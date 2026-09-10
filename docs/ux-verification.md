@@ -118,12 +118,11 @@ Every status carries a word as well as a colour: routing policy badges read
 
 Stated plainly, because these are acceptance criteria that remain open.
 
-**Seven of the eleven routing acceptance tests.** Tests 1, 2, 7 and 11 are now verified by
-`spikes/routing-spike.sh` (12 passed, 0 failed, reproduced three times — see
-[spike-results.md](spike-results.md)). Tests 3, 4, 5, 6, 8, 9 and 10 require the privileged
-daemon, which is not implemented. Their underlying mechanisms — cgroup membership, instance
-identity re-verification, classifier withdrawal — are exercised by the spike, but that is
-not the same as testing them.
+**Three of the eleven routing acceptance tests.** Tests 1, 2, 4, 5, 6, 7, 8 (inclusion) and
+11 are verified by the daemon acceptance suite — see
+[daemon-acceptance.md](daemon-acceptance.md). Test 3 needs configuration persistence, child
+*exclusion* needs the process-event watcher, and test 10 needs a Wine runtime in the harness.
+None of the three is built.
 
 **Keyboard-only walkthroughs of the five workflows.** The screenshot harness drives a bare
 Xvfb with no window manager, so it cannot meaningfully exercise focus traversal, focus

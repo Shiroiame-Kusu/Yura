@@ -7,11 +7,11 @@ Yura routes the traffic of **specific running processes** through proxies you al
 It does not ship or manage a routing engine: you point it at your own SOCKS5 or HTTP(S)
 endpoint, and Yura decides which process's traffic goes there.
 
-> **Status: early milestone.** The routing approach is **proven working** — see
-> [docs/spike-results.md](docs/spike-results.md). The domain model, design system and the
-> Processes, Games and Proxy Editor screens are built and verified. The privileged daemon
-> that would drive it in the product is **not yet implemented**, so the application applies
-> nothing yet and says so. See [Current state](#current-state).
+> **Status: working end to end.** The privileged daemon routes selected running processes
+> through user-supplied proxies, verified by
+> [29 acceptance tests](docs/daemon-acceptance.md) driven through its real IPC socket, and
+> the desktop application drives it. Persistence, the Connections page and the process-event
+> watcher are still missing. See [Current state](#current-state).
 
 ## Why per-process routing is hard on Linux
 
@@ -37,12 +37,15 @@ That last row is a feature, not a limitation: it is exactly the semantic the UI 
 ## Repository layout
 
 ```
-src/Yura.Core          domain model: process identity, rules, proxies, connections
+src/Yura.Core          domain model: process identity, rules, proxies, connections, IPC
+src/Yura.Daemon        privileged daemon: cgroups, nftables, TPROXY forwarder, IPC server
 src/Yura.App           Avalonia 12 + FluentAvalonia desktop application (unprivileged)
-tests/Yura.Core.Tests  unit tests, including the rule-system acceptance criteria
+tests/Yura.Core.Tests  unit tests for the rule system and /proc reader
+tests/Yura.Daemon.Tests unit tests for the nftables ruleset builder
+tests/acceptance/      the daemon acceptance suite, driven through the real IPC socket
 spikes/                the routing spike: proves running-process routing end to end
 tools/                 screenshot harness, contrast checker
-docs/                  architecture notes, UX verification report, screenshots
+docs/                  architecture notes, verification reports, screenshots
 ```
 
 ## Requirements
@@ -106,6 +109,39 @@ namespaced `yura-spike` and removed by its cleanup trap, including on failure.
 When something breaks, `sudo ./spikes/debug-classify.sh` puts an nftables counter on every
 rule and reports which links a packet actually reached.
 
+## Run the daemon
+
+The daemon is the only privileged component. It configures nftables, policy routing and
+cgroups, and forwards captured flows to your proxies.
+
+```bash
+dotnet build src/Yura.Daemon
+sudo ./src/Yura.Daemon/bin/Debug/net10.0/yura-daemon --verbose
+```
+
+It authorises callers by peer credential (`SO_PEERCRED`): root, plus whichever user invoked
+it via sudo. On SIGTERM it removes every rule, route and cgroup it created.
+
+`yura-daemon ctl <op>` speaks the same socket for scripting and diagnostics:
+
+```bash
+yura-daemon ctl status
+yura-daemon ctl list-rules
+yura-daemon ctl list-flows
+yura-daemon ctl connection-counts
+```
+
+## Acceptance tests
+
+```bash
+sudo tests/acceptance/daemon-acceptance.sh
+```
+
+29 checks against a controlled network on a dummy interface, where each marker payload is
+reachable only through one specific proxy. **29 passed, 0 failed.** Mandatory acceptance
+tests 1, 2, 4, 5, 6, 7, 8 and 11 are verified; see
+[docs/daemon-acceptance.md](docs/daemon-acceptance.md) for what is not.
+
 ## Design system
 
 Tokens live in [`Themes/Tokens.axaml`](src/Yura.App/Themes/Tokens.axaml): graphite/slate
@@ -130,16 +166,24 @@ All 52 required foreground/background pairs meet their target in both themes.
 - Design system, and the Processes, Games and Proxy Editor screens
 - Screenshot harness covering both themes, both languages, 960×640 and 1280×800, and
   100–200% scaling
-- **Routing spike passing 12/12**: a running process migrated into a cgroup live, classified
-  by nftables, captured by TPROXY and forwarded to a SOCKS5 proxy — for TCP and UDP, per
-  instance, with the process still running as its original user
+- **Routing spike passing 12/12** and the **daemon acceptance suite passing 29/29**: a
+  running process migrated into a cgroup live, classified by nftables, captured by TPROXY
+  and forwarded to a SOCKS5 proxy — for TCP and UDP, per instance, with the process still
+  running as its original user
+- The privileged daemon: cgroup manager, nftables ruleset builder, transparent TCP and UDP
+  forwarder, SOCKS5 and HTTP CONNECT clients, socket-ownership attribution, and a
+  peer-credential-authorised IPC server
+- The app driving the real daemon over its socket, including live per-process connection
+  counts
 
 **Not yet built**
 
-- The privileged daemon. Without it the app runs fully but applies nothing, and says so.
+- Configuration persistence: rules and proxies live in memory and are lost on restart,
+  so acceptance test 3 (a persistent executable rule surviving a restart) is not met
+- The process-event watcher. Persistent rules only cover processes running when the rule is
+  applied, and child *exclusion* is unimplemented
 - Connections, Rules, Diagnostics and Settings pages
-- Acceptance tests 3, 4, 5, 6, 8, 9 and 10 — the mechanisms they rest on are exercised by
-  the spike, but the daemon that drives them does not exist yet
+- Proxy chains, and IPv6 in the UDP path
 
 See [docs/ux-verification.md](docs/ux-verification.md) for what was checked and what could
 not be.

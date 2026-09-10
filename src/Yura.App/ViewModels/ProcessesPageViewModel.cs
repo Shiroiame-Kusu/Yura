@@ -29,6 +29,8 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
     private readonly Dictionary<string, ProcessRowViewModel> _rows = [];
     private readonly DispatcherTimer _timer;
     private readonly uint _currentUid;
+    private IReadOnlyDictionary<int, int> _connectionCounts = new Dictionary<int, int>();
+    private bool _countsInFlight;
 
     public ProcessesPageViewModel(ProcProcessSource source, IDaemonClient daemon, RuleStore rules)
     {
@@ -185,8 +187,16 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
         var snapshots = _source.Enumerate();
         var seen = new HashSet<string>(snapshots.Count);
 
-        foreach (var snapshot in snapshots)
+        // Only the daemon can attribute sockets to processes it does not own. With no daemon
+        // the count is genuinely unknown, and null renders as "—" rather than a misleading 0.
+        var counts = _daemon.State == DaemonState.Connected ? _connectionCounts : null;
+
+        foreach (var raw in snapshots)
         {
+            var snapshot = counts is null
+                ? raw
+                : raw with { ConnectionCount = counts.GetValueOrDefault(raw.Identity.Pid) };
+
             var key = ProcessRowViewModel.MakeKey(snapshot.Identity);
             seen.Add(key);
 
@@ -210,6 +220,34 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
 
         ApplyPolicies();
         RebuildView();
+
+        // Fetched out of band: the table must not stall on a daemon round trip, and a
+        // count that is one refresh stale is better than a list that stutters.
+        _ = RefreshConnectionCountsAsync();
+    }
+
+    private async Task RefreshConnectionCountsAsync()
+    {
+        if (_countsInFlight || _daemon.State != DaemonState.Connected)
+        {
+            return;
+        }
+
+        _countsInFlight = true;
+        try
+        {
+            _connectionCounts = await _daemon.GetConnectionCountsAsync().ConfigureAwait(true);
+        }
+        catch (Exception)
+        {
+            // A daemon that went away mid-refresh is not an error worth surfacing here;
+            // the next pass reverts the column to "unknown".
+            _connectionCounts = new Dictionary<int, int>();
+        }
+        finally
+        {
+            _countsInFlight = false;
+        }
     }
 
     private void ApplyPolicies()
@@ -312,6 +350,13 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
         {
             Refresh();
         }
+    }
+
+    /// <summary>Re-evaluates everything gated on the daemon being reachable.</summary>
+    public void NotifyDaemonStateChanged()
+    {
+        OnPropertyChanged(nameof(CanApply));
+        OnPropertyChanged(nameof(ApplyBlockedReason));
     }
 
     partial void OnIsCompactChanged(bool value) => OnPropertyChanged(nameof(ShowOverlayInspector));

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Yura.Daemon</RootNamespace>
+    <AssemblyName>yura-daemon</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- The daemon is Linux-only by construction: cgroup v2, nftables and TPROXY have no
+         meaningful equivalent elsewhere, so there is nothing to gain from pretending. -->
+    <RuntimeIdentifiers>linux-x64;linux-arm64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Yura.Core/Yura.Core.csproj" />
+  </ItemGroup>
+
+</Project>

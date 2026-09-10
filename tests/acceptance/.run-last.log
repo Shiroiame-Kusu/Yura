@@ -1,0 +1,67 @@
+
+==> Preflight
+    daemon  /home/hakuu/Documents/GitHub/Yura/src/Yura.Daemon/bin/Debug/net10.0/yura-daemon
+    run dir /home/hakuu/Documents/GitHub/Yura/tests/acceptance/.run
+
+==> Isolated test network
+    198.51.100.1/24 on yuraacc0; 198.51.100.7 has no host
+
+==> Two markers, two proxies
+    proxy A :11080 -> marker A (YURA-VIA-PROXY-A);  proxy B :11081 -> marker B (YURA-VIA-PROXY-B)
+
+==> Daemon
+    PASS daemon answers status over the socket — {"ok":true,"status":{"version":"0.1.0","activeRules":0,"activeFlows":0,"uptimeSeconds":0}}
+    PASS daemon accepts the proxy list — {"ok":true,"apply":{"succeeded":true,"confirmedAtUtc":"2026-09-10T05:10:24.3388157+00:00","migratedProcesses":0,"warnings":[]}}
+
+==> Two instances of the same ordinary application, started normally
+    A: pid 110666 (hakuu)   B: pid 110677   exe /usr/bin/python3.14
+
+==> Baseline
+    PASS A cannot reach the proxy-only destination — 1 record(s) matched
+    PASS B cannot reach the proxy-only destination — 1 record(s) matched
+
+==> Acceptance 1 & 2 & 7 & 11: instance rule on A -> proxy A
+    PASS daemon applies an instance rule for A — {"ok":true,"apply":{"succeeded":true,"confirmedAtUtc":"2026-09-10T05:10:29.1628004+00:00","migratedProcesses":1,"preExistingConnections":2,"warnings":[]}}
+    PASS 1: A's new TCP connections traverse proxy A — 3 record(s) matched
+    PASS 2: B, same executable, is still direct — 3 record(s) matched
+    PASS 7: A's UDP traverses proxy A — 3 record(s) matched
+    PASS 11: A's pre-rule connection is still open on its old route — 3 record(s) matched
+    PASS proxy A's own log confirms A's flows — proxy A saw 16 CONNECTs
+    PASS proxy B saw nothing — proxy B log empty
+    PASS daemon reports A's flows as confirmed proxied — 33 flows confirmedProxied, proxy=Proxy A, dest=198.51.100.7:9090
+    PASS A's process still runs as its original user — uid owner: hakuu
+
+==> Acceptance 5: B -> proxy B, simultaneously with A -> proxy A
+    PASS daemon applies an instance rule for B — {"ok":true,"apply":{"succeeded":true,"confirmedAtUtc":"2026-09-10T05:10:39.5548033+00:00","migratedProcesses":1,"preExistingConnections":2,"warnings":[]}}
+    PASS 5: B traverses proxy B — 3 record(s) matched
+    PASS 5: A still traverses proxy A at the same time — 3 record(s) matched
+    counters and flows dumped to /home/hakuu/Documents/GitHub/Yura/tests/acceptance/.run/nft-after-B.txt, flows-after-B.json
+
+==> Acceptance 6: Block, then Direct, for B
+    PASS daemon replaces B's rule with Block — {"ok":true,"apply":{"succeeded":true,"confirmedAtUtc":"2026-09-10T05:10:53.8124627+00:00","migratedProcesses":0,"preExistingConnections":2,"warnings":[]}}
+    PASS 6: B's connections are refused, not merely timing out — 3 record(s) matched
+    PASS daemon replaces B's rule with Direct — {"ok":true,"apply":{"succeeded":true,"confirmedAtUtc":"2026-09-10T05:10:57.9924552+00:00","migratedProcesses":0,"preExistingConnections":1,"warnings":[]}}
+    PASS 6: B is direct again (unreachable destination times out) — 2 record(s) matched
+
+==> Acceptance 8 (inclusion): a process tree, children forked after the rule
+    loop shell pid 111762; every curl it forks is a fresh child process
+    PASS daemon applies a tree rule (include future children) on the loop shell — {"ok":true,"apply":{"succeeded":true,"confirmedAtUtc":"2026-09-10T05:11:06.4306065+00:00","migratedProcesses":1,"preExistingConnections":0,"warnings":[]}}
+    PASS 8: curl children forked after the rule are proxied — 8 child curls received the marker
+
+==> Acceptance 4: instance rule expires when its process exits
+    PASS rule A is listed while A runs — listed
+    A lives in cgroup /sys/fs/cgroup/yura/s001
+    PASS 4: rule A is gone from the daemon after A exited — rule expired
+    PASS 4: A's cgroup was removed, so nothing can inherit its policy — cgroup gone
+    PASS 4: a fresh instance of the same executable is unaffected — 1 record(s) matched
+
+==> Clean shutdown
+    PASS nft table removed on shutdown — removed
+    PASS policy routing removed on shutdown — removed
+    PASS cgroup subtree removed on shutdown — removed
+
+==> Result
+    29 passed, 0 failed
+    daemon log: /home/hakuu/Documents/GitHub/Yura/tests/acceptance/.run/daemon.log
+
+==> Teardown

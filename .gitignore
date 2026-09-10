@@ -13,3 +13,4 @@ spikes/.run/
 # Screenshots produced by the UI verification harness are committed on purpose;
 # intermediate captures are not.
 docs/screenshots/.scratch/
+tests/acceptance/.run/

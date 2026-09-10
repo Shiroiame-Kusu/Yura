@@ -24,7 +24,7 @@ public sealed partial class YuraApplication : Application
             // daemon for design review only.
             IDaemonClient daemon = options.Demo
                 ? new SimulatedDaemonClient()
-                : new DisconnectedDaemonClient();
+                : new UnixSocketDaemonClient();
 
             Loc.Current.Language = options.Language;
             RequestedThemeVariant = options.Theme.Equals("light", StringComparison.OrdinalIgnoreCase)
@@ -48,6 +48,11 @@ public sealed partial class YuraApplication : Application
             {
                 DemoData.Populate(shell);
             }
+
+            // Probe the daemon once at startup so the shell shows its real state rather
+            // than assuming the worst. The result only changes a banner, so it does not
+            // block the window from appearing.
+            _ = shell.RefreshDaemonStateAsync();
 
             var window = new MainWindow { DataContext = shell };
             if (options.ScreenshotMode)

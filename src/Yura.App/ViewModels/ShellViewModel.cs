@@ -135,11 +135,28 @@ public sealed partial class ShellViewModel : ObservableObject
     }
 
     [RelayCommand]
-    private async Task ReconnectAsync()
+    private Task ReconnectAsync() => RefreshDaemonStateAsync();
+
+    /// <summary>
+    /// Asks the daemon whether it is there, then republishes everything that depends on
+    /// the answer. Also pushes the current proxy list, since a daemon that just started
+    /// knows nothing about the endpoints the user configured.
+    /// </summary>
+    public async Task RefreshDaemonStateAsync()
     {
         await _daemon.ConnectAsync().ConfigureAwait(true);
+
+        if (_daemon is UnixSocketDaemonClient socketClient && IsDaemonConnected && Rules.Proxies.Count > 0)
+        {
+            await socketClient
+                .SetProxiesAsync(Rules.Proxies.Select(p => (p, (string?)null)).ToList())
+                .ConfigureAwait(true);
+        }
+
         OnPropertyChanged(nameof(IsDaemonConnected));
         OnPropertyChanged(nameof(DaemonStatusText));
         OnPropertyChanged(nameof(DaemonBannerDetail));
+        OnPropertyChanged(nameof(DaemonDiagnostics));
+        Processes.NotifyDaemonStateChanged();
     }
 }
