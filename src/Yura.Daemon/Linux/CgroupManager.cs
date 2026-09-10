@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using Yura.Core.Processes;
 
@@ -37,19 +38,28 @@ public sealed record MigrationResult(MigrationOutcome Outcome, string? Detail = 
 /// Every cgroup here is a direct child of <see cref="Root"/>, which is a top-level cgroup
 /// that systemd does not manage. Nesting under the process's existing slice would keep
 /// systemd's accounting intact, but collides with cgroup v2's "no internal processes" rule
-/// once controllers are enabled on the parent. The trade-off is documented rather than
-/// hidden: a migrated process leaves its systemd scope, so `systemctl --user stop` no longer
-/// reaches it by cgroup.
+/// once controllers are enabled on the parent. The compromise is to remember where every
+/// process came from and put it back there when its rule goes away, so leaving Yura's tree
+/// returns the process to its systemd scope rather than dumping it in the root cgroup.
 /// </remarks>
 public sealed class CgroupManager
 {
-    /// <summary>Top-level cgroup that holds one child per active rule slot.</summary>
+    /// <summary>Top-level cgroup that holds one child per process group.</summary>
     public const string Root = "/sys/fs/cgroup/yura";
 
     private const string CgroupMount = "/sys/fs/cgroup";
 
+    /// <summary>Depth of <see cref="RelativePathFor"/>, for nftables' <c>level</c> argument.</summary>
+    public const int Level = 2;
+
     private readonly Action<string> _log;
     private readonly ProcProcessSource _processes;
+
+    /// <summary>Where each migrated process lived before Yura moved it, keyed by pid.</summary>
+    private readonly ConcurrentDictionary<int, string> _origins = new();
+
+    /// <summary>Origin path to the directory it resolves to, so the fork hot path does no stat.</summary>
+    private readonly ConcurrentDictionary<string, string> _resolvedOrigins = new();
 
     public CgroupManager(Action<string> log, ProcProcessSource processes)
     {
@@ -57,16 +67,11 @@ public sealed class CgroupManager
         _processes = processes;
     }
 
-    /// <summary>Path of the cgroup backing a slot, e.g. <c>/sys/fs/cgroup/yura/s01</c>.</summary>
-    public static string PathFor(string slotName) => $"{Root}/{slotName}";
+    /// <summary>Path of the cgroup backing a group, e.g. <c>/sys/fs/cgroup/yura/g001</c>.</summary>
+    public static string PathFor(string groupName) => $"{Root}/{groupName}";
 
-    /// <summary>
-    /// Path relative to the cgroup mount, which is the form nftables wants.
-    /// </summary>
-    public static string RelativePathFor(string slotName) => $"yura/{slotName}";
-
-    /// <summary>Depth of <see cref="RelativePathFor"/>, for nftables' <c>level</c> argument.</summary>
-    public const int Level = 2;
+    /// <summary>Path relative to the cgroup mount, which is the form nftables wants.</summary>
+    public static string RelativePathFor(string groupName) => $"yura/{groupName}";
 
     public static bool IsCgroup2Available() =>
         Directory.Exists(CgroupMount) && File.Exists($"{CgroupMount}/cgroup.controllers");
@@ -80,10 +85,10 @@ public sealed class CgroupManager
         }
     }
 
-    public void CreateSlot(string slotName)
+    public void CreateGroup(string groupName)
     {
         EnsureRoot();
-        var path = PathFor(slotName);
+        var path = PathFor(groupName);
         if (!Directory.Exists(path))
         {
             Directory.CreateDirectory(path);
@@ -91,25 +96,27 @@ public sealed class CgroupManager
         }
     }
 
+    public bool GroupExists(string groupName) => Directory.Exists(PathFor(groupName));
+
     /// <summary>
-    /// Removes a slot's cgroup, returning any remaining members to the root cgroup first.
+    /// Removes a group's cgroup, returning any remaining members to where they came from.
     /// </summary>
     /// <remarks>
     /// A non-empty cgroup cannot be removed, and leaving one behind is worse than it looks:
     /// nftables resolved its path to a cgroup id at rule-load time, so a stale directory that
     /// is later recreated will not match the installed rules.
     /// </remarks>
-    public void RemoveSlot(string slotName)
+    public void RemoveGroup(string groupName)
     {
-        var path = PathFor(slotName);
+        var path = PathFor(groupName);
         if (!Directory.Exists(path))
         {
             return;
         }
 
-        foreach (var pid in ReadMembers(slotName))
+        foreach (var pid in ReadMembers(groupName))
         {
-            EvictToRoot(pid);
+            Restore(pid);
         }
 
         try
@@ -123,9 +130,9 @@ public sealed class CgroupManager
         }
     }
 
-    public IReadOnlyList<int> ReadMembers(string slotName)
+    public IReadOnlyList<int> ReadMembers(string groupName)
     {
-        var file = $"{PathFor(slotName)}/cgroup.procs";
+        var file = $"{PathFor(groupName)}/cgroup.procs";
         try
         {
             return File.ReadAllLines(file)
@@ -140,8 +147,56 @@ public sealed class CgroupManager
         }
     }
 
+    /// <summary>Every group directory currently under the root.</summary>
+    public IReadOnlyList<string> ListGroups()
+    {
+        if (!Directory.Exists(Root))
+        {
+            return [];
+        }
+
+        return Directory.EnumerateDirectories(Root).Select(Path.GetFileName).Where(n => n is not null).Select(n => n!).ToArray();
+    }
+
     /// <summary>
-    /// Moves a running process into a slot, but only if it is still the instance we were
+    /// The unified-hierarchy cgroup path of a process, e.g. <c>/yura/g001</c>, or null if it
+    /// cannot be read (exited, or not permitted).
+    /// </summary>
+    public static string? ReadCgroupOf(int pid)
+    {
+        try
+        {
+            foreach (var line in File.ReadLines($"/proc/{pid}/cgroup"))
+            {
+                if (line.StartsWith("0::", StringComparison.Ordinal))
+                {
+                    return line[3..];
+                }
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+        }
+
+        return null;
+    }
+
+    /// <summary>The group name a process is currently in, or null when it is outside Yura's tree.</summary>
+    public static string? GroupOf(int pid)
+    {
+        var path = ReadCgroupOf(pid);
+        if (path is null || !path.StartsWith("/yura/", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var rest = path["/yura/".Length..];
+        var slash = rest.IndexOf('/');
+        return slash < 0 ? rest : rest[..slash];
+    }
+
+    /// <summary>
+    /// Moves a running process into a group, but only if it is still the instance we were
     /// asked about.
     /// </summary>
     /// <remarks>
@@ -150,7 +205,7 @@ public sealed class CgroupManager
     /// syscall wide, and closing it properly needs pidfd, which is a later refinement. What
     /// matters is that the check is never skipped and never done against a cached snapshot.
     /// </remarks>
-    public MigrationResult Migrate(string slotName, ProcessIdentity expected)
+    public MigrationResult Migrate(string groupName, ProcessIdentity expected)
     {
         var current = _processes.TryRead(expected.Pid);
         if (current is null)
@@ -166,42 +221,157 @@ public sealed class CgroupManager
                 $"(start ticks {current.Identity.StartTicks}, expected {expected.StartTicks})");
         }
 
-        CreateSlot(slotName);
+        return Move(groupName, expected.Pid, current.DisplayName);
+    }
+
+    /// <summary>
+    /// Moves a process by pid alone. Only for processes the kernel just told us about (a fork
+    /// or exec event), where the pid cannot have been reused yet.
+    /// </summary>
+    public MigrationResult Move(string groupName, int pid, string? displayName = null)
+    {
+        CreateGroup(groupName);
+
+        // Remember the origin once; a process moved between Yura groups keeps its first home.
+        if (!_origins.ContainsKey(pid))
+        {
+            var origin = ReadCgroupOf(pid);
+            if (origin is not null && !origin.StartsWith("/yura/", StringComparison.Ordinal))
+            {
+                _origins[pid] = origin;
+            }
+        }
 
         try
         {
-            File.WriteAllText($"{PathFor(slotName)}/cgroup.procs",
-                expected.Pid.ToString(CultureInfo.InvariantCulture));
+            File.WriteAllText($"{PathFor(groupName)}/cgroup.procs", pid.ToString(CultureInfo.InvariantCulture));
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
             // ESRCH here means the process exited during the write, which is ordinary.
-            return Directory.Exists($"/proc/{expected.Pid}")
+            return Directory.Exists($"/proc/{pid}")
                 ? new MigrationResult(MigrationOutcome.Refused, e.Message)
-                : new MigrationResult(MigrationOutcome.ProcessGone, $"pid {expected.Pid} exited during migration");
+                : new MigrationResult(MigrationOutcome.ProcessGone, $"pid {pid} exited during migration");
         }
 
-        _log($"migrated pid {expected.Pid} ({current.DisplayName}) into {RelativePathFor(slotName)}");
+        _log($"migrated pid {pid}{(displayName is null ? string.Empty : $" ({displayName})")} into {RelativePathFor(groupName)}");
         return new MigrationResult(MigrationOutcome.Migrated);
     }
 
-    /// <summary>Moves a process back to the root cgroup, undoing a migration.</summary>
-    public bool EvictToRoot(int pid)
+    /// <summary>
+    /// Moves a process back to where it was before Yura touched it, falling back to the
+    /// root cgroup if that place no longer exists.
+    /// </summary>
+    public bool Restore(int pid)
     {
+        _origins.TryRemove(pid, out var origin);
+        return RestoreTo(pid, origin, forget: false);
+    }
+
+    /// <summary>
+    /// Moves a process to an explicit cgroup path, for a child that must leave a group it
+    /// only inherited. Falls back to the root, which always accepts a write.
+    /// </summary>
+    public bool RestoreTo(int pid, string? origin, bool forget = true)
+    {
+        if (forget)
+        {
+            _origins.TryRemove(pid, out _);
+        }
+
+        var target = origin is not null && Directory.Exists(CgroupMount + origin)
+            ? CgroupMount + origin
+            : CgroupMount;
+
         try
         {
-            File.WriteAllText($"{CgroupMount}/cgroup.procs", pid.ToString(CultureInfo.InvariantCulture));
+            File.WriteAllText($"{target}/cgroup.procs", pid.ToString(CultureInfo.InvariantCulture));
             return true;
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
             // The process exiting on its own is the common case and needs no reporting.
+            // A refused write into the origin falls back to the root, which always accepts.
+            if (target != CgroupMount)
+            {
+                try
+                {
+                    File.WriteAllText($"{CgroupMount}/cgroup.procs", pid.ToString(CultureInfo.InvariantCulture));
+                    return true;
+                }
+                catch (Exception inner) when (inner is IOException or UnauthorizedAccessException)
+                {
+                }
+            }
+
             return false;
         }
     }
 
-    /// <summary>Removes every slot cgroup Yura created, used on shutdown.</summary>
-    public void RemoveAllSlots()
+    /// <summary>Where a process came from, when Yura moved it. Used to place excluded children.</summary>
+    public string? OriginOf(int pid) => _origins.GetValueOrDefault(pid);
+
+    /// <summary>
+    /// The absolute directory a process should be returned to, resolved once.
+    /// </summary>
+    /// <remarks>
+    /// Excluding a forked child is a race against that child creating a socket, so the hot
+    /// path must not stat the filesystem. Resolving the parent's origin to a directory here,
+    /// and caching it, leaves one write to do when the fork event arrives.
+    /// </remarks>
+    public string ResolvedOriginOf(int pid)
+    {
+        if (!_origins.TryGetValue(pid, out var origin))
+        {
+            return CgroupMount;
+        }
+
+        if (_resolvedOrigins.TryGetValue(origin, out var resolved))
+        {
+            return resolved;
+        }
+
+        resolved = Directory.Exists(CgroupMount + origin) ? CgroupMount + origin : CgroupMount;
+        _resolvedOrigins[origin] = resolved;
+        return resolved;
+    }
+
+    /// <summary>Writes a pid into an already-resolved cgroup directory, falling back to the root.</summary>
+    public bool RestoreToResolved(int pid, string directory)
+    {
+        var text = pid.ToString(CultureInfo.InvariantCulture);
+        try
+        {
+            File.WriteAllText($"{directory}/cgroup.procs", text);
+            return true;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            if (directory == CgroupMount)
+            {
+                return false;
+            }
+        }
+
+        try
+        {
+            File.WriteAllText($"{CgroupMount}/cgroup.procs", text);
+            return true;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Records an origin explicitly, e.g. a child that inherits its parent's origin.</summary>
+    public void RememberOrigin(int pid, string origin) => _origins.TryAdd(pid, origin);
+
+    /// <summary>Drops bookkeeping for a process that has exited.</summary>
+    public void Forget(int pid) => _origins.TryRemove(pid, out _);
+
+    /// <summary>Removes every group cgroup Yura created, used on shutdown.</summary>
+    public void RemoveAllGroups()
     {
         if (!Directory.Exists(Root))
         {
@@ -210,7 +380,7 @@ public sealed class CgroupManager
 
         foreach (var directory in Directory.EnumerateDirectories(Root))
         {
-            RemoveSlot(Path.GetFileName(directory));
+            RemoveGroup(Path.GetFileName(directory));
         }
 
         try

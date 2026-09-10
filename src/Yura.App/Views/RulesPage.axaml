@@ -1,0 +1,122 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:Yura.App.ViewModels"
+             xmlns:loc="using:Yura.App.Localization"
+             xmlns:icons="using:FluentIcons.Avalonia"
+             xmlns:views="using:Yura.App.Views"
+             mc:Ignorable="d"
+             x:Class="Yura.App.Views.RulesPage"
+             x:DataType="vm:RulesPageViewModel">
+
+  <Grid RowDefinitions="Auto,*">
+
+    <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="24,20,24,12">
+      <StackPanel Grid.Column="0" Spacing="2">
+        <TextBlock Classes="PageTitle" Text="{loc:Tr Rules.Title}" />
+        <TextBlock Classes="Subtitle" Text="{loc:Tr Rules.Subtitle}" MaxWidth="620" HorizontalAlignment="Left" />
+      </StackPanel>
+      <Button Grid.Column="1" Classes="accent" VerticalAlignment="Top"
+              Command="{Binding AddRuleCommand}" Content="{loc:Tr Rules.Editor.TitleNew}" />
+    </Grid>
+
+    <Grid Grid.Row="1" ColumnDefinitions="*,Auto,Auto" Margin="20,0,20,16">
+
+      <Border Grid.Column="0" Classes="Panel" ClipToBounds="True">
+        <Grid RowDefinitions="Auto,*,Auto">
+
+          <!-- The rule's name and what it matches share one wide column: a separate process
+               column could only ever show a truncated path, and the inspector shows it in
+               full. Column widths are repeated verbatim on the row grid below. -->
+          <Border Grid.Row="0" Classes="ColumnHeader">
+            <Grid Margin="12,0" ColumnDefinitions="40,2.2*,1.4*,130,86">
+              <TextBlock Grid.Column="0" Text="{loc:Tr Rules.Column.Order}" />
+              <TextBlock Grid.Column="1" Text="{loc:Tr Rules.Column.Name}" Margin="0,0,12,0" />
+              <TextBlock Grid.Column="2" Text="{loc:Tr Rules.Column.Destination}" Margin="0,0,8,0" />
+              <TextBlock Grid.Column="3" Text="{loc:Tr Rules.Column.Action}" />
+              <TextBlock Grid.Column="4" Text="{loc:Tr Rules.Column.State}" />
+            </Grid>
+          </Border>
+
+          <ListBox Grid.Row="1" Classes="Table"
+                   ItemsSource="{Binding Rules}"
+                   SelectedItem="{Binding SelectedRule}"
+                   SelectionMode="Single"
+                   ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                   AutomationProperties.Name="{loc:Tr Rules.Title}">
+            <ListBox.ItemTemplate>
+              <DataTemplate x:DataType="vm:RuleRowViewModel">
+                <Grid Margin="12,0" ColumnDefinitions="40,2.2*,1.4*,130,86" Height="42">
+                  <TextBlock Grid.Column="0" Classes="Numeric Caption Secondary" Text="{Binding Order}"
+                             VerticalAlignment="Center" HorizontalAlignment="Left" />
+
+                  <StackPanel Grid.Column="1" Spacing="0" VerticalAlignment="Center" Margin="0,0,12,0">
+                    <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis"
+                               ToolTip.Tip="{Binding Name}"
+                               Classes.Unavailable="{Binding IsDisabled}" />
+                    <TextBlock Classes="Caption" Text="{Binding MatchSummary}"
+                               TextTrimming="LeadingCharacterEllipsis"
+                               ToolTip.Tip="{Binding MatchSummary}" />
+                  </StackPanel>
+
+                  <TextBlock Grid.Column="2" Classes="Mono Secondary" Text="{Binding DestinationDisplay}"
+                             VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Margin="0,0,8,0"
+                             ToolTip.Tip="{Binding DestinationDisplay}" />
+
+                  <Border Grid.Column="3" Classes="Badge" VerticalAlignment="Center" HorizontalAlignment="Left"
+                          Classes.Accent="{Binding IsProxyAction}"
+                          Classes.Danger="{Binding IsBlockAction}">
+                    <TextBlock Text="{Binding ActionDisplay}" TextTrimming="CharacterEllipsis" MaxWidth="114" />
+                  </Border>
+
+                  <Border Grid.Column="4" Classes="Badge" VerticalAlignment="Center" HorizontalAlignment="Left"
+                          Classes.Success="{Binding IsActive}"
+                          Classes.Warning="{Binding IsPending}">
+                    <TextBlock Text="{Binding StateDisplay}" />
+                  </Border>
+                </Grid>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+
+          <StackPanel Grid.Row="1" IsVisible="{Binding IsEmpty}"
+                      HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="6" MaxWidth="380">
+            <TextBlock Text="{loc:Tr Rules.Empty}" HorizontalAlignment="Center" />
+            <TextBlock Classes="Caption" Text="{loc:Tr Rules.EmptyHint}" HorizontalAlignment="Center"
+                       TextAlignment="Center" TextWrapping="Wrap" />
+          </StackPanel>
+
+          <Border Grid.Row="2" Background="{DynamicResource YuraSurfaceRaised}"
+                  BorderBrush="{DynamicResource YuraBorderSubtle}" BorderThickness="0,1,0,0"
+                  Padding="12,6">
+            <Grid ColumnDefinitions="Auto,*,Auto">
+              <TextBlock Grid.Column="0" Classes="Caption Metric" Text="{Binding CountSummary}" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" Classes="Caption" Margin="12,0" VerticalAlignment="Center"
+                         TextTrimming="CharacterEllipsis" Text="{loc:Tr Rules.Precedence}" />
+              <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6">
+                <Button Command="{Binding UndoCommand}" IsEnabled="{Binding CanUndo}"
+                        Content="{loc:Tr Common.Undo}"
+                        ToolTip.Tip="{Binding UndoDescription}" />
+              </StackPanel>
+            </Grid>
+          </Border>
+        </Grid>
+      </Border>
+
+      <Border Grid.Column="1" Width="1" Background="{DynamicResource YuraBorderSubtle}" Margin="7,0"
+              IsVisible="{Binding !IsCompact}" />
+
+      <!-- Docked inspector, wide windows only. -->
+      <views:RuleInspector Grid.Column="2" Width="330" IsVisible="{Binding !IsCompact}" />
+    </Grid>
+
+    <!-- Narrow windows: the inspector floats over the table rather than squeezing every
+         column into illegibility, which is what a docked panel does at 960 DIPs. -->
+    <views:RuleInspector Grid.Row="1" Width="340"
+                         HorizontalAlignment="Right"
+                         Margin="0,0,20,16"
+                         Classes="Floating"
+                         IsVisible="{Binding ShowOverlayInspector}" />
+  </Grid>
+</UserControl>

@@ -222,7 +222,7 @@
 
   <!-- A panel that floats above other content earns a shadow; a docked one does not.
        This is the only shadow in the application. -->
-  <Style Selector="views|ProcessInspector.Floating > Border">
+  <Style Selector="views|ProcessInspector.Floating > Border, views|RuleInspector.Floating > Border">
     <Setter Property="BoxShadow" Value="-10 0 28 0 #55000000" />
   </Style>
 

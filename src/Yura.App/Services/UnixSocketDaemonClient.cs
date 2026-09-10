@@ -45,21 +45,49 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
         SetState(response.Ok ? DaemonState.Connected : DaemonState.Disconnected);
     }
 
+    public async Task<DaemonStatus?> GetStatusAsync(CancellationToken cancellationToken = default)
+    {
+        var response = await SendAsync(new IpcRequest { Op = "status" }, cancellationToken).ConfigureAwait(false);
+        if (!response.Ok || response.Status is not { } status)
+        {
+            return null;
+        }
+
+        return new DaemonStatus
+        {
+            Version = status.Version,
+            ActiveRules = status.ActiveRules,
+            ActiveFlows = status.ActiveFlows,
+            ActiveGroups = status.ActiveGroups,
+            Uptime = TimeSpan.FromSeconds(status.UptimeSeconds),
+            ProcessWatcher = status.ProcessWatcher,
+            DnsPolicy = status.DnsPolicy,
+            KernelRelease = status.KernelRelease,
+            NftVersion = status.NftVersion,
+            CgroupRoot = status.CgroupRoot,
+            SocketPath = status.SocketPath,
+            AllowedUids = status.AllowedUids,
+            Checks = status.Checks.Select(c => new DaemonCheck(c.Name, c.Passed, c.Detail)).ToArray(),
+        };
+    }
+
     public async Task<IReadOnlyDictionary<int, int>> GetConnectionCountsAsync(CancellationToken cancellationToken = default)
     {
         var response = await SendAsync(new IpcRequest { Op = "connection-counts" }, cancellationToken).ConfigureAwait(false);
         return response.Counts ?? new Dictionary<int, int>();
     }
 
-    public async Task<IReadOnlyList<ConnectionRecord>> GetConnectionsAsync(CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<ConnectionRecord>> GetConnectionsAsync(
+        int? pid = null, CancellationToken cancellationToken = default)
     {
-        var response = await SendAsync(new IpcRequest { Op = "list-flows" }, cancellationToken).ConfigureAwait(false);
-        if (response.Flows is null)
+        var response = await SendAsync(new IpcRequest { Op = "list-connections", Pid = pid }, cancellationToken)
+            .ConfigureAwait(false);
+        if (response.Connections is null)
         {
             return [];
         }
 
-        return response.Flows.Select(ToRecord).ToArray();
+        return response.Connections.Select(ToRecord).ToArray();
     }
 
     public async Task<RuleApplyResult> ApplyRuleAsync(RoutingRule rule, CancellationToken cancellationToken = default)
@@ -76,15 +104,26 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
         return ToApplyResult(response);
     }
 
-    /// <summary>Pushes the full proxy list, including secrets, to the daemon.</summary>
     public async Task<RuleApplyResult> SetProxiesAsync(
         IReadOnlyList<(ProxyEndpoint Endpoint, string? Password)> proxies,
+        IReadOnlyList<ProxyChain> chains,
         CancellationToken cancellationToken = default)
     {
         var response = await SendAsync(new IpcRequest
         {
             Op = "set-proxies",
             Proxies = proxies.Select(p => ProxyDto.From(p.Endpoint, p.Password)).ToList(),
+            Chains = chains.Select(ChainDto.From).ToList(),
+        }, cancellationToken).ConfigureAwait(false);
+        return ToApplyResult(response);
+    }
+
+    public async Task<RuleApplyResult> SetDnsPolicyAsync(DnsPolicy policy, CancellationToken cancellationToken = default)
+    {
+        var response = await SendAsync(new IpcRequest
+        {
+            Op = "set-options",
+            Options = new OptionsDto { DnsPolicy = policy },
         }, cancellationToken).ConfigureAwait(false);
         return ToApplyResult(response);
     }
@@ -119,6 +158,38 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
             FailureReason = probe.FailureReason,
             Diagnostics = probe.Diagnostics,
         };
+    }
+
+    public async Task<MeasurementDto?> MeasureAsync(
+        string host, ushort port, Guid? proxyId, Guid? chainId, int samples,
+        CancellationToken cancellationToken = default)
+    {
+        var response = await SendAsync(new IpcRequest
+        {
+            Op = "measure",
+            Measure = new MeasureRequestDto
+            {
+                Host = host,
+                Port = port,
+                ProxyId = proxyId,
+                ChainId = chainId,
+                Samples = samples,
+            },
+        }, cancellationToken).ConfigureAwait(false);
+
+        return response.Ok ? response.Measurement : null;
+    }
+
+    public async Task<string?> DumpRulesetAsync(CancellationToken cancellationToken = default)
+    {
+        var response = await SendAsync(new IpcRequest { Op = "dump-ruleset" }, cancellationToken).ConfigureAwait(false);
+        return response.Ok ? response.Ruleset : response.Error;
+    }
+
+    public async Task<IReadOnlyList<string>> GetLogAsync(int lines = 200, CancellationToken cancellationToken = default)
+    {
+        var response = await SendAsync(new IpcRequest { Op = "log", Lines = lines }, cancellationToken).ConfigureAwait(false);
+        return response.Log ?? [];
     }
 
     // -- transport -----------------------------------------------------------
@@ -198,22 +269,29 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
         FailureReason = response.Error ?? response.Apply?.FailureReason,
         Diagnostics = response.Diagnostics ?? response.Apply?.Diagnostics,
         PreExistingConnections = response.Apply?.PreExistingConnections,
+        Warnings = response.Apply?.Warnings ?? [],
     };
 
-    private static ConnectionRecord ToRecord(FlowDto flow) => new()
+    private static ConnectionRecord ToRecord(ConnectionDto connection) => new()
     {
-        Id = flow.Id,
-        Local = ParseEndpoint(flow.Client),
-        Remote = ParseEndpoint(flow.Destination),
-        Protocol = flow.Protocol,
-        State = flow.State,
-        Route = flow.Route,
-        MatchedRuleId = flow.RuleId,
-        ProxyName = flow.ProxyName,
-        BytesUp = flow.BytesUp,
-        BytesDown = flow.BytesDown,
-        CreatedAtUtc = flow.CreatedAtUtc,
-        FailureReason = flow.FailureReason,
+        Id = connection.Id,
+        OwnerPid = connection.Pid,
+        ProcessDisplayName = connection.ProcessName,
+        Local = ParseEndpoint(connection.Local),
+        Remote = ParseEndpoint(connection.Remote),
+        RemoteHost = connection.Host,
+        Protocol = connection.Protocol,
+        State = connection.State,
+        KernelState = connection.KernelState,
+        Route = connection.Route,
+        MatchedRuleId = connection.RuleId,
+        MatchedRuleName = connection.RuleName,
+        ProxyName = connection.ProxyName,
+        BytesUp = connection.BytesUp,
+        BytesDown = connection.BytesDown,
+        CreatedAtUtc = connection.CreatedAtUtc,
+        FailureReason = connection.FailureReason,
+        Note = connection.Note,
     };
 
     private static IPEndPoint ParseEndpoint(string text) =>

@@ -1,6 +1,7 @@
 using System.Net;
 using Yura.Core.Connections;
 using Yura.Core.Rules;
+using Yura.Daemon.Runtime;
 
 namespace Yura.Daemon.Forwarding;
 
@@ -9,7 +10,8 @@ namespace Yura.Daemon.Forwarding;
 /// </summary>
 /// <remarks>
 /// This is the daemon-side source of truth for the Connections page. A flow only exists
-/// here because the daemon holds both its sockets, which is exactly the evidence
+/// here because the daemon holds the application's socket, and its <see cref="Route"/>
+/// records what the daemon then did with it — which is exactly the evidence
 /// <see cref="RouteObservation.ConfirmedProxied"/> demands.
 /// </remarks>
 public sealed class Flow
@@ -18,16 +20,16 @@ public sealed class Flow
     private long _bytesUp;
     private long _bytesDown;
 
-    public Flow(IPEndPoint client, IPEndPoint originalDestination, TransportProtocol protocol, Guid ruleId, string proxyName)
+    public Flow(IPEndPoint client, IPEndPoint originalDestination, TransportProtocol protocol, Guid slotRuleId)
     {
         Id = Interlocked.Increment(ref _nextId);
         Client = client;
         OriginalDestination = originalDestination;
         Protocol = protocol;
-        RuleId = ruleId;
-        ProxyName = proxyName;
+        RuleId = slotRuleId;
         CreatedAtUtc = DateTimeOffset.UtcNow;
         State = ConnectionState.Establishing;
+        Route = RouteObservation.Pending;
     }
 
     public long Id { get; }
@@ -40,9 +42,22 @@ public sealed class Flow
 
     public TransportProtocol Protocol { get; }
 
-    public Guid RuleId { get; }
+    /// <summary>The rule that decided the flow. Starts as the capturing slot's rule.</summary>
+    public Guid? RuleId { get; private set; }
 
-    public string ProxyName { get; }
+    public string? RuleName { get; private set; }
+
+    /// <summary>Display name of the proxy or chain carrying the flow, when proxied.</summary>
+    public string? ProxyName { get; private set; }
+
+    public int? OwnerPid { get; private set; }
+
+    public string? ProcessName { get; private set; }
+
+    /// <summary>Destination name from SNI, an HTTP Host header or a DNS answer.</summary>
+    public string? Host { get; private set; }
+
+    public RouteObservation Route { get; private set; }
 
     public DateTimeOffset CreatedAtUtc { get; }
 
@@ -60,7 +75,28 @@ public sealed class Flow
 
     public void AddDown(long bytes) => Interlocked.Add(ref _bytesDown, bytes);
 
-    public void MarkEstablished() => State = ConnectionState.Established;
+    /// <summary>Records the per-flow decision. The route stays Pending until the leg is up.</summary>
+    public void Describe(FlowPlan plan)
+    {
+        RuleId = plan.RuleId;
+        RuleName = plan.RuleName;
+        OwnerPid = plan.OwnerPid;
+        ProcessName = plan.ProcessName;
+        Host = plan.Host;
+        ProxyName = plan.Kind == FlowPlanKind.Proxy ? plan.RouteName : null;
+    }
+
+    public void MarkEstablished(RouteObservation route)
+    {
+        State = ConnectionState.Established;
+        Route = route;
+    }
+
+    public void MarkBlocked()
+    {
+        State = ConnectionState.Closed;
+        Route = RouteObservation.ConfirmedBlocked;
+    }
 
     public void MarkClosing() => State = ConnectionState.Closing;
 
@@ -69,6 +105,7 @@ public sealed class Flow
     public void MarkFailed(string reason)
     {
         State = ConnectionState.Failed;
+        Route = RouteObservation.Unknown;
         FailureReason = reason;
     }
 }

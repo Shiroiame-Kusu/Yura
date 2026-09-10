@@ -59,20 +59,12 @@
             <TextBlock Classes="Caption" Text="{Binding DaemonStatusText}" />
           </StackPanel>
 
-          <!-- Verification affordances. These belong in Settings for the real product;
-               they sit here so a reviewer can flip theme and language in one click while
-               comparing screenshots. -->
-          <StackPanel Spacing="4">
-            <CheckBox IsChecked="{Binding IsDarkTheme}" Content="Dark theme" FontSize="12" />
-            <CheckBox IsChecked="{Binding IsChinese}" Content="简体中文" FontSize="12" />
-            <CheckBox IsChecked="{Binding ReducedMotion}" Content="Reduced motion" FontSize="12" />
-          </StackPanel>
         </StackPanel>
       </Grid>
     </Border>
 
     <!-- ============================== Workspace ============================== -->
-    <Grid Grid.Column="1" RowDefinitions="Auto,*">
+    <Grid Grid.Column="1" RowDefinitions="Auto,Auto,*">
 
       <!-- Persistent problem banner. Not a toast: it stays true until acted on. -->
       <Border Grid.Row="0"
@@ -95,24 +87,46 @@
         </Grid>
       </Border>
 
-      <Panel Grid.Row="1">
+      <!-- Every page is kept alive rather than swapped, so search text, filters, column
+           widths and scroll position survive moving between them. The ones that poll are
+           started and stopped by the shell instead. -->
+      <!-- Configuration problems: also persistent, also actionable. -->
+      <Border Grid.Row="1"
+              Background="{DynamicResource YuraDangerSubtle}"
+              BorderBrush="{DynamicResource YuraDanger}"
+              BorderThickness="0,0,0,1"
+              Padding="24,10"
+              IsVisible="{Binding ConfigWarning, Converter={x:Static ObjectConverters.IsNotNull}}">
+        <Grid ColumnDefinitions="Auto,*">
+          <icons:SymbolIcon Grid.Column="0" Symbol="Warning" FontSize="18"
+                            Foreground="{DynamicResource YuraDanger}"
+                            VerticalAlignment="Center" Margin="0,0,10,0" />
+          <TextBlock Grid.Column="1" Classes="Caption" Text="{Binding ConfigWarning}"
+                     TextWrapping="Wrap" VerticalAlignment="Center" />
+        </Grid>
+      </Border>
+
+      <Panel Grid.Row="2">
         <views:ProcessesPage DataContext="{Binding Processes}"
                              IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsProcessesSelected}" />
 
         <views:GamesPage DataContext="{Binding Games}"
                          IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsGamesSelected}" />
 
+        <views:ConnectionsPage DataContext="{Binding Connections}"
+                               IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsConnectionsSelected}" />
+
         <views:ProxiesPage DataContext="{Binding Proxies}"
                            IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsProxiesSelected}" />
 
-        <!-- Pages that are navigable but not part of this milestone. Saying so is better
-             than a blank page that looks broken. -->
-        <StackPanel IsVisible="{Binding IsPlaceholderSelected}"
-                    HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8" MaxWidth="380">
-          <TextBlock Classes="PageTitle" Text="{Binding PlaceholderTitle}" HorizontalAlignment="Center" />
-          <TextBlock Classes="Subtitle" TextAlignment="Center"
-                     Text="This page is not part of the current milestone. The design system, Processes, Games and the proxy editor are built first, as the specification requires." />
-        </StackPanel>
+        <views:RulesPage DataContext="{Binding RulesPage}"
+                         IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsRulesSelected}" />
+
+        <views:DiagnosticsPage DataContext="{Binding Diagnostics}"
+                               IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsDiagnosticsSelected}" />
+
+        <views:SettingsPage DataContext="{Binding Settings}"
+                            IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsSettingsSelected}" />
       </Panel>
     </Grid>
   </Grid>

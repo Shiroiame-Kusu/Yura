@@ -2,59 +2,80 @@ using System.Net.Sockets;
 
 namespace Yura.Daemon.Forwarding;
 
-/// <summary>Copies bytes both ways between two sockets until both directions are done.</summary>
+/// <summary>Copies bytes both ways between the application's socket and an upstream leg.</summary>
 internal static class FlowPump
 {
     private const int BufferSize = 64 * 1024;
 
-    public static async Task RunAsync(Socket client, Socket upstream, Flow flow, CancellationToken cancellationToken)
+    public static async Task RunAsync(Socket client, UpstreamLeg upstream, Flow flow, CancellationToken cancellationToken)
     {
-        var up = CopyAsync(client, upstream, flow.AddUp, cancellationToken);
-        var down = CopyAsync(upstream, client, flow.AddDown, cancellationToken);
+        var up = CopyUpAsync(client, upstream, flow, cancellationToken);
+        var down = CopyDownAsync(upstream, client, flow, cancellationToken);
 
         // When either direction finishes, half-close the other side so the peer sees EOF,
         // then wait for the remaining direction to drain naturally.
-        var first = await Task.WhenAny(up, down).ConfigureAwait(false);
+        await Task.WhenAny(up, down).ConfigureAwait(false);
         flow.MarkClosing();
-        TryShutdown(first == up ? upstream : client);
         await Task.WhenAll(up, down).ConfigureAwait(false);
     }
 
-    private static async Task CopyAsync(Socket from, Socket to, Action<long> count, CancellationToken ct)
+    private static async Task CopyUpAsync(Socket client, UpstreamLeg upstream, Flow flow, CancellationToken ct)
     {
         var buffer = new byte[BufferSize];
         try
         {
             while (true)
             {
-                var read = await from.ReceiveAsync(buffer, ct).ConfigureAwait(false);
+                var read = await client.ReceiveAsync(buffer, ct).ConfigureAwait(false);
                 if (read == 0)
                 {
                     break;
                 }
 
-                await to.SendAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                count(read);
+                await upstream.Stream.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                await upstream.Stream.FlushAsync(ct).ConfigureAwait(false);
+                flow.AddUp(read);
             }
         }
-        catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
+        catch (Exception e) when (e is SocketException or IOException or ObjectDisposedException or OperationCanceledException)
         {
             // A reset or cancellation ends the copy; the pump's caller closes both sockets.
         }
         finally
         {
-            TryShutdown(to);
+            upstream.ShutdownSend();
         }
     }
 
-    private static void TryShutdown(Socket socket)
+    private static async Task CopyDownAsync(UpstreamLeg upstream, Socket client, Flow flow, CancellationToken ct)
     {
+        var buffer = new byte[BufferSize];
         try
         {
-            socket.Shutdown(SocketShutdown.Send);
+            while (true)
+            {
+                var read = await upstream.Stream.ReadAsync(buffer, ct).ConfigureAwait(false);
+                if (read == 0)
+                {
+                    break;
+                }
+
+                await client.SendAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                flow.AddDown(read);
+            }
         }
-        catch (Exception e) when (e is SocketException or ObjectDisposedException)
+        catch (Exception e) when (e is SocketException or IOException or ObjectDisposedException or OperationCanceledException)
         {
+        }
+        finally
+        {
+            try
+            {
+                client.Shutdown(SocketShutdown.Send);
+            }
+            catch (Exception e) when (e is SocketException or ObjectDisposedException)
+            {
+            }
         }
     }
 }

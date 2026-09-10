@@ -29,7 +29,7 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
     private readonly Dictionary<string, ProcessRowViewModel> _rows = [];
     private readonly DispatcherTimer _timer;
     private readonly uint _currentUid;
-    private IReadOnlyDictionary<int, int> _connectionCounts = new Dictionary<int, int>();
+    private IReadOnlyDictionary<int, int>? _connectionCounts;
     private bool _countsInFlight;
 
     public ProcessesPageViewModel(ProcProcessSource source, IDaemonClient daemon, RuleStore rules)
@@ -187,8 +187,9 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
         var snapshots = _source.Enumerate();
         var seen = new HashSet<string>(snapshots.Count);
 
-        // Only the daemon can attribute sockets to processes it does not own. With no daemon
-        // the count is genuinely unknown, and null renders as "—" rather than a misleading 0.
+        // Only the daemon can attribute sockets to processes it does not own. With no daemon —
+        // or before its first answer has arrived — the count is genuinely unknown, and null
+        // renders as "—" rather than a misleading 0.
         var counts = _daemon.State == DaemonState.Connected ? _connectionCounts : null;
 
         foreach (var raw in snapshots)
@@ -241,8 +242,8 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
         catch (Exception)
         {
             // A daemon that went away mid-refresh is not an error worth surfacing here;
-            // the next pass reverts the column to "unknown".
-            _connectionCounts = new Dictionary<int, int>();
+            // the column reverts to "unknown" rather than claiming zero.
+            _connectionCounts = null;
         }
         finally
         {
@@ -252,6 +253,8 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
 
     private void ApplyPolicies()
     {
+        RefreshCoveringRules();
+
         foreach (var row in _rows.Values)
         {
             var (kind, detail) = _rules.DescribePolicy(row.Snapshot);
@@ -352,6 +355,95 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
         }
     }
 
+    /// <summary>Every rule covering the selected process, in evaluation order.</summary>
+    public ObservableCollection<CoveringRule> CoveringRules { get; } = [];
+
+    public bool HasCoveringRules => CoveringRules.Count > 0;
+
+    private void RefreshCoveringRules()
+    {
+        CoveringRules.Clear();
+        if (SelectedProcess is not { } row)
+        {
+            OnPropertyChanged(nameof(HasCoveringRules));
+            return;
+        }
+
+        var covering = _rules.RulesFor(row.Snapshot);
+        for (var i = 0; i < covering.Count; i++)
+        {
+            var rule = covering[i];
+            var routeName = rule.Action switch
+            {
+                RuleAction.Proxy p => _rules.RouteName(p.EndpointId),
+                RuleAction.Chain c => _rules.RouteName(c.ChainId),
+                _ => null,
+            };
+            var detail = rule.Destination.IsUnconstrained
+                ? Localization.RuleDescriber.Route(rule.Action, routeName)
+                : $"{Localization.RuleDescriber.Destination(rule.Destination)} ⇒ {Localization.RuleDescriber.Route(rule.Action, routeName)}";
+            CoveringRules.Add(new CoveringRule(
+                rule.Order.ToString(System.Globalization.CultureInfo.CurrentCulture),
+                rule.Name,
+                detail,
+                // Only the first enabled one decides anything; the rest are shadowed.
+                IsWinner: rule.Enabled && covering.Take(i).All(r => !r.Enabled)));
+        }
+
+        OnPropertyChanged(nameof(HasCoveringRules));
+    }
+
+    /// <summary>
+    /// Raised when the user asks to see a process's connections. The shell switches page and
+    /// filters, rather than this page reaching into another one.
+    /// </summary>
+    public event EventHandler<ProcessSnapshot>? InspectConnectionsRequested;
+
+    /// <summary>Raised when the user wants to treat a running process as a game.</summary>
+    public event EventHandler<ProcessSnapshot>? AddAsGameRequested;
+
+    [RelayCommand]
+    private void InspectConnections()
+    {
+        if (SelectedProcess is { } row)
+        {
+            InspectConnectionsRequested?.Invoke(this, row.Snapshot);
+        }
+    }
+
+    [RelayCommand]
+    private void AddAsGame()
+    {
+        if (SelectedProcess is { } row)
+        {
+            AddAsGameRequested?.Invoke(this, row.Snapshot);
+        }
+    }
+
+    /// <summary>
+    /// Stops the refresh timer while the page is not visible.
+    /// </summary>
+    /// <remarks>
+    /// Enumerating /proc for several hundred processes twice a second is not free, and a page
+    /// nobody is looking at should not cost it. The specification asks for exactly this:
+    /// reduce visual refresh work when the window is not in use.
+    /// </remarks>
+    public void SetActive(bool active)
+    {
+        if (active)
+        {
+            if (!IsPaused)
+            {
+                Refresh();
+                _timer.Start();
+            }
+        }
+        else
+        {
+            _timer.Stop();
+        }
+    }
+
     /// <summary>Re-evaluates everything gated on the daemon being reachable.</summary>
     public void NotifyDaemonStateChanged()
     {
@@ -369,6 +461,7 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
         OnPropertyChanged(nameof(ApplyBlockedReason));
         LastApplied = null;
         ErrorMessage = null;
+        RefreshCoveringRules();
     }
 
     // -- actions -------------------------------------------------------------
@@ -490,6 +583,9 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
 
     public void Dispose() => _timer.Stop();
 }
+
+/// <summary>One rule that covers the selected process, and whether it is the one that wins.</summary>
+public sealed record CoveringRule(string Position, string Name, string Detail, bool IsWinner);
 
 /// <summary>The three rule scopes offered on the Processes page.</summary>
 public enum RuleScopeChoice

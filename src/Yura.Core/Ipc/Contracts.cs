@@ -35,7 +35,11 @@ public static class IpcProtocol
 
 public sealed class IpcRequest
 {
-    /// <summary>status | set-proxies | apply-rule | remove-rule | list-rules | list-flows | probe-proxy | connection-counts</summary>
+    /// <summary>
+    /// status | set-proxies | set-options | apply-rule | remove-rule | list-rules |
+    /// list-flows | list-connections | connection-counts | probe-proxy | measure |
+    /// dump-ruleset | log
+    /// </summary>
     public required string Op { get; init; }
 
     public RuleDto? Rule { get; init; }
@@ -44,7 +48,19 @@ public sealed class IpcRequest
 
     public List<ProxyDto>? Proxies { get; init; }
 
+    public List<ChainDto>? Chains { get; init; }
+
     public ProxyDto? Proxy { get; init; }
+
+    public OptionsDto? Options { get; init; }
+
+    public MeasureRequestDto? Measure { get; init; }
+
+    /// <summary>For list-connections: restrict to one owning pid.</summary>
+    public int? Pid { get; init; }
+
+    /// <summary>For log: how many trailing lines to return.</summary>
+    public int? Lines { get; init; }
 }
 
 public sealed class IpcResponse
@@ -63,9 +79,18 @@ public sealed class IpcResponse
 
     public List<FlowDto>? Flows { get; init; }
 
+    public List<ConnectionDto>? Connections { get; init; }
+
     public ProbeResultDto? Probe { get; init; }
 
+    public MeasurementDto? Measurement { get; init; }
+
     public Dictionary<int, int>? Counts { get; init; }
+
+    /// <summary>For dump-ruleset: the installed nftables table, routes and rules as text.</summary>
+    public string? Ruleset { get; init; }
+
+    public List<string>? Log { get; init; }
 
     public static IpcResponse Failure(string error, string? diagnostics = null) =>
         new() { Ok = false, Error = error, Diagnostics = diagnostics };
@@ -80,6 +105,41 @@ public sealed class StatusDto
     public required int ActiveFlows { get; init; }
 
     public required long UptimeSeconds { get; init; }
+
+    /// <summary>Number of process groups (cgroups) currently in use.</summary>
+    public int ActiveGroups { get; init; }
+
+    /// <summary>"netlink" when process events are delivered by the kernel, otherwise why not.</summary>
+    public string? ProcessWatcher { get; init; }
+
+    public DnsPolicy DnsPolicy { get; init; }
+
+    public string? KernelRelease { get; init; }
+
+    public string? NftVersion { get; init; }
+
+    public string? CgroupRoot { get; init; }
+
+    public string? SocketPath { get; init; }
+
+    public List<uint> AllowedUids { get; init; } = [];
+
+    /// <summary>Environment checks the daemon ran at startup, each with its outcome.</summary>
+    public List<CheckDto> Checks { get; init; } = [];
+}
+
+public sealed class CheckDto
+{
+    public required string Name { get; init; }
+
+    public required bool Passed { get; init; }
+
+    public string? Detail { get; init; }
+}
+
+public sealed class OptionsDto
+{
+    public DnsPolicy DnsPolicy { get; init; }
 }
 
 public sealed class ApplyResultDto
@@ -117,6 +177,55 @@ public sealed class ProbeResultDto
     public string? Diagnostics { get; init; }
 }
 
+public sealed class MeasureRequestDto
+{
+    public required string Host { get; init; }
+
+    public required ushort Port { get; init; }
+
+    /// <summary>Measure through this proxy as well as directly. Null measures direct only.</summary>
+    public Guid? ProxyId { get; init; }
+
+    public Guid? ChainId { get; init; }
+
+    public int Samples { get; init; } = 5;
+}
+
+/// <summary>One side of a direct-versus-routed comparison, measured the same way.</summary>
+public sealed class SampleSetDto
+{
+    public required int Samples { get; init; }
+
+    public required int Successes { get; init; }
+
+    /// <summary>Median round trip of the successful samples. Null when none succeeded.</summary>
+    public double? LatencyMilliseconds { get; init; }
+
+    /// <summary>Mean absolute deviation of the successful samples. Null with fewer than two.</summary>
+    public double? JitterMilliseconds { get; init; }
+
+    public double? LossPercent { get; init; }
+
+    public string? FailureReason { get; init; }
+
+    public List<double> RoundTripsMilliseconds { get; init; } = [];
+}
+
+public sealed class MeasurementDto
+{
+    /// <summary>The literal address both sides were measured against.</summary>
+    public required string Target { get; init; }
+
+    /// <summary>What was measured: "TCP connect".</summary>
+    public required string Method { get; init; }
+
+    public required SampleSetDto Direct { get; init; }
+
+    public SampleSetDto? Routed { get; init; }
+
+    public required DateTimeOffset MeasuredAtUtc { get; init; }
+}
+
 public sealed class ProxyDto
 {
     public required Guid Id { get; init; }
@@ -137,6 +246,8 @@ public sealed class ProxyDto
     /// </summary>
     public string? Password { get; init; }
 
+    public bool AllowInvalidCertificate { get; init; }
+
     public static ProxyDto From(ProxyEndpoint endpoint, string? password) => new()
     {
         Id = endpoint.Id,
@@ -146,6 +257,7 @@ public sealed class ProxyDto
         Port = endpoint.Port,
         Username = endpoint.Username,
         Password = password,
+        AllowInvalidCertificate = endpoint.AllowInvalidCertificate,
     };
 
     public ProxyEndpoint ToEndpoint() => new()
@@ -156,7 +268,26 @@ public sealed class ProxyDto
         Host = Host,
         Port = Port,
         Username = Username,
+        AllowInvalidCertificate = AllowInvalidCertificate,
     };
+}
+
+public sealed class ChainDto
+{
+    public required Guid Id { get; init; }
+
+    public required string Name { get; init; }
+
+    public required List<Guid> Hops { get; init; }
+
+    public static ChainDto From(ProxyChain chain) => new()
+    {
+        Id = chain.Id,
+        Name = chain.Name,
+        Hops = chain.Hops.ToList(),
+    };
+
+    public ProxyChain ToChain() => new() { Id = Id, Name = Name, Hops = Hops.ToArray() };
 }
 
 public sealed class RuleDto
@@ -174,6 +305,8 @@ public sealed class RuleDto
     public required RuleLifetime Lifetime { get; init; }
 
     public required DateTimeOffset CreatedAtUtc { get; init; }
+
+    public string? Notes { get; init; }
 
     // -- process side
     public required ProcessSelectorKind ProcessKind { get; init; }
@@ -220,6 +353,7 @@ public sealed class RuleDto
         Origin = rule.Origin,
         Lifetime = rule.Lifetime,
         CreatedAtUtc = rule.CreatedAtUtc,
+        Notes = rule.Notes,
         ProcessKind = rule.Process.Kind,
         Pid = rule.Process.Identity?.Pid,
         StartTicks = rule.Process.Identity?.StartTicks,
@@ -292,6 +426,7 @@ public sealed class RuleDto
             Origin = Origin,
             Lifetime = Lifetime,
             CreatedAtUtc = CreatedAtUtc,
+            Notes = Notes,
             Process = new ProcessSelector
             {
                 Kind = ProcessKind,
@@ -314,16 +449,21 @@ public sealed class RuleDto
         };
     }
 
-    private static HostPattern ParseHost(string text) => text switch
+    public static HostPattern ParseHost(string text)
     {
-        _ when text.StartsWith("*.", StringComparison.Ordinal) => new HostPattern(HostMatchKind.Suffix, text[2..]),
-        _ when text.StartsWith('*') && text.EndsWith('*') && text.Length > 2 =>
-            new HostPattern(HostMatchKind.Keyword, text[1..^1]),
-        _ => new HostPattern(HostMatchKind.Exact, text),
-    };
+        text = text.Trim();
+        return text switch
+        {
+            _ when text.StartsWith("*.", StringComparison.Ordinal) => new HostPattern(HostMatchKind.Suffix, text[2..]),
+            _ when text.StartsWith('*') && text.EndsWith('*') && text.Length > 2 =>
+                new HostPattern(HostMatchKind.Keyword, text[1..^1]),
+            _ => new HostPattern(HostMatchKind.Exact, text),
+        };
+    }
 
-    private static IPNetwork ParseNetwork(string text)
+    public static IPNetwork ParseNetwork(string text)
     {
+        text = text.Trim();
         if (IPNetwork.TryParse(text, out var network))
         {
             return network;
@@ -352,9 +492,18 @@ public sealed class FlowDto
 
     public required RouteObservation Route { get; init; }
 
-    public required Guid RuleId { get; init; }
+    public Guid? RuleId { get; init; }
 
-    public required string ProxyName { get; init; }
+    public string? RuleName { get; init; }
+
+    public string? ProxyName { get; init; }
+
+    public int? OwnerPid { get; init; }
+
+    public string? ProcessName { get; init; }
+
+    /// <summary>Destination name learned from SNI, an HTTP Host header or a DNS answer.</summary>
+    public string? Host { get; init; }
 
     public required long BytesUp { get; init; }
 
@@ -363,4 +512,47 @@ public sealed class FlowDto
     public required DateTimeOffset CreatedAtUtc { get; init; }
 
     public string? FailureReason { get; init; }
+}
+
+/// <summary>
+/// One row for the Connections page: a flow the daemon is relaying, or a kernel socket it
+/// merely observed. The two are distinguished by <see cref="Route"/>, never conflated.
+/// </summary>
+public sealed class ConnectionDto
+{
+    public required string Id { get; init; }
+
+    public int? Pid { get; init; }
+
+    public string? ProcessName { get; init; }
+
+    public required string Local { get; init; }
+
+    public required string Remote { get; init; }
+
+    public required TransportProtocol Protocol { get; init; }
+
+    public ConnectionState State { get; init; }
+
+    public string? KernelState { get; init; }
+
+    public required RouteObservation Route { get; init; }
+
+    public Guid? RuleId { get; init; }
+
+    public string? RuleName { get; init; }
+
+    public string? ProxyName { get; init; }
+
+    public long? BytesUp { get; init; }
+
+    public long? BytesDown { get; init; }
+
+    public DateTimeOffset? CreatedAtUtc { get; init; }
+
+    public string? FailureReason { get; init; }
+
+    public string? Host { get; init; }
+
+    public string? Note { get; init; }
 }

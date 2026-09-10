@@ -39,6 +39,20 @@ public sealed class EnumToBoolConverter : IValueConverter
     }
 }
 
+/// <summary>Renders a <see cref="Yura.Core.Rules.DnsPolicy"/> as the choice it represents.</summary>
+public sealed class DnsPolicyDisplayConverter : IValueConverter
+{
+    public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture) =>
+        value is Yura.Core.Rules.DnsPolicy policy
+            ? Yura.App.Localization.Loc.Current[policy == Yura.Core.Rules.DnsPolicy.ThroughProxy
+                ? "Settings.Dns.ThroughProxy"
+                : "Settings.Dns.Direct"]
+            : value?.ToString();
+
+    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) =>
+        BindingOperations.DoNothing;
+}
+
 /// <summary>Renders a <see cref="Yura.Core.Proxies.ProxyProtocol"/> the way it is written.</summary>
 public sealed class ProtocolDisplayConverter : IValueConverter
 {

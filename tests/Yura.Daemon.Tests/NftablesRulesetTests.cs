@@ -11,7 +11,8 @@ namespace Yura.Daemon.Tests;
 /// <summary>
 /// The ruleset builder is pure, so the exact text the daemon hands to nft can be checked
 /// without root. These pin the properties that keep routing correct: order, the loop
-/// guards, and refusing to install what the kernel cannot express.
+/// guards, one match per (rule, group) pair, and refusing to install what the kernel
+/// cannot express.
 /// </summary>
 public sealed class NftablesRulesetTests
 {
@@ -36,8 +37,22 @@ public sealed class NftablesRulesetTests
             CreatedAtUtc = DateTimeOffset.UnixEpoch,
         };
 
-    private static RuleSlot Slot(int index, RoutingRule rule, SlotDisposition disposition) =>
-        new() { Index = index, Rule = rule, Disposition = disposition };
+    private static ProcessGroup Group(int index, params RoutingRule[] rules) =>
+        new() { Index = index, RuleIds = rules.Select(r => r.Id).ToHashSet() };
+
+    /// <summary>
+    /// The port is the one the kernel handed the listener; 17800 + index here only so the
+    /// expectations below stay readable.
+    /// </summary>
+    private static RuleSlot Slot(int index, RoutingRule rule, SlotDisposition disposition, params ProcessGroup[] groups) =>
+        new()
+        {
+            Index = index,
+            Rule = rule,
+            Disposition = disposition,
+            Groups = groups,
+            Port = disposition == SlotDisposition.Capture ? 17800 + index : 0,
+        };
 
     [Fact]
     public void Always_guards_against_its_own_upstream_traffic_and_loopback()
@@ -64,50 +79,80 @@ public sealed class NftablesRulesetTests
     }
 
     [Fact]
-    public void A_proxy_slot_marks_accepts_and_gets_a_tproxy_rule_for_both_transports()
+    public void A_capture_slot_marks_accepts_and_gets_a_tproxy_rule_for_both_transports()
     {
-        var slot = Slot(7, Rule("r", 0, new RuleAction.Proxy(ProxyA)), SlotDisposition.Proxy);
+        var rule = Rule("r", 0, new RuleAction.Proxy(ProxyA));
+        var slot = Slot(7, rule, SlotDisposition.Capture, Group(3, rule));
 
         var text = NftablesManager.Build([slot], []);
 
-        Assert.Contains("socket cgroupv2 level 2 \"yura/s007\" meta mark set 0x7107 counter accept", text);
+        Assert.Contains("socket cgroupv2 level 2 \"yura/g003\" meta mark set 0x7107 counter accept", text);
         Assert.Contains("meta mark 0x7107 meta l4proto tcp tproxy ip to :17807 counter accept", text);
         Assert.Contains("meta mark 0x7107 meta l4proto udp tproxy ip to :17807 counter accept", text);
     }
 
     [Fact]
-    public void A_block_slot_resets_tcp_and_rejects_the_rest()
+    public void A_rule_covering_several_groups_is_emitted_once_per_group()
     {
-        var slot = Slot(2, Rule("b", 0, RuleAction.Block.Instance), SlotDisposition.Block);
+        var rule = Rule("r", 0, new RuleAction.Proxy(ProxyA));
+        var slot = Slot(1, rule, SlotDisposition.Capture, Group(1, rule), Group(2, rule));
 
         var text = NftablesManager.Build([slot], []);
 
-        Assert.Contains("socket cgroupv2 level 2 \"yura/s002\" meta l4proto tcp counter reject with tcp reset", text);
-        Assert.Contains("socket cgroupv2 level 2 \"yura/s002\" counter reject", text);
+        Assert.Contains("\"yura/g001\" meta mark set 0x7101", text);
+        Assert.Contains("\"yura/g002\" meta mark set 0x7101", text);
+    }
+
+    [Fact]
+    public void A_process_rule_with_no_running_match_installs_nothing_but_says_so()
+    {
+        var rule = Rule("idle", 0, new RuleAction.Proxy(ProxyA));
+        var slot = Slot(1, rule, SlotDisposition.Capture);
+
+        var text = NftablesManager.Build([slot], []);
+
+        Assert.Contains("no running process matches this rule yet", text);
+        Assert.DoesNotContain("meta mark set", text.Split("chain capture")[0]);
+    }
+
+    [Fact]
+    public void A_block_slot_resets_tcp_and_rejects_the_rest()
+    {
+        var rule = Rule("b", 0, RuleAction.Block.Instance);
+        var slot = Slot(2, rule, SlotDisposition.Block, Group(1, rule));
+
+        var text = NftablesManager.Build([slot], []);
+
+        Assert.Contains("socket cgroupv2 level 2 \"yura/g001\" meta l4proto tcp counter reject with tcp reset", text);
+        Assert.Contains("socket cgroupv2 level 2 \"yura/g001\" counter reject", text);
         Assert.DoesNotContain("tproxy", text.Split("chain capture")[1]);
     }
 
     [Fact]
     public void A_direct_slot_accepts_without_marking()
     {
-        var slot = Slot(3, Rule("d", 0, RuleAction.Direct.Instance), SlotDisposition.Direct);
+        var rule = Rule("d", 0, RuleAction.Direct.Instance);
+        var slot = Slot(3, rule, SlotDisposition.Direct, Group(1, rule));
 
         var text = NftablesManager.Build([slot], []);
         var classify = text.Split("chain capture")[0];
 
-        Assert.Contains("socket cgroupv2 level 2 \"yura/s003\" counter accept", classify);
+        Assert.Contains("socket cgroupv2 level 2 \"yura/g001\" counter accept", classify);
         Assert.DoesNotContain("meta mark set", classify);
     }
 
     [Fact]
     public void Slots_are_emitted_in_the_order_given_so_first_match_semantics_hold()
     {
-        var first = Slot(5, Rule("first", 0, RuleAction.Direct.Instance), SlotDisposition.Direct);
-        var second = Slot(1, Rule("second", 1, new RuleAction.Proxy(ProxyA)), SlotDisposition.Proxy);
+        var a = Rule("first", 0, RuleAction.Direct.Instance);
+        var b = Rule("second", 1, new RuleAction.Proxy(ProxyA));
+        var group = Group(1, a, b);
+        var first = Slot(5, a, SlotDisposition.Direct, group);
+        var second = Slot(1, b, SlotDisposition.Capture, group);
 
         var text = NftablesManager.Build([first, second], []);
 
-        Assert.True(text.IndexOf("yura/s005", StringComparison.Ordinal) < text.IndexOf("yura/s001", StringComparison.Ordinal),
+        Assert.True(text.IndexOf("# s005", StringComparison.Ordinal) < text.IndexOf("# s001", StringComparison.Ordinal),
             "slot order must follow rule order, not slot index");
     }
 
@@ -121,24 +166,42 @@ public sealed class NftablesRulesetTests
             Protocol = TransportFilter.Tcp,
         });
 
-        var text = NftablesManager.Build([Slot(1, rule, SlotDisposition.Proxy)], []);
+        var text = NftablesManager.Build([Slot(1, rule, SlotDisposition.Capture, Group(1, rule))], []);
 
         Assert.Contains("meta l4proto tcp ip daddr { 203.0.113.0/24, 198.51.100.7 } th dport { 443, 27000-27100 } socket cgroupv2", text);
     }
 
     [Fact]
-    public void A_host_name_rule_is_skipped_and_reported_rather_than_over_capturing()
+    public void A_host_name_rule_on_a_process_captures_everything_else_about_it_and_leaves_the_name_to_the_listener()
     {
-        var rule = Rule("host", 0, new RuleAction.Proxy(ProxyA), destination: new DestinationSelector
+        var rule = Rule("host", 0, RuleAction.Block.Instance, destination: new DestinationSelector
+        {
+            Hosts = [new HostPattern(HostMatchKind.Suffix, "example.com")],
+            Ports = [new PortRange(443, 443)],
+        });
+        var skipped = new List<string>();
+
+        // The runtime turns any host rule into a Capture slot regardless of its action.
+        var text = NftablesManager.Build([Slot(1, rule, SlotDisposition.Capture, Group(1, rule))], [], skipped: skipped);
+
+        Assert.Empty(skipped);
+        Assert.Contains("th dport { 443 } socket cgroupv2 level 2 \"yura/g001\" meta mark set 0x7101 counter accept", text);
+        Assert.DoesNotContain("example.com", text.Split("chain classify")[1].Split("# s001")[1].Split('\n')[1]);
+    }
+
+    [Fact]
+    public void A_host_name_rule_without_a_process_selector_is_refused_rather_than_capturing_the_machine()
+    {
+        var rule = Rule("host", 0, new RuleAction.Proxy(ProxyA), process: ProcessSelector.Any, destination: new DestinationSelector
         {
             Hosts = [new HostPattern(HostMatchKind.Suffix, "example.com")],
         });
         var skipped = new List<string>();
 
-        var text = NftablesManager.Build([Slot(1, rule, SlotDisposition.Proxy)], [], skipped);
+        var text = NftablesManager.Build([Slot(1, rule, SlotDisposition.Capture)], [], skipped: skipped);
 
         Assert.Single(skipped);
-        Assert.Contains("host-name", skipped[0]);
+        Assert.Contains("process selector", skipped[0]);
         Assert.DoesNotContain("meta mark set", text);
     }
 
@@ -148,7 +211,7 @@ public sealed class NftablesRulesetTests
         var rule = Rule("everything", 0, new RuleAction.Proxy(ProxyA), process: ProcessSelector.Any);
         var skipped = new List<string>();
 
-        var text = NftablesManager.Build([Slot(1, rule, SlotDisposition.Proxy)], [], skipped);
+        var text = NftablesManager.Build([Slot(1, rule, SlotDisposition.Capture)], [], skipped: skipped);
 
         Assert.Single(skipped);
         Assert.Contains("all traffic", skipped[0]);
@@ -162,10 +225,48 @@ public sealed class NftablesRulesetTests
             process: ProcessSelector.Any,
             destination: new DestinationSelector { Ports = [new PortRange(25, 25)] });
 
-        var text = NftablesManager.Build([Slot(4, rule, SlotDisposition.Proxy)], []);
+        var text = NftablesManager.Build([Slot(4, rule, SlotDisposition.Capture)], []);
 
         Assert.Contains("th dport { 25 } meta mark set 0x7104 counter accept", text);
         Assert.DoesNotContain("cgroupv2", text);
+    }
+
+    [Fact]
+    public void Direct_dns_policy_lets_port_53_out_before_the_capture_line_for_proxy_rules_only()
+    {
+        var proxied = Rule("p", 0, new RuleAction.Proxy(ProxyA));
+        var blocked = Rule("b", 1, RuleAction.Block.Instance);
+        var group = Group(1, proxied, blocked);
+        var slots = new[]
+        {
+            Slot(1, proxied, SlotDisposition.Capture, group),
+            Slot(2, blocked, SlotDisposition.Block, group),
+        };
+
+        var text = NftablesManager.Build(slots, [], new DaemonOptions { DnsPolicy = DnsPolicy.Direct });
+
+        var bypass = text.IndexOf("\"yura/g001\" th dport 53 counter accept", StringComparison.Ordinal);
+        var capture = text.IndexOf("\"yura/g001\" meta mark set 0x7101", StringComparison.Ordinal);
+        Assert.True(bypass >= 0 && bypass < capture, "the DNS bypass must precede the capture line");
+        Assert.Equal(1, text.Split("th dport 53").Length - 1);
+
+        var defaultPolicy = NftablesManager.Build(slots, []);
+        Assert.DoesNotContain("th dport 53", defaultPolicy);
+    }
+
+    [Fact]
+    public void A_capture_slot_with_no_listener_is_left_out_rather_than_black_holing_traffic()
+    {
+        var rule = Rule("r", 0, new RuleAction.Proxy(ProxyA));
+        var slot = Slot(1, rule, SlotDisposition.Capture, Group(1, rule)) with { Port = 0 };
+        var skipped = new List<string>();
+
+        var text = NftablesManager.Build([slot], [], skipped: skipped);
+
+        Assert.Single(skipped);
+        Assert.Contains("no transparent listener", skipped[0]);
+        Assert.DoesNotContain("meta mark set", text);
+        Assert.DoesNotContain("tproxy", text);
     }
 
     [Fact]
@@ -177,5 +278,15 @@ public sealed class NftablesRulesetTests
             Assert.Equal(PolicyRouting.MarkBase, slot.Mark & PolicyRouting.MarkMask);
             Assert.NotEqual(PolicyRouting.BypassMark, slot.Mark);
         }
+    }
+
+    [Fact]
+    public void Groups_with_the_same_rule_set_share_a_key_regardless_of_order()
+    {
+        var a = Guid.NewGuid();
+        var b = Guid.NewGuid();
+
+        Assert.Equal(ProcessGroup.KeyFor([a, b]), ProcessGroup.KeyFor([b, a]));
+        Assert.NotEqual(ProcessGroup.KeyFor([a]), ProcessGroup.KeyFor([a, b]));
     }
 }

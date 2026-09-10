@@ -39,12 +39,15 @@ public sealed class NftablesManager
     /// </summary>
     /// <param name="slots">Already in evaluation order. First match wins, as in the rule list.</param>
     /// <param name="proxies">Configured endpoints, so traffic to them is never captured.</param>
+    /// <param name="options">Daemon-wide policy, currently what to do with DNS.</param>
     /// <param name="skipped">Receives one line per rule that could not be expressed in the kernel.</param>
     public static string Build(
         IReadOnlyList<RuleSlot> slots,
         IReadOnlyList<ProxyEndpoint> proxies,
+        DaemonOptions? options = null,
         List<string>? skipped = null)
     {
+        options ??= new DaemonOptions();
         var sb = new StringBuilder();
 
         // Declare-then-flush-then-define: one transaction, idempotent whether or not the
@@ -88,7 +91,7 @@ public sealed class NftablesManager
 
         foreach (var slot in slots)
         {
-            if (!TryRenderSlotMatch(slot, out var match, out var reason))
+            if (!TryRenderBaseMatch(slot, out var baseMatch, out var reason))
             {
                 skipped?.Add($"{slot.Rule.Name}: {reason}");
                 sb.Append(CultureInfo.InvariantCulture, $"    # slot {slot.Name} ({slot.Rule.Name}) skipped: {reason}\n");
@@ -96,27 +99,33 @@ public sealed class NftablesManager
             }
 
             sb.Append(CultureInfo.InvariantCulture, $"    # {slot.Name}: {slot.Rule.Name}\n");
-            switch (slot.Disposition)
+
+            if (slot.Disposition == SlotDisposition.Capture && slot.Port == 0)
             {
-                case SlotDisposition.Proxy:
-                    // 'accept' ends evaluation so a broader rule further down cannot
-                    // overwrite the mark; the route hook still re-routes because the mark
-                    // changed.
-                    // 'counter' on every slot rule is deliberate: per-rule packet counts are
-                    // the first thing to look at when a rule "does nothing", and they cost
-                    // nothing to keep.
-                    sb.Append(CultureInfo.InvariantCulture,
-                        $"    {match} meta mark set 0x{slot.Mark:x} counter accept\n");
-                    break;
-                case SlotDisposition.Block:
-                    sb.Append(CultureInfo.InvariantCulture,
-                        $"    {match} meta l4proto tcp counter reject with tcp reset\n");
-                    sb.Append(CultureInfo.InvariantCulture,
-                        $"    {match} counter reject\n");
-                    break;
-                case SlotDisposition.Direct:
-                    sb.Append(CultureInfo.InvariantCulture, $"    {match} counter accept\n");
-                    break;
+                // No listener, so nothing to hand the traffic to. Marking it would send it
+                // into a hole; leaving it alone keeps the application working.
+                skipped?.Add($"{slot.Rule.Name}: no transparent listener is available");
+                sb.Append(CultureInfo.InvariantCulture, $"    # slot {slot.Name} ({slot.Rule.Name}) skipped: no listener\n");
+                continue;
+            }
+
+            if (slot.UsesCgroup)
+            {
+                if (slot.Groups.Count == 0)
+                {
+                    sb.Append("    # (no running process matches this rule yet)\n");
+                    continue;
+                }
+
+                foreach (var group in slot.Groups)
+                {
+                    var match = $"{baseMatch} socket cgroupv2 level {CgroupManager.Level} \"{CgroupManager.RelativePathFor(group.Name)}\"";
+                    AppendDisposition(sb, slot, match, options);
+                }
+            }
+            else
+            {
+                AppendDisposition(sb, slot, baseMatch, options);
             }
         }
 
@@ -125,7 +134,7 @@ public sealed class NftablesManager
         // ---- capture: hand each marked flow to its slot's listener.
         sb.Append("  chain capture {\n");
         sb.Append("    type filter hook prerouting priority mangle; policy accept;\n");
-        foreach (var slot in slots.Where(s => s.Disposition == SlotDisposition.Proxy))
+        foreach (var slot in slots.Where(s => s.Disposition == SlotDisposition.Capture && s.Port > 0))
         {
             sb.Append(CultureInfo.InvariantCulture,
                 $"    meta mark 0x{slot.Mark:x} meta l4proto tcp tproxy ip to :{slot.Port} counter accept\n");
@@ -138,22 +147,54 @@ public sealed class NftablesManager
         return sb.ToString();
     }
 
+    private static void AppendDisposition(StringBuilder sb, RuleSlot slot, string match, DaemonOptions options)
+    {
+        switch (slot.Disposition)
+        {
+            case SlotDisposition.Capture:
+                if (options.DnsPolicy == DnsPolicy.Direct && slot.Rule.Action.RequiresProxy)
+                {
+                    // DNS bypass: name lookups leave directly instead of through the proxy.
+                    // Emitted before the capture line so it wins for port 53 only.
+                    sb.Append(CultureInfo.InvariantCulture, $"    {match} th dport 53 counter accept\n");
+                }
+
+                // 'accept' ends evaluation so a broader rule further down cannot overwrite
+                // the mark; the route hook still re-routes because the mark changed.
+                // 'counter' on every slot rule is deliberate: per-rule packet counts are the
+                // first thing to look at when a rule "does nothing", and they cost nothing.
+                sb.Append(CultureInfo.InvariantCulture,
+                    $"    {match} meta mark set 0x{slot.Mark:x} counter accept\n");
+                break;
+            case SlotDisposition.Block:
+                sb.Append(CultureInfo.InvariantCulture,
+                    $"    {match} meta l4proto tcp counter reject with tcp reset\n");
+                sb.Append(CultureInfo.InvariantCulture,
+                    $"    {match} counter reject\n");
+                break;
+            case SlotDisposition.Direct:
+                sb.Append(CultureInfo.InvariantCulture, $"    {match} counter accept\n");
+                break;
+        }
+    }
+
     /// <summary>
-    /// Renders the match expression for a slot, or explains why the kernel cannot express it.
+    /// Renders the destination part of a slot's match, or explains why the kernel cannot
+    /// express the rule at all. Host names are deliberately left out: they are matched by
+    /// the listener, which is why any rule that names one is a Capture slot.
     /// </summary>
-    private static bool TryRenderSlotMatch(RuleSlot slot, out string match, out string reason)
+    private static bool TryRenderBaseMatch(RuleSlot slot, out string match, out string reason)
     {
         match = string.Empty;
         reason = string.Empty;
 
         var destination = slot.Rule.Destination;
-        if (destination.Hosts.Count > 0)
+
+        if (destination.Hosts.Count > 0 && !slot.UsesCgroup)
         {
-            // Host names are not visible at the packet layer. Matching them needs the
-            // forwarder to sniff SNI/Host and decide per flow, which is not implemented.
-            // Installing the rule without the constraint would capture traffic the user
-            // never asked for, so it is left out and reported instead.
-            reason = "host-name destinations are not supported in the kernel classifier yet";
+            // Matching a name means capturing the flow to look at it. For a rule with no
+            // process selector that would mean capturing the whole machine's traffic.
+            reason = "host-name rules need a process selector; add one, or match on an address instead";
             return false;
         }
 
@@ -191,11 +232,7 @@ public sealed class NftablesManager
             parts.Add($"th dport {{ {set} }}");
         }
 
-        if (slot.UsesCgroup)
-        {
-            parts.Add($"socket cgroupv2 level {CgroupManager.Level} \"{CgroupManager.RelativePathFor(slot.Name)}\"");
-        }
-        else if (destination.IsUnconstrained)
+        if (!slot.UsesCgroup && destination.IsUnconstrained)
         {
             // Any process, any destination, would capture the entire machine including
             // the daemon's control traffic. Refuse rather than let a mis-click do that.
@@ -222,6 +259,14 @@ public sealed class NftablesManager
     /// <summary>Validates without installing. Used at startup to fail fast on syntax or kernel support.</summary>
     public Task<CommandResult> CheckAsync(string ruleset, CancellationToken cancellationToken = default) =>
         _commands.RunAsync("nft", ["--check", "-f", "-"], ruleset, cancellationToken);
+
+    /// <summary>The installed table with live counters, for diagnostics.</summary>
+    public async Task<string> DumpAsync(CancellationToken cancellationToken = default)
+    {
+        var result = await _commands.RunAsync("nft", ["list", "table", "inet", TableName],
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+        return result.Succeeded ? result.StandardOutput : $"(not installed: {result.FailureText})";
+    }
 
     public async Task RemoveAsync(CancellationToken cancellationToken = default)
     {

@@ -45,7 +45,10 @@ public enum RouteObservation
     /// </summary>
     PreExistingPreviousRoute,
 
-    /// <summary>The flow was never claimed by the classifier and left through the normal route.</summary>
+    /// <summary>
+    /// The flow left through the normal route: either the classifier never claimed it, or
+    /// the daemon captured it, evaluated the rules and relayed it directly itself.
+    /// </summary>
     ConfirmedDirect,
 
     /// <summary>
@@ -61,10 +64,14 @@ public enum RouteObservation
 /// <summary>One row of the Connections page.</summary>
 public sealed record ConnectionRecord
 {
-    public required long Id { get; init; }
+    /// <summary>Stable across refreshes: <c>f:&lt;flow id&gt;</c> or <c>s:&lt;inode&gt;</c>.</summary>
+    public required string Id { get; init; }
 
     /// <summary>Owning process, or null when ownership could not be established.</summary>
     public ProcessIdentity? Process { get; init; }
+
+    /// <summary>Owning pid when known. Set even when the full identity is not.</summary>
+    public int? OwnerPid { get; init; }
 
     /// <summary>Cached display name so the row survives the process exiting.</summary>
     public string? ProcessDisplayName { get; init; }
@@ -80,6 +87,9 @@ public sealed record ConnectionRecord
 
     public required ConnectionState State { get; init; }
 
+    /// <summary>Kernel socket state (ESTABLISHED, TIME_WAIT, …) for rows read from /proc/net.</summary>
+    public string? KernelState { get; init; }
+
     public required RouteObservation Route { get; init; }
 
     /// <summary>The rule that decided this flow, or null when the default applied.</summary>
@@ -93,14 +103,18 @@ public sealed record ConnectionRecord
     /// </summary>
     public string? ProxyName { get; init; }
 
-    public long BytesUp { get; init; }
+    /// <summary>Null when the daemon does not hold the sockets and cannot count.</summary>
+    public long? BytesUp { get; init; }
 
-    public long BytesDown { get; init; }
+    public long? BytesDown { get; init; }
 
-    public required DateTimeOffset CreatedAtUtc { get; init; }
+    public DateTimeOffset? CreatedAtUtc { get; init; }
 
     /// <summary>Operator-facing reason for <see cref="ConnectionState.Failed"/>.</summary>
     public string? FailureReason { get; init; }
+
+    /// <summary>Why the route is what it is, e.g. "Loopback is never proxied".</summary>
+    public string? Note { get; init; }
 
     /// <summary>
     /// The route label to render. Never claims "Proxied" without a confirmed observation.

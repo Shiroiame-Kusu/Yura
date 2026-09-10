@@ -1,0 +1,168 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:Yura.App.ViewModels"
+             xmlns:loc="using:Yura.App.Localization"
+             xmlns:icons="using:FluentIcons.Avalonia"
+             mc:Ignorable="d"
+             x:Class="Yura.App.Views.DiagnosticsPage"
+             x:DataType="vm:DiagnosticsPageViewModel">
+
+  <Grid RowDefinitions="Auto,*">
+
+    <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="24,20,24,12">
+      <StackPanel Grid.Column="0" Spacing="2">
+        <TextBlock Classes="PageTitle" Text="{loc:Tr Diagnostics.Title}" />
+        <TextBlock Classes="Subtitle" Text="{loc:Tr Diagnostics.Subtitle}" MaxWidth="620" HorizontalAlignment="Left" />
+      </StackPanel>
+      <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Top">
+        <Button Command="{Binding RefreshCommand}" Content="{loc:Tr Common.Refresh}" />
+        <Button Name="CopyReport" Click="OnCopyReport" Content="{loc:Tr Diagnostics.CopyReport}" />
+      </StackPanel>
+    </Grid>
+
+    <ScrollViewer Grid.Row="1" Margin="24,0,24,20">
+      <StackPanel Spacing="16" MaxWidth="980" HorizontalAlignment="Stretch">
+
+        <!-- A failed check is the reason routing is not working; it goes first. -->
+        <Border Classes="Panel" Padding="12"
+                Background="{DynamicResource YuraDangerSubtle}"
+                BorderBrush="{DynamicResource YuraDanger}"
+                IsVisible="{Binding HasFailedChecks}">
+          <StackPanel Orientation="Horizontal" Spacing="10">
+            <icons:SymbolIcon Symbol="Warning" FontSize="18"
+                              Foreground="{DynamicResource YuraDanger}" VerticalAlignment="Center" />
+            <TextBlock Text="{loc:Tr Diagnostics.ChecksFailed}" TextWrapping="Wrap" VerticalAlignment="Center" />
+          </StackPanel>
+        </Border>
+
+        <!-- ====================== Environment ====================== -->
+        <Border Classes="Panel" Padding="16">
+          <StackPanel Spacing="12">
+            <TextBlock Classes="SectionTitle" Text="{loc:Tr Diagnostics.Environment}" />
+
+            <Grid ColumnDefinitions="190,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto"
+                  RowSpacing="6">
+              <TextBlock Grid.Row="0" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Diagnostics.App}" />
+              <TextBlock Grid.Row="0" Grid.Column="1" Classes="Mono" Text="{Binding AppVersion}" />
+
+              <TextBlock Grid.Row="1" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Diagnostics.Daemon}" />
+              <TextBlock Grid.Row="1" Grid.Column="1" Classes="Mono" Text="{Binding DaemonVersion}" />
+
+              <TextBlock Grid.Row="2" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Diagnostics.Uptime}" />
+              <TextBlock Grid.Row="2" Grid.Column="1" Classes="Mono Metric" Text="{Binding UptimeDisplay}" />
+
+              <TextBlock Grid.Row="3" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Diagnostics.Kernel}" />
+              <TextBlock Grid.Row="3" Grid.Column="1" Classes="Mono" Text="{Binding KernelDisplay}"
+                         TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding KernelDisplay}" />
+
+              <TextBlock Grid.Row="4" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Diagnostics.Nftables}" />
+              <TextBlock Grid.Row="4" Grid.Column="1" Classes="Mono" Text="{Binding NftDisplay}" />
+
+              <TextBlock Grid.Row="5" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Diagnostics.Watcher}" />
+              <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                <Border Classes="Badge" Classes.Success="{Binding IsWatcherEventDriven}"
+                        Classes.Warning="{Binding !IsWatcherEventDriven}">
+                  <TextBlock Text="{Binding ProcessWatcherDisplay}" />
+                </Border>
+              </StackPanel>
+
+              <TextBlock Grid.Row="6" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Diagnostics.Counts}" />
+              <TextBlock Grid.Row="6" Grid.Column="1" Classes="Mono Metric">
+                <Run Text="{Binding ActiveRulesDisplay}" />
+                <Run Text=" / " />
+                <Run Text="{Binding ActiveFlowsDisplay}" />
+                <Run Text=" / " />
+                <Run Text="{Binding ActiveGroupsDisplay}" />
+              </TextBlock>
+
+              <TextBlock Grid.Row="7" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Diagnostics.Socket}" />
+              <TextBlock Grid.Row="7" Grid.Column="1" Classes="Mono" Text="{Binding SocketDisplay}" />
+
+              <TextBlock Grid.Row="8" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Diagnostics.AllowedUids}" />
+              <TextBlock Grid.Row="8" Grid.Column="1" Classes="Mono" Text="{Binding AllowedUidsDisplay}" />
+            </Grid>
+
+            <!-- Polling is a real behavioural difference, so it is stated, not hidden. -->
+            <TextBlock Classes="FieldHint" Text="{loc:Tr Diagnostics.WatcherPollingHint}"
+                       IsVisible="{Binding !IsWatcherEventDriven}" />
+          </StackPanel>
+        </Border>
+
+        <!-- ======================== Storage ======================== -->
+        <Border Classes="Panel" Padding="16">
+          <Grid ColumnDefinitions="190,*" RowDefinitions="Auto,Auto" RowSpacing="6">
+            <TextBlock Grid.Row="0" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Diagnostics.Config}" />
+            <SelectableTextBlock Grid.Row="0" Grid.Column="1" Classes="Mono" Text="{Binding ConfigPath}" />
+            <TextBlock Grid.Row="1" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Diagnostics.Secrets}" />
+            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding SecretStore}" />
+          </Grid>
+        </Border>
+
+        <!-- ===================== Startup checks ===================== -->
+        <Border Classes="Panel" Padding="16">
+          <StackPanel Spacing="10">
+            <TextBlock Classes="SectionTitle" Text="{loc:Tr Diagnostics.Checks}" />
+            <ItemsControl ItemsSource="{Binding Checks}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="vm:CheckRow">
+                  <Grid ColumnDefinitions="74,*" Margin="0,3">
+                    <Border Grid.Column="0" Classes="Badge" HorizontalAlignment="Left"
+                            Classes.Success="{Binding Passed}"
+                            Classes.Danger="{Binding !Passed}">
+                      <TextBlock Text="{Binding StateDisplay}" />
+                    </Border>
+                    <StackPanel Grid.Column="1" Spacing="1">
+                      <TextBlock Text="{Binding Name}" TextWrapping="Wrap" />
+                      <TextBlock Classes="Caption Mono" Text="{Binding Detail}" TextWrapping="Wrap"
+                                 IsVisible="{Binding Detail, Converter={x:Static ObjectConverters.IsNotNull}}" />
+                    </StackPanel>
+                  </Grid>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+            <TextBlock Classes="Subtitle" Text="{Binding UnavailableReason}"
+                       IsVisible="{Binding !IsDaemonConnected}" TextWrapping="Wrap" />
+          </StackPanel>
+        </Border>
+
+        <!-- ==================== Installed ruleset ==================== -->
+        <Border Classes="Panel" Padding="16">
+          <StackPanel Spacing="10">
+            <Grid ColumnDefinitions="*,Auto">
+              <TextBlock Grid.Column="0" Classes="SectionTitle" Text="{loc:Tr Diagnostics.Ruleset}"
+                         VerticalAlignment="Center" />
+              <Button Grid.Column="1" Command="{Binding LoadRulesetCommand}"
+                      Content="{loc:Tr Diagnostics.LoadRuleset}" />
+            </Grid>
+            <Border Classes="Sunken" Padding="12" MaxHeight="280"
+                    IsVisible="{Binding Ruleset, Converter={x:Static ObjectConverters.IsNotNull}}">
+              <ScrollViewer>
+                <SelectableTextBlock Classes="Mono" Text="{Binding Ruleset}" />
+              </ScrollViewer>
+            </Border>
+          </StackPanel>
+        </Border>
+
+        <!-- ======================= Daemon log ======================= -->
+        <Border Classes="Panel" Padding="16">
+          <StackPanel Spacing="10">
+            <TextBlock Classes="SectionTitle" Text="{loc:Tr Diagnostics.Log}" />
+            <Border Classes="Sunken" Padding="12" MaxHeight="260">
+              <ScrollViewer>
+                <ItemsControl ItemsSource="{Binding Log}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="x:String">
+                      <SelectableTextBlock Classes="Mono" Text="{Binding}" />
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </ScrollViewer>
+            </Border>
+          </StackPanel>
+        </Border>
+      </StackPanel>
+    </ScrollViewer>
+  </Grid>
+</UserControl>

@@ -1,66 +1,251 @@
 using System.Buffers.Binary;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Yura.Core.Proxies;
+using Yura.Daemon.Linux;
 
 namespace Yura.Daemon.Forwarding;
 
 /// <summary>Raised when a proxy refuses or garbles a handshake. The message is operator-facing.</summary>
 public sealed class ProxyHandshakeException(string message) : Exception(message);
 
+/// <summary>One hop of a route: an endpoint plus the credential the app handed over.</summary>
+public sealed record ProxyHop(ProxyEndpoint Endpoint, string? Password);
+
 /// <summary>
-/// Opens a TCP tunnel to an arbitrary destination through a user-supplied proxy.
+/// The daemon's side of a relayed connection: the socket it dialled and the stream it
+/// speaks over, which is the socket itself or a TLS layer above it.
+/// </summary>
+public sealed class UpstreamLeg : IAsyncDisposable
+{
+    public UpstreamLeg(Socket socket, Stream stream, bool isTls)
+    {
+        Socket = socket;
+        Stream = stream;
+        IsTls = isTls;
+    }
+
+    public Socket Socket { get; }
+
+    public Stream Stream { get; }
+
+    public bool IsTls { get; }
+
+    /// <summary>
+    /// Signals EOF towards the destination. A plain socket can half-close; a TLS stream
+    /// cannot without ending the session, so the far side is left to close on its own.
+    /// </summary>
+    public void ShutdownSend()
+    {
+        if (IsTls)
+        {
+            return;
+        }
+
+        try
+        {
+            Socket.Shutdown(SocketShutdown.Send);
+        }
+        catch (Exception e) when (e is SocketException or ObjectDisposedException)
+        {
+        }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        try
+        {
+            Stream.Dispose();
+        }
+        catch (Exception e) when (e is IOException or ObjectDisposedException)
+        {
+        }
+
+        Socket.Dispose();
+        return ValueTask.CompletedTask;
+    }
+}
+
+/// <summary>
+/// Opens a TCP path to a destination: directly, through one proxy, or through a chain.
 /// </summary>
 /// <remarks>
-/// Only what Yura needs: SOCKS5 CONNECT with optional username/password (RFC 1928, 1929)
-/// and HTTP CONNECT (RFC 7231 §4.3.6). The destination is always sent as a literal address,
-/// because by the time a flow reaches the daemon the application has already resolved it —
-/// asking the proxy to resolve again could send the flow somewhere different.
+/// A chain is dialled by connecting to the first hop and then asking each hop, in turn, to
+/// CONNECT to the next one, so every hop only ever sees its neighbours. SOCKS5 (RFC 1928,
+/// 1929) and HTTP CONNECT (RFC 7231 §4.3.6) both run over any byte stream, which is what
+/// makes chaining and HTTPS proxies (CONNECT inside TLS) the same code path.
+///
+/// The final destination is always sent as a literal address: by the time a flow reaches
+/// the daemon the application has already resolved it, and asking the proxy to resolve
+/// again could send the flow somewhere different. Intermediate hops are sent by whatever
+/// the user typed, since the previous hop is the one that has to reach them.
+///
+/// Every socket opened here carries the bypass mark, which is what stops the classifier
+/// from capturing the daemon's own upstream traffic and feeding the forwarder into itself.
 /// </remarks>
-public static class ProxyClients
+public static class ProxyDialer
 {
     private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(10);
 
-    /// <summary>Performs the handshake for <paramref name="endpoint"/>'s protocol on an already-connected socket.</summary>
-    public static async Task TunnelAsync(
-        Socket upstream,
-        ProxyEndpoint endpoint,
-        string? password,
-        IPEndPoint destination,
-        CancellationToken cancellationToken)
+    public static async Task<UpstreamLeg> OpenAsync(IReadOnlyList<ProxyHop> hops, IPEndPoint destination, CancellationToken ct)
     {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (hops.Count == 0)
+        {
+            return await OpenDirectAsync(destination, ct).ConfigureAwait(false);
+        }
+
+        var first = hops[0].Endpoint;
+        var socket = await ConnectWithBypassAsync(first.Host, first.Port, ct).ConfigureAwait(false);
+        Stream stream = new NetworkStream(socket, ownsSocket: false);
+        var isTls = false;
+
+        try
+        {
+            for (var i = 0; i < hops.Count; i++)
+            {
+                var hop = hops[i];
+                if (hop.Endpoint.Protocol == ProxyProtocol.Https)
+                {
+                    stream = await WrapTlsAsync(stream, hop.Endpoint, ct).ConfigureAwait(false);
+                    isTls = true;
+                }
+
+                var (targetHost, targetPort) = i + 1 < hops.Count
+                    ? (hops[i + 1].Endpoint.Host, (int)hops[i + 1].Endpoint.Port)
+                    : (destination.Address.ToString(), destination.Port);
+
+                await TunnelAsync(stream, hop, targetHost, targetPort, ct).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            stream.Dispose();
+            socket.Dispose();
+            throw;
+        }
+
+        return new UpstreamLeg(socket, stream, isTls);
+    }
+
+    /// <summary>A plain connection to the destination, still bypass-marked so it is not re-captured.</summary>
+    public static async Task<UpstreamLeg> OpenDirectAsync(IPEndPoint destination, CancellationToken ct)
+    {
+        var socket = new Socket(destination.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+        socket.SetMark(PolicyRouting.BypassMark);
+        socket.NoDelay = true;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(ConnectTimeout);
+        try
+        {
+            await socket.ConnectAsync(destination, timeout.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+
+        return new UpstreamLeg(socket, new NetworkStream(socket, ownsSocket: false), isTls: false);
+    }
+
+    /// <summary>Resolves and connects to a proxy host with the bypass mark set.</summary>
+    public static async Task<Socket> ConnectWithBypassAsync(string host, int port, CancellationToken ct)
+    {
+        var address = await ResolveAsync(host, ct).ConfigureAwait(false);
+        var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+        socket.SetMark(PolicyRouting.BypassMark);
+        socket.NoDelay = true;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(ConnectTimeout);
+        try
+        {
+            await socket.ConnectAsync(new IPEndPoint(address, port), timeout.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+
+        return socket;
+    }
+
+    public static async Task<IPAddress> ResolveAsync(string host, CancellationToken ct)
+    {
+        if (IPAddress.TryParse(host, out var literal))
+        {
+            return literal;
+        }
+
+        var addresses = await Dns.GetHostAddressesAsync(host, ct).ConfigureAwait(false);
+        return addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)
+               ?? addresses.FirstOrDefault()
+               ?? throw new SocketException((int)SocketError.HostNotFound);
+    }
+
+    private static async Task<Stream> WrapTlsAsync(Stream inner, ProxyEndpoint hop, CancellationToken ct)
+    {
+        var tls = new SslStream(inner, leaveInnerStreamOpen: false, (_, _, _, errors) =>
+            errors == SslPolicyErrors.None || hop.AllowInvalidCertificate);
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(HandshakeTimeout);
+            await tls.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+            {
+                TargetHost = hop.Host,
+                CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+            }, timeout.Token).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is IOException or System.Security.Authentication.AuthenticationException)
+        {
+            tls.Dispose();
+            throw new ProxyHandshakeException(
+                e is System.Security.Authentication.AuthenticationException
+                    ? $"TLS to {hop.Authority} failed: {e.Message} Enable 'allow invalid certificate' only if you trust this proxy."
+                    : $"TLS to {hop.Authority} was cut off: {e.Message}");
+        }
+
+        return tls;
+    }
+
+    /// <summary>Performs one hop's handshake on an already-connected stream.</summary>
+    public static async Task TunnelAsync(Stream stream, ProxyHop hop, string targetHost, int targetPort, CancellationToken ct)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(HandshakeTimeout);
 
-        switch (endpoint.Protocol)
+        switch (hop.Endpoint.Protocol)
         {
             case ProxyProtocol.Socks5:
-                await Socks5ConnectAsync(upstream, endpoint.Username, password, destination, timeout.Token)
+                await Socks5ConnectAsync(stream, hop.Endpoint.Username, hop.Password, targetHost, targetPort, timeout.Token)
                     .ConfigureAwait(false);
                 break;
             case ProxyProtocol.Http:
-                await HttpConnectAsync(upstream, endpoint.Username, password, destination, timeout.Token)
+            case ProxyProtocol.Https:
+                await HttpConnectAsync(stream, hop.Endpoint.Username, hop.Password, targetHost, targetPort, timeout.Token)
                     .ConfigureAwait(false);
                 break;
             default:
-                throw new ProxyHandshakeException(
-                    $"{endpoint.Protocol} is not supported by the forwarder yet.");
+                throw new ProxyHandshakeException($"{hop.Endpoint.Protocol} is not a supported proxy protocol.");
         }
     }
 
     // -- SOCKS5 --------------------------------------------------------------
 
-    private static async Task Socks5ConnectAsync(
-        Socket socket, string? username, string? password, IPEndPoint destination, CancellationToken ct)
+    /// <summary>Negotiates authentication with a SOCKS5 server. Shared by CONNECT, UDP ASSOCIATE and the probe.</summary>
+    public static async Task Socks5GreetAsync(Stream stream, string? username, string? password, CancellationToken ct)
     {
         var wantsAuth = !string.IsNullOrEmpty(username);
-
-        // Greeting: offer no-auth, plus user/pass when we have credentials.
         var greeting = wantsAuth ? new byte[] { 0x05, 0x02, 0x00, 0x02 } : new byte[] { 0x05, 0x01, 0x00 };
-        await socket.SendAsync(greeting, ct).ConfigureAwait(false);
+        await stream.WriteAsync(greeting, ct).ConfigureAwait(false);
+        await stream.FlushAsync(ct).ConfigureAwait(false);
 
-        var choice = await ReadExactlyAsync(socket, 2, ct).ConfigureAwait(false);
+        var choice = await ReadExactlyAsync(stream, 2, ct).ConfigureAwait(false);
         if (choice[0] != 0x05)
         {
             throw new ProxyHandshakeException("The proxy did not answer as SOCKS5. Check the protocol setting.");
@@ -69,10 +254,10 @@ public static class ProxyClients
         switch (choice[1])
         {
             case 0x00:
-                break;
+                return;
             case 0x02 when wantsAuth:
-                await Socks5AuthenticateAsync(socket, username!, password ?? string.Empty, ct).ConfigureAwait(false);
-                break;
+                await Socks5AuthenticateAsync(stream, username!, password ?? string.Empty, ct).ConfigureAwait(false);
+                return;
             case 0x02:
                 throw new ProxyHandshakeException("The proxy requires a username and password.");
             case 0xFF:
@@ -82,19 +267,18 @@ public static class ProxyClients
             default:
                 throw new ProxyHandshakeException($"The proxy chose an unsupported authentication method ({choice[1]:#x}).");
         }
+    }
 
-        // CONNECT request with a literal address.
-        var address = destination.Address.GetAddressBytes();
-        var request = new byte[4 + address.Length + 2];
-        request[0] = 0x05;
-        request[1] = 0x01; // CONNECT
-        request[2] = 0x00;
-        request[3] = destination.AddressFamily == AddressFamily.InterNetworkV6 ? (byte)0x04 : (byte)0x01;
-        address.CopyTo(request, 4);
-        BinaryPrimitives.WriteUInt16BigEndian(request.AsSpan(4 + address.Length), (ushort)destination.Port);
-        await socket.SendAsync(request, ct).ConfigureAwait(false);
+    private static async Task Socks5ConnectAsync(
+        Stream stream, string? username, string? password, string targetHost, int targetPort, CancellationToken ct)
+    {
+        await Socks5GreetAsync(stream, username, password, ct).ConfigureAwait(false);
 
-        var header = await ReadExactlyAsync(socket, 4, ct).ConfigureAwait(false);
+        var request = BuildSocks5Request(0x01, targetHost, targetPort);
+        await stream.WriteAsync(request, ct).ConfigureAwait(false);
+        await stream.FlushAsync(ct).ConfigureAwait(false);
+
+        var header = await ReadExactlyAsync(stream, 4, ct).ConfigureAwait(false);
         if (header[1] != 0x00)
         {
             throw new ProxyHandshakeException(header[1] switch
@@ -110,18 +294,72 @@ public static class ProxyClients
             });
         }
 
-        // Drain the bound address the proxy reports; we do not use it.
-        var boundLength = header[3] switch
-        {
-            0x01 => 4,
-            0x04 => 16,
-            0x03 => (await ReadExactlyAsync(socket, 1, ct).ConfigureAwait(false))[0],
-            _ => throw new ProxyHandshakeException("The proxy sent a malformed CONNECT reply."),
-        };
-        await ReadExactlyAsync(socket, boundLength + 2, ct).ConfigureAwait(false);
+        await DrainSocks5AddressAsync(stream, header[3], ct).ConfigureAwait(false);
     }
 
-    private static async Task Socks5AuthenticateAsync(Socket socket, string username, string password, CancellationToken ct)
+    /// <summary>RSV/CMD/ATYP/ADDR/PORT for CONNECT (1) or UDP ASSOCIATE (3).</summary>
+    public static byte[] BuildSocks5Request(byte command, string targetHost, int targetPort)
+    {
+        byte[] request;
+        if (IPAddress.TryParse(targetHost, out var ip))
+        {
+            var address = ip.GetAddressBytes();
+            request = new byte[4 + address.Length + 2];
+            request[3] = ip.AddressFamily == AddressFamily.InterNetworkV6 ? (byte)0x04 : (byte)0x01;
+            address.CopyTo(request, 4);
+            BinaryPrimitives.WriteUInt16BigEndian(request.AsSpan(4 + address.Length), (ushort)targetPort);
+        }
+        else
+        {
+            var name = Encoding.ASCII.GetBytes(targetHost);
+            if (name.Length > 255)
+            {
+                throw new ProxyHandshakeException("The destination host name is too long for SOCKS5.");
+            }
+
+            request = new byte[4 + 1 + name.Length + 2];
+            request[3] = 0x03;
+            request[4] = (byte)name.Length;
+            name.CopyTo(request, 5);
+            BinaryPrimitives.WriteUInt16BigEndian(request.AsSpan(5 + name.Length), (ushort)targetPort);
+        }
+
+        request[0] = 0x05;
+        request[1] = command;
+        request[2] = 0x00;
+        return request;
+    }
+
+    /// <summary>Reads the bound address that follows a SOCKS5 reply header.</summary>
+    public static async Task<IPEndPoint?> DrainSocks5AddressAsync(Stream stream, byte addressType, CancellationToken ct)
+    {
+        switch (addressType)
+        {
+            case 0x01:
+            {
+                var bound = await ReadExactlyAsync(stream, 6, ct).ConfigureAwait(false);
+                return new IPEndPoint(new IPAddress(bound.AsSpan(0, 4)), BinaryPrimitives.ReadUInt16BigEndian(bound.AsSpan(4)));
+            }
+
+            case 0x04:
+            {
+                var bound = await ReadExactlyAsync(stream, 18, ct).ConfigureAwait(false);
+                return new IPEndPoint(new IPAddress(bound.AsSpan(0, 16)), BinaryPrimitives.ReadUInt16BigEndian(bound.AsSpan(16)));
+            }
+
+            case 0x03:
+            {
+                var length = (await ReadExactlyAsync(stream, 1, ct).ConfigureAwait(false))[0];
+                await ReadExactlyAsync(stream, length + 2, ct).ConfigureAwait(false);
+                return null;
+            }
+
+            default:
+                throw new ProxyHandshakeException("The proxy sent a malformed reply.");
+        }
+    }
+
+    private static async Task Socks5AuthenticateAsync(Stream stream, string username, string password, CancellationToken ct)
     {
         var user = Encoding.UTF8.GetBytes(username);
         var pass = Encoding.UTF8.GetBytes(password);
@@ -136,9 +374,10 @@ public static class ProxyClients
         user.CopyTo(frame, 2);
         frame[2 + user.Length] = (byte)pass.Length;
         pass.CopyTo(frame, 3 + user.Length);
-        await socket.SendAsync(frame, ct).ConfigureAwait(false);
+        await stream.WriteAsync(frame, ct).ConfigureAwait(false);
+        await stream.FlushAsync(ct).ConfigureAwait(false);
 
-        var reply = await ReadExactlyAsync(socket, 2, ct).ConfigureAwait(false);
+        var reply = await ReadExactlyAsync(stream, 2, ct).ConfigureAwait(false);
         if (reply[1] != 0x00)
         {
             throw new ProxyHandshakeException("The proxy rejected the username or password.");
@@ -148,11 +387,11 @@ public static class ProxyClients
     // -- HTTP CONNECT --------------------------------------------------------
 
     private static async Task HttpConnectAsync(
-        Socket socket, string? username, string? password, IPEndPoint destination, CancellationToken ct)
+        Stream stream, string? username, string? password, string targetHost, int targetPort, CancellationToken ct)
     {
-        var authority = destination.AddressFamily == AddressFamily.InterNetworkV6
-            ? $"[{destination.Address}]:{destination.Port}"
-            : $"{destination.Address}:{destination.Port}";
+        var authority = targetHost.Contains(':', StringComparison.Ordinal)
+            ? $"[{targetHost}]:{targetPort}"
+            : $"{targetHost}:{targetPort}";
 
         var sb = new StringBuilder();
         sb.Append("CONNECT ").Append(authority).Append(" HTTP/1.1\r\n");
@@ -164,20 +403,21 @@ public static class ProxyClients
         }
 
         sb.Append("Proxy-Connection: keep-alive\r\n\r\n");
-        await socket.SendAsync(Encoding.ASCII.GetBytes(sb.ToString()), ct).ConfigureAwait(false);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(sb.ToString()), ct).ConfigureAwait(false);
+        await stream.FlushAsync(ct).ConfigureAwait(false);
 
         // Read up to the end of the response headers, byte by byte to avoid consuming
         // tunnelled payload that may follow immediately.
         var response = new StringBuilder();
         var one = new byte[1];
-        while (!response.ToString().EndsWith("\r\n\r\n", StringComparison.Ordinal))
+        while (!EndsWithBlankLine(response))
         {
             if (response.Length > 16 * 1024)
             {
                 throw new ProxyHandshakeException("The proxy sent an oversized CONNECT response.");
             }
 
-            var read = await socket.ReceiveAsync(one, ct).ConfigureAwait(false);
+            var read = await stream.ReadAsync(one, ct).ConfigureAwait(false);
             if (read == 0)
             {
                 throw new ProxyHandshakeException("The proxy closed the connection during CONNECT.");
@@ -188,7 +428,7 @@ public static class ProxyClients
 
         var statusLine = response.ToString().Split("\r\n", 2)[0];
         var fields = statusLine.Split(' ', 3);
-        if (fields.Length < 2 || !int.TryParse(fields[1], out var status))
+        if (fields.Length < 2 || !fields[0].StartsWith("HTTP/", StringComparison.Ordinal) || !int.TryParse(fields[1], out var status))
         {
             throw new ProxyHandshakeException("The proxy did not answer as HTTP. Check the protocol setting.");
         }
@@ -205,21 +445,21 @@ public static class ProxyClients
         }
     }
 
+    private static bool EndsWithBlankLine(StringBuilder sb) =>
+        sb.Length >= 4 && sb[^1] == '\n' && sb[^2] == '\r' && sb[^3] == '\n' && sb[^4] == '\r';
+
     // -- helpers -------------------------------------------------------------
 
-    private static async Task<byte[]> ReadExactlyAsync(Socket socket, int count, CancellationToken ct)
+    public static async Task<byte[]> ReadExactlyAsync(Stream stream, int count, CancellationToken ct)
     {
         var buffer = new byte[count];
-        var offset = 0;
-        while (offset < count)
+        try
         {
-            var read = await socket.ReceiveAsync(buffer.AsMemory(offset), ct).ConfigureAwait(false);
-            if (read == 0)
-            {
-                throw new ProxyHandshakeException("The proxy closed the connection during the handshake.");
-            }
-
-            offset += read;
+            await stream.ReadExactlyAsync(buffer, ct).ConfigureAwait(false);
+        }
+        catch (EndOfStreamException)
+        {
+            throw new ProxyHandshakeException("The proxy closed the connection during the handshake.");
         }
 
         return buffer;

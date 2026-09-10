@@ -1,0 +1,92 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:Yura.App.ViewModels"
+             xmlns:loc="using:Yura.App.Localization"
+             mc:Ignorable="d"
+             x:Class="Yura.App.Views.SettingsPage"
+             x:DataType="vm:SettingsPageViewModel">
+
+  <Grid RowDefinitions="Auto,*">
+
+    <StackPanel Grid.Row="0" Margin="24,20,24,12" Spacing="2">
+      <TextBlock Classes="PageTitle" Text="{loc:Tr Settings.Title}" />
+      <TextBlock Classes="Subtitle" Text="{loc:Tr Settings.Subtitle}" MaxWidth="620" HorizontalAlignment="Left" />
+    </StackPanel>
+
+    <ScrollViewer Grid.Row="1" Margin="24,0,24,20">
+      <StackPanel Spacing="16" MaxWidth="720" HorizontalAlignment="Left">
+
+        <Border Classes="Panel" Padding="16">
+          <StackPanel Spacing="10">
+            <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Appearance}" />
+            <CheckBox IsChecked="{Binding IsDarkTheme}" Content="{loc:Tr Settings.DarkTheme}" />
+            <CheckBox IsChecked="{Binding IsChinese}" Content="{loc:Tr Settings.Chinese}" />
+            <StackPanel Spacing="2">
+              <CheckBox IsChecked="{Binding ReducedMotion}" Content="{loc:Tr Settings.ReducedMotion}" />
+              <TextBlock Classes="FieldHint" Text="{loc:Tr Settings.ReducedMotionHint}" Margin="28,0,0,0" />
+            </StackPanel>
+          </StackPanel>
+        </Border>
+
+        <Border Classes="Panel" Padding="16">
+          <StackPanel Spacing="10">
+            <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Processes}" />
+            <StackPanel Spacing="2">
+              <CheckBox IsChecked="{Binding ShowAllProcesses}" Content="{loc:Tr Settings.ShowAllProcesses}" />
+              <TextBlock Classes="FieldHint" Text="{loc:Tr Settings.ShowAllProcessesHint}" Margin="28,0,0,0" />
+            </StackPanel>
+          </StackPanel>
+        </Border>
+
+        <Border Classes="Panel" Padding="16">
+          <StackPanel Spacing="10">
+            <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Networking}" />
+            <StackPanel Spacing="2">
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Settings.Dns}" />
+              <ComboBox ItemsSource="{Binding DnsPolicies}" SelectedItem="{Binding DnsPolicy}"
+                        HorizontalAlignment="Left" MinWidth="280"
+                        AutomationProperties.Name="{loc:Tr Settings.Dns}">
+                <ComboBox.ItemTemplate>
+                  <DataTemplate>
+                    <TextBlock Text="{Binding Converter={StaticResource DnsPolicyDisplay}}" />
+                  </DataTemplate>
+                </ComboBox.ItemTemplate>
+              </ComboBox>
+              <TextBlock Classes="FieldHint" Text="{Binding DnsPolicyHint}" MaxWidth="640" />
+            </StackPanel>
+          </StackPanel>
+        </Border>
+
+        <Border Classes="Panel" Padding="16">
+          <StackPanel Spacing="10">
+            <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Storage}" />
+            <StackPanel Spacing="2">
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Diagnostics.Config}" />
+              <SelectableTextBlock Classes="Mono" Text="{Binding ConfigPath}" />
+            </StackPanel>
+            <StackPanel Spacing="2">
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Diagnostics.Secrets}" />
+              <TextBlock Text="{Binding SecretStoreDescription}" />
+            </StackPanel>
+            <Button HorizontalAlignment="Left" Command="{Binding OpenConfigDirectoryCommand}"
+                    Content="{loc:Tr Settings.OpenConfig}" />
+          </StackPanel>
+        </Border>
+
+        <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraAccentSubtle}"
+                BorderBrush="{DynamicResource YuraAccent}"
+                IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+          <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
+        </Border>
+
+        <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraDangerSubtle}"
+                BorderBrush="{DynamicResource YuraDanger}"
+                IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+          <TextBlock Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
+        </Border>
+      </StackPanel>
+    </ScrollViewer>
+  </Grid>
+</UserControl>

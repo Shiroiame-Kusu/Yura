@@ -1,5 +1,9 @@
 using Yura.App.ViewModels;
+using Yura.Core.Games;
+using Yura.Core.Net;
+using Yura.Core.Processes;
 using Yura.Core.Proxies;
+using Yura.Core.Rules;
 
 namespace Yura.App.Services;
 
@@ -9,7 +13,7 @@ namespace Yura.App.Services;
 /// <remarks>
 /// Deliberately includes the awkward cases that break layouts and that a happy-path mock
 /// would hide: a very long executable path, an IPv6 literal endpoint, a proxy that cannot
-/// carry UDP, and a metric that has not been measured.
+/// carry UDP, a chain, and a metric that has not been measured.
 /// </remarks>
 internal static class DemoData
 {
@@ -57,17 +61,50 @@ internal static class DemoData
         shell.Rules.Proxies.Add(v6);
         shell.Rules.Proxies.Add(http);
 
-        shell.Games.Games.Add(new GameEntry(
-            "cs2", "Counter-Strike 2", "/home/hakuu/.steam/steamapps/common/Counter-Strike Global Offensive/game/bin/linuxsteamrt64/cs2", "730"));
-        shell.Games.Games.Add(new GameEntry(
-            "ffxiv", "Final Fantasy XIV",
-            "/home/hakuu/.local/share/Steam/steamapps/common/FINAL FANTASY XIV Online/game/ffxiv_dx11.exe", "39210"));
-        shell.Games.Games.Add(new GameEntry("minecraft", "Minecraft", "/usr/bin/minecraft-launcher", null));
+        shell.Rules.Chains.Add(new ProxyChain
+        {
+            Id = Guid.Parse("cccccccc-0000-4000-8000-00000000000c"),
+            Name = "Home then Tokyo",
+            Hops = [socks.Id, v6.Id],
+        });
 
-        shell.Games.SelectedGame = shell.Games.Games[0];
-        shell.Games.SelectedRoute = socks;
+        shell.Games.LoadProfiles(
+        [
+            new GameProfile
+            {
+                Id = Guid.Parse("bbbbbbbb-0000-4000-8000-000000000001"),
+                Name = "Counter-Strike 2",
+                ExecutablePath = "/home/hakuu/.steam/steamapps/common/Counter-Strike Global Offensive/game/bin/linuxsteamrt64/cs2",
+                SteamAppId = "730",
+                Source = GameSource.Steam,
+                RouteId = socks.Id,
+                MeasurementHost = "162.254.192.71",
+                MeasurementPort = 27015,
+            },
+            new GameProfile
+            {
+                Id = Guid.Parse("bbbbbbbb-0000-4000-8000-000000000002"),
+                Name = "Final Fantasy XIV",
+                WineTargetExecutable = "Z:\\home\\hakuu\\.local\\share\\Steam\\steamapps\\common\\FINAL FANTASY XIV Online\\game\\ffxiv_dx11.exe",
+                SteamAppId = "39210",
+                Source = GameSource.Steam,
+            },
+            // A game with nothing known about it yet, which is what a fresh Steam scan gives.
+            new GameProfile
+            {
+                Id = Guid.Parse("bbbbbbbb-0000-4000-8000-000000000003"),
+                Name = "Deep Rock Galactic",
+                SteamAppId = "548430",
+                Source = GameSource.Steam,
+            },
+        ]);
+
+        shell.Games.SelectedGame = shell.Games.Games.FirstOrDefault(g => g.Name.StartsWith("Counter", StringComparison.Ordinal));
+        shell.Games.SelectedRoute = shell.Rules.FindRoute(socks.Id);
+        shell.Games.MeasurementTargetInput = "162.254.192.71:27015";
         shell.Games.EnterSimulatedSession(BoostState.Routing, TimeSpan.FromMinutes(7).Add(TimeSpan.FromSeconds(24)));
         shell.Games.MeasurementTarget = "162.254.192.71:27015";
+        shell.Games.MeasurementMethod = "TCP connect";
         shell.Games.LastMeasurementUtc = DateTimeOffset.UtcNow;
         shell.Games.DirectLatency = new Metric(84.3, "ms");
         shell.Games.DirectJitter = new Metric(11.2, "ms");
@@ -77,6 +114,100 @@ internal static class DemoData
         // Left unmeasured on purpose: the UI must show "Not measured", not 0%.
         shell.Games.RoutedLoss = Metric.NotMeasured;
 
+        // Rules that tell the precedence story the Rules page exists to explain: a process
+        // selection above a game profile on the same game, a narrow manual rule, and one
+        // disabled rule so all three states are visible at once.
+        var cs2Instance = new RoutingRule
+        {
+            Id = Guid.Parse("eeee0001-0000-4000-8000-000000000001"),
+            Order = 100,
+            Name = "cs2 (pid 4821)",
+            Origin = RuleOrigin.ProcessSelection,
+            Lifetime = RuleLifetime.Instance,
+            Process = new ProcessSelector
+            {
+                Kind = ProcessSelectorKind.Instance,
+                Identity = new ProcessIdentity { Pid = 4821, StartTicks = 918_233, Uid = 1000, BootId = "demo" },
+                Descendants = DescendantPolicy.IncludeFuture,
+            },
+            Action = new RuleAction.Proxy(socks.Id),
+            CreatedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-8),
+            AppliedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-8),
+        };
+
+        var cs2Profile = new RoutingRule
+        {
+            Id = Guid.Parse("eeee0002-0000-4000-8000-000000000002"),
+            Order = 300,
+            Name = "Counter-Strike 2 (game boost)",
+            Origin = RuleOrigin.GameProfile,
+            Lifetime = RuleLifetime.Session,
+            Process = new ProcessSelector
+            {
+                Kind = ProcessSelectorKind.ExecutablePath,
+                ExecutablePath = "/home/hakuu/.steam/steamapps/common/Counter-Strike Global Offensive/game/bin/linuxsteamrt64/cs2",
+                Descendants = DescendantPolicy.IncludeExistingAndFuture,
+            },
+            Action = new RuleAction.Chain(Guid.Parse("cccccccc-0000-4000-8000-00000000000c")),
+            CreatedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-7),
+            AppliedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-7),
+        };
+
+        var firefox = new RoutingRule
+        {
+            Id = Guid.Parse("eeee0003-0000-4000-8000-000000000003"),
+            Order = 500,
+            Name = "firefox → *.example.com",
+            Origin = RuleOrigin.Manual,
+            Lifetime = RuleLifetime.Persistent,
+            Process = new ProcessSelector { Kind = ProcessSelectorKind.ProcessName, ProcessName = "firefox" },
+            Destination = new DestinationSelector
+            {
+                Hosts = [new HostPattern(HostMatchKind.Suffix, "example.com")],
+                Ports = [PortRange.Single(443)],
+                Protocol = TransportFilter.Tcp,
+            },
+            Action = new RuleAction.Proxy(http.Id),
+            CreatedAtUtc = DateTimeOffset.UtcNow.AddHours(-2),
+            AppliedAtUtc = DateTimeOffset.UtcNow.AddHours(-2),
+        };
+
+        // Pending: asked for, not yet confirmed by the daemon. A distinct state on purpose.
+        var telemetry = new RoutingRule
+        {
+            Id = Guid.Parse("eeee0004-0000-4000-8000-000000000004"),
+            Order = 501,
+            Name = "Block outbound SMTP",
+            Origin = RuleOrigin.Manual,
+            Lifetime = RuleLifetime.Session,
+            Process = new ProcessSelector { Kind = ProcessSelectorKind.ProcessName, ProcessName = "thunderbird" },
+            Destination = new DestinationSelector { Ports = [PortRange.Single(25)] },
+            Action = RuleAction.Block.Instance,
+            CreatedAtUtc = DateTimeOffset.UtcNow.AddHours(-1),
+        };
+
+        var disabled = new RoutingRule
+        {
+            Id = Guid.Parse("eeee0005-0000-4000-8000-000000000005"),
+            Order = 502,
+            Name = "steam (all instances)",
+            Enabled = false,
+            Origin = RuleOrigin.ProcessSelection,
+            Lifetime = RuleLifetime.Persistent,
+            Process = new ProcessSelector { Kind = ProcessSelectorKind.ExecutablePath, ExecutablePath = "/usr/lib/steam/steam" },
+            Action = new RuleAction.Proxy(v6.Id),
+            CreatedAtUtc = DateTimeOffset.UtcNow.AddDays(-3),
+        };
+
+        shell.Rules.LoadPersisted([cs2Instance, cs2Profile, firefox, telemetry, disabled]);
+        // LoadPersisted deliberately clears AppliedAtUtc, which is right at startup but not
+        // here: these are meant to look like rules the daemon has confirmed.
+        foreach (var applied in new[] { cs2Instance.Id, cs2Profile.Id, firefox.Id })
+        {
+            shell.Rules.MarkApplied(applied, DateTimeOffset.UtcNow);
+        }
+
+        shell.RulesPage.SelectedRule = shell.RulesPage.Rules.FirstOrDefault(r => r.Id == cs2Profile.Id);
         shell.Proxies.Editor.BeginEdit(socks);
     }
 }

@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using Yura.Core.Connections;
 using Yura.Core.Proxies;
 using Yura.Core.Rules;
 using Yura.Daemon.Linux;
@@ -11,7 +12,7 @@ using Yura.Daemon.Runtime;
 namespace Yura.Daemon.Forwarding;
 
 /// <summary>
-/// Relays the UDP datagrams TPROXY redirects to one slot through that slot's SOCKS5 proxy.
+/// Relays the UDP datagrams TPROXY redirects to one slot according to the per-flow decision.
 /// </summary>
 /// <remarks>
 /// UDP under TPROXY differs from TCP in two ways that shape this class:
@@ -22,34 +23,36 @@ namespace Yura.Daemon.Forwarding;
 /// <item>Replies must appear to come from the address the application sent to, so each
 /// session owns a transparent socket bound to that foreign address.</item>
 /// </list>
-/// Sessions are keyed on (client, original destination). Each holds one SOCKS5 UDP
-/// association and is dropped after a period of silence.
+/// Sessions are keyed on (client, original destination). Each is one of: a SOCKS5 UDP
+/// association, a direct relay, DNS carried over TCP for routes that cannot relay UDP, or a
+/// deliberate drop. All are dropped after a period of silence.
 /// </remarks>
 public sealed class TransparentUdpListener : IAsyncDisposable
 {
     private static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(60);
 
     private readonly RuleSlot _slot;
-    private readonly ProxyEndpoint _proxy;
-    private readonly string? _password;
+    private readonly int _port;
+    private readonly IRouteDecider _decider;
     private readonly FlowRegistry _flows;
     private readonly Action<string> _log;
-    private readonly ConcurrentDictionary<(IPEndPoint Client, IPEndPoint Destination), UdpSession> _sessions = new();
+    private readonly ConcurrentDictionary<(IPEndPoint Client, IPEndPoint Destination), Task<UdpSession>> _sessions = new();
     private readonly CancellationTokenSource _stopping = new();
+    private readonly ReplySocketPool _replies;
     private Socket? _socket;
     private Thread? _receiveThread;
 
-    public TransparentUdpListener(
-        RuleSlot slot, ProxyEndpoint proxy, string? password, FlowRegistry flows, Action<string> log)
+    public TransparentUdpListener(RuleSlot slot, int port, IRouteDecider decider, FlowRegistry flows, Action<string> log)
     {
         _slot = slot;
-        _proxy = proxy;
-        _password = password;
+        _port = port;
+        _decider = decider;
         _flows = flows;
         _log = log;
+        // The pool's own sockets are a second way datagrams reach us; route them through the
+        // same dispatch so a destination that already has a session keeps working.
+        _replies = new ReplySocketPool((client, original, datagram) => DispatchAsync(client, original, datagram), log);
     }
-
-    public Guid ProxyId => _proxy.Id;
 
     public void Start()
     {
@@ -57,7 +60,7 @@ public sealed class TransparentUdpListener : IAsyncDisposable
         socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         socket.SetTransparent();
         socket.SetRawSocketOption(0 /* SOL_IP */, 20 /* IP_RECVORIGDSTADDR */, BitConverter.GetBytes(1));
-        socket.Bind(new IPEndPoint(IPAddress.Any, _slot.Port));
+        socket.Bind(new IPEndPoint(IPAddress.Any, _port));
         _socket = socket;
 
         _receiveThread = new Thread(() => ReceiveLoop(socket))
@@ -66,7 +69,7 @@ public sealed class TransparentUdpListener : IAsyncDisposable
             Name = $"yura-udp-{_slot.Name}",
         };
         _receiveThread.Start();
-        _log($"slot {_slot.Name}: udp listener on :{_slot.Port} -> {_proxy}");
+        _log($"slot {_slot.Name}: udp listener on :{_port} for '{_slot.Rule.Name}'");
     }
 
     private unsafe void ReceiveLoop(Socket socket)
@@ -127,39 +130,89 @@ public sealed class TransparentUdpListener : IAsyncDisposable
     private async Task DispatchAsync(IPEndPoint client, IPEndPoint original, byte[] datagram)
     {
         var key = (client, original);
-        if (!_sessions.TryGetValue(key, out var session))
+        var sessionTask = _sessions.GetOrAdd(key, _ => OpenSessionAsync(client, original));
+
+        UdpSession session;
+        try
         {
-            var flow = new Flow(client, original, TransportProtocol.Udp, _slot.Rule.Id, _proxy.Name);
-            _flows.Add(flow);
-
-            try
-            {
-                session = await UdpSession.OpenAsync(_proxy, _password, client, original, flow, _log, _stopping.Token)
-                    .ConfigureAwait(false);
-            }
-            catch (Exception e) when (e is ProxyHandshakeException or SocketException)
-            {
-                flow.MarkFailed(e.Message);
-                _log($"slot {_slot.Name}: udp {client} -> {original} failed: {e.Message}");
-                return;
-            }
-
-            if (!_sessions.TryAdd(key, session))
-            {
-                // Lost a race with a concurrent datagram for the same pair; keep the winner.
-                await session.DisposeAsync().ConfigureAwait(false);
-                session = _sessions[key];
-            }
-            else
-            {
-                _ = ExpireWhenIdleAsync(key, session);
-            }
+            session = await sessionTask.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // OpenSessionAsync records the failure on the flow; a failed session is kept in
+            // the table briefly so every datagram does not retry the handshake.
+            return;
         }
 
         await session.SendAsync(datagram).ConfigureAwait(false);
     }
 
-    private async Task ExpireWhenIdleAsync((IPEndPoint, IPEndPoint) key, UdpSession session)
+    private async Task<UdpSession> OpenSessionAsync(IPEndPoint client, IPEndPoint original)
+    {
+        var flow = new Flow(client, original, TransportProtocol.Udp, _slot.Rule.Id);
+        _flows.Add(flow);
+        _ = ExpireWhenIdleAsync((client, original));
+
+        var plan = _decider.Decide(_slot, client, original, TransportProtocol.Udp, null);
+        flow.Describe(plan);
+        var learn = original.Port == 53 ? _decider.Dns : null;
+
+        try
+        {
+            switch (plan.Kind)
+            {
+                case FlowPlanKind.Block:
+                    flow.MarkBlocked();
+                    return new DropSession(flow);
+
+                case FlowPlanKind.Fail:
+                    flow.MarkFailed(plan.FailureReason ?? "The rule could not be carried out.");
+                    return new DropSession(flow);
+
+                case FlowPlanKind.Direct:
+                {
+                    var session = await DirectUdpSession.OpenAsync(_replies, client, original, flow, learn, _stopping.Token).ConfigureAwait(false);
+                    flow.MarkEstablished(RouteObservation.ConfirmedDirect);
+                    return session;
+                }
+
+                default:
+                {
+                    if (plan.Hops.Count == 1 && plan.Hops[0].Endpoint.Protocol == ProxyProtocol.Socks5)
+                    {
+                        var session = await Socks5UdpSession.OpenAsync(_replies, plan.Hops[0], client, original, flow, learn, _stopping.Token)
+                            .ConfigureAwait(false);
+                        flow.MarkEstablished(RouteObservation.ConfirmedProxied);
+                        return session;
+                    }
+
+                    if (original.Port == 53)
+                    {
+                        // The route cannot carry UDP, but DNS has a TCP form. Using it keeps
+                        // name resolution working for processes behind HTTP proxies and chains.
+                        var session = DnsOverTcpSession.Open(_replies, plan.Hops, client, original, flow, learn, _stopping.Token);
+                        flow.MarkEstablished(RouteObservation.ConfirmedProxied);
+                        return session;
+                    }
+
+                    var reason = plan.Hops.Count > 1
+                        ? "A proxy chain cannot relay UDP."
+                        : $"{plan.RouteName} is an {plan.Hops[0].Endpoint.ProtocolDisplay} proxy and cannot relay UDP.";
+                    flow.MarkFailed(reason);
+                    _log($"slot {_slot.Name}: udp {client} -> {original} dropped: {reason}");
+                    return new DropSession(flow);
+                }
+            }
+        }
+        catch (Exception e) when (e is ProxyHandshakeException or SocketException)
+        {
+            flow.MarkFailed(e.Message);
+            _log($"slot {_slot.Name}: udp {client} -> {original} failed: {e.Message}");
+            return new DropSession(flow);
+        }
+    }
+
+    private async Task ExpireWhenIdleAsync((IPEndPoint, IPEndPoint) key)
     {
         while (!_stopping.IsCancellationRequested)
         {
@@ -172,11 +225,17 @@ public sealed class TransparentUdpListener : IAsyncDisposable
                 return;
             }
 
-            if (DateTimeOffset.UtcNow - session.LastActivityUtc >= IdleTimeout)
+            if (!_sessions.TryGetValue(key, out var task) || !task.IsCompletedSuccessfully)
             {
-                if (_sessions.TryRemove(key, out var removed))
+                _sessions.TryRemove(key, out _);
+                return;
+            }
+
+            if (DateTimeOffset.UtcNow - task.Result.LastActivityUtc >= IdleTimeout)
+            {
+                if (_sessions.TryRemove(key, out var removed) && removed.IsCompletedSuccessfully)
                 {
-                    await removed.DisposeAsync().ConfigureAwait(false);
+                    await removed.Result.DisposeAsync().ConfigureAwait(false);
                 }
 
                 return;
@@ -190,12 +249,16 @@ public sealed class TransparentUdpListener : IAsyncDisposable
         _socket?.Dispose(); // Unblocks recvmsg with EBADF.
         _receiveThread?.Join(TimeSpan.FromSeconds(2));
 
-        foreach (var session in _sessions.Values)
+        foreach (var task in _sessions.Values)
         {
-            await session.DisposeAsync().ConfigureAwait(false);
+            if (task.IsCompletedSuccessfully)
+            {
+                await task.Result.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
         _sessions.Clear();
+        await _replies.DisposeAsync().ConfigureAwait(false);
         _stopping.Dispose();
     }
 
@@ -263,27 +326,135 @@ public sealed class TransparentUdpListener : IAsyncDisposable
     }
 }
 
-/// <summary>One UDP flow relayed through a SOCKS5 UDP association.</summary>
-internal sealed class UdpSession : IAsyncDisposable
+/// <summary>One UDP flow, however it is being carried.</summary>
+internal abstract class UdpSession : IAsyncDisposable
 {
-    private readonly Socket _control;
+    protected UdpSession(Flow flow) => Flow = flow;
+
+    public Flow Flow { get; }
+
+    public DateTimeOffset LastActivityUtc { get; protected set; } = DateTimeOffset.UtcNow;
+
+    public abstract Task SendAsync(byte[] datagram);
+
+    public abstract ValueTask DisposeAsync();
+}
+
+/// <summary>Blocked, failed or unroutable: every datagram is discarded, and the flow says why.</summary>
+internal sealed class DropSession : UdpSession
+{
+    public DropSession(Flow flow) : base(flow)
+    {
+    }
+
+    public override Task SendAsync(byte[] datagram)
+    {
+        LastActivityUtc = DateTimeOffset.UtcNow;
+        return Task.CompletedTask;
+    }
+
+    public override ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+/// <summary>Relays datagrams straight to the destination from a bypass-marked socket.</summary>
+internal sealed class DirectUdpSession : UdpSession
+{
+    private readonly ReplySocketPool _replies;
     private readonly Socket _relay;
-    private readonly Socket _reply;
     private readonly IPEndPoint _client;
     private readonly IPEndPoint _original;
-    private readonly Flow _flow;
+    private readonly DnsCache? _learn;
+    private readonly CancellationTokenSource _closing = new();
+
+    private DirectUdpSession(
+        ReplySocketPool replies, Socket relay, IPEndPoint client, IPEndPoint original, Flow flow, DnsCache? learn)
+        : base(flow)
+    {
+        _replies = replies;
+        _relay = relay;
+        _client = client;
+        _original = original;
+        _learn = learn;
+        _ = PumpRepliesAsync(_closing.Token);
+    }
+
+    public static Task<DirectUdpSession> OpenAsync(
+        ReplySocketPool replies, IPEndPoint client, IPEndPoint original, Flow flow, DnsCache? learn, CancellationToken ct)
+    {
+        var relay = new Socket(original.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+        relay.SetMark(PolicyRouting.BypassMark);
+        relay.Connect(original);
+        replies.Reserve(original);
+        return Task.FromResult(new DirectUdpSession(replies, relay, client, original, flow, learn));
+    }
+
+    public override async Task SendAsync(byte[] datagram)
+    {
+        LastActivityUtc = DateTimeOffset.UtcNow;
+        try
+        {
+            await _relay.SendAsync(datagram, _closing.Token).ConfigureAwait(false);
+            Flow.AddUp(datagram.Length);
+        }
+        catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
+        {
+        }
+    }
+
+    private async Task PumpRepliesAsync(CancellationToken ct)
+    {
+        var buffer = new byte[65535];
+        while (!ct.IsCancellationRequested)
+        {
+            int received;
+            try
+            {
+                received = await _relay.ReceiveAsync(buffer, ct).ConfigureAwait(false);
+            }
+            catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
+            {
+                return;
+            }
+
+            LastActivityUtc = DateTimeOffset.UtcNow;
+            _learn?.Learn(buffer.AsSpan(0, received));
+            await _replies.SendAsync(_original, _client, buffer.AsMemory(0, received)).ConfigureAwait(false);
+            Flow.AddDown(received);
+        }
+    }
+
+    public override ValueTask DisposeAsync()
+    {
+        _closing.Cancel();
+        Flow.MarkClosed();
+        _relay.Dispose();
+        _closing.Dispose();
+        return ValueTask.CompletedTask;
+    }
+}
+
+/// <summary>One UDP flow relayed through a SOCKS5 UDP association.</summary>
+internal sealed class Socks5UdpSession : UdpSession
+{
+    private readonly ReplySocketPool _replies;
+    private readonly Socket _control;
+    private readonly Socket _relay;
+    private readonly IPEndPoint _client;
+    private readonly IPEndPoint _original;
+    private readonly DnsCache? _learn;
     private readonly byte[] _header;
     private readonly CancellationTokenSource _closing = new();
 
-    private UdpSession(Socket control, Socket relay, Socket reply, IPEndPoint client, IPEndPoint original, Flow flow)
+    private Socks5UdpSession(
+        ReplySocketPool replies, Socket control, Socket relay, IPEndPoint client, IPEndPoint original, Flow flow, DnsCache? learn)
+        : base(flow)
     {
+        _replies = replies;
         _control = control;
         _relay = relay;
-        _reply = reply;
         _client = client;
         _original = original;
-        _flow = flow;
-        LastActivityUtc = DateTimeOffset.UtcNow;
+        _learn = learn;
 
         // SOCKS5 UDP header: RSV(2) FRAG(1) ATYP(1) ADDR PORT — built once per session.
         var address = original.Address.GetAddressBytes();
@@ -295,83 +466,47 @@ internal sealed class UdpSession : IAsyncDisposable
         _ = PumpRepliesAsync(_closing.Token);
     }
 
-    public DateTimeOffset LastActivityUtc { get; private set; }
-
-    public static async Task<UdpSession> OpenAsync(
-        ProxyEndpoint proxy, string? password, IPEndPoint client, IPEndPoint original, Flow flow,
-        Action<string> log, CancellationToken ct)
+    public static async Task<Socks5UdpSession> OpenAsync(
+        ReplySocketPool replies, ProxyHop hop, IPEndPoint client, IPEndPoint original, Flow flow, DnsCache? learn,
+        CancellationToken ct)
     {
-        IPAddress proxyAddress;
-        if (!IPAddress.TryParse(proxy.Host, out proxyAddress!))
-        {
-            var addresses = await Dns.GetHostAddressesAsync(proxy.Host, ct).ConfigureAwait(false);
-            proxyAddress = addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)
-                           ?? throw new SocketException((int)SocketError.HostNotFound);
-        }
+        var proxyAddress = await ProxyDialer.ResolveAsync(hop.Endpoint.Host, ct).ConfigureAwait(false);
 
         // The association lives as long as this TCP control connection.
-        var control = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        control.SetMark(PolicyRouting.BypassMark);
-        await control.ConnectAsync(new IPEndPoint(proxyAddress, proxy.Port), ct).ConfigureAwait(false);
-
-        var relayEndpoint = await Socks5UdpAssociateAsync(control, proxy.Username, password, proxyAddress, ct)
-            .ConfigureAwait(false);
+        var control = await ProxyDialer.ConnectWithBypassAsync(hop.Endpoint.Host, hop.Endpoint.Port, ct).ConfigureAwait(false);
+        IPEndPoint relayEndpoint;
+        try
+        {
+            using var stream = new NetworkStream(control, ownsSocket: false);
+            relayEndpoint = await AssociateAsync(stream, hop, proxyAddress, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            control.Dispose();
+            throw;
+        }
 
         var relay = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         relay.SetMark(PolicyRouting.BypassMark);
         await relay.ConnectAsync(relayEndpoint, ct).ConfigureAwait(false);
 
-        // Replies must come FROM the address the application addressed. Binding a
-        // transparent socket to a foreign address is exactly what IP_TRANSPARENT permits.
-        var reply = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        reply.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        reply.SetTransparent();
-        reply.SetMark(PolicyRouting.BypassMark);
-        reply.Bind(original);
-
-        flow.MarkEstablished();
-        return new UdpSession(control, relay, reply, client, original, flow);
+        replies.Reserve(original);
+        return new Socks5UdpSession(replies, control, relay, client, original, flow, learn);
     }
 
-    private static async Task<IPEndPoint> Socks5UdpAssociateAsync(
-        Socket control, string? username, string? password, IPAddress proxyAddress, CancellationToken ct)
+    private static async Task<IPEndPoint> AssociateAsync(Stream control, ProxyHop hop, IPAddress proxyAddress, CancellationToken ct)
     {
-        // Reuse the CONNECT client's negotiation by speaking the greeting ourselves; the
-        // only difference from CONNECT is the command byte and the meaning of the reply.
-        var wantsAuth = !string.IsNullOrEmpty(username);
-        await control.SendAsync(wantsAuth ? new byte[] { 5, 2, 0, 2 } : new byte[] { 5, 1, 0 }, ct).ConfigureAwait(false);
-        var choice = await ReadExactlyAsync(control, 2, ct).ConfigureAwait(false);
-        if (choice[0] != 5)
-        {
-            throw new ProxyHandshakeException("The proxy did not answer as SOCKS5.");
-        }
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        var token = timeout.Token;
 
-        if (choice[1] == 2 && wantsAuth)
-        {
-            var user = System.Text.Encoding.UTF8.GetBytes(username!);
-            var pass = System.Text.Encoding.UTF8.GetBytes(password ?? string.Empty);
-            var frame = new byte[3 + user.Length + pass.Length];
-            frame[0] = 1;
-            frame[1] = (byte)user.Length;
-            user.CopyTo(frame, 2);
-            frame[2 + user.Length] = (byte)pass.Length;
-            pass.CopyTo(frame, 3 + user.Length);
-            await control.SendAsync(frame, ct).ConfigureAwait(false);
-            var auth = await ReadExactlyAsync(control, 2, ct).ConfigureAwait(false);
-            if (auth[1] != 0)
-            {
-                throw new ProxyHandshakeException("The proxy rejected the username or password.");
-            }
-        }
-        else if (choice[1] != 0)
-        {
-            throw new ProxyHandshakeException("The proxy requires authentication for UDP.");
-        }
+        await ProxyDialer.Socks5GreetAsync(control, hop.Endpoint.Username, hop.Password, token).ConfigureAwait(false);
 
         // UDP ASSOCIATE with an unspecified client address: we will send from whatever
         // port the relay socket gets.
-        await control.SendAsync(new byte[] { 5, 3, 0, 1, 0, 0, 0, 0, 0, 0 }, ct).ConfigureAwait(false);
-        var reply = await ReadExactlyAsync(control, 4, ct).ConfigureAwait(false);
+        await control.WriteAsync(ProxyDialer.BuildSocks5Request(0x03, "0.0.0.0", 0), token).ConfigureAwait(false);
+        await control.FlushAsync(token).ConfigureAwait(false);
+        var reply = await ProxyDialer.ReadExactlyAsync(control, 4, token).ConfigureAwait(false);
         if (reply[1] != 0)
         {
             throw new ProxyHandshakeException(reply[1] == 7
@@ -379,25 +514,18 @@ internal sealed class UdpSession : IAsyncDisposable
                 : $"The proxy refused UDP ASSOCIATE (reply {reply[1]:#x}).");
         }
 
-        if (reply[3] != 1)
+        var bound = await ProxyDialer.DrainSocks5AddressAsync(control, reply[3], token).ConfigureAwait(false)
+                    ?? throw new ProxyHandshakeException("The proxy returned a named relay address, which is not supported.");
+        if (bound.AddressFamily != AddressFamily.InterNetwork)
         {
             throw new ProxyHandshakeException("The proxy returned a non-IPv4 relay address, which is not supported yet.");
         }
 
-        var bound = await ReadExactlyAsync(control, 6, ct).ConfigureAwait(false);
-        var relayAddress = new IPAddress(bound.AsSpan(0, 4));
-        var relayPort = BinaryPrimitives.ReadUInt16BigEndian(bound.AsSpan(4));
-
         // 0.0.0.0 means "same host as the control connection".
-        if (relayAddress.Equals(IPAddress.Any))
-        {
-            relayAddress = proxyAddress;
-        }
-
-        return new IPEndPoint(relayAddress, relayPort);
+        return bound.Address.Equals(IPAddress.Any) ? new IPEndPoint(proxyAddress, bound.Port) : bound;
     }
 
-    public async Task SendAsync(byte[] datagram)
+    public override async Task SendAsync(byte[] datagram)
     {
         LastActivityUtc = DateTimeOffset.UtcNow;
         var framed = new byte[_header.Length + datagram.Length];
@@ -406,7 +534,7 @@ internal sealed class UdpSession : IAsyncDisposable
         try
         {
             await _relay.SendAsync(framed, _closing.Token).ConfigureAwait(false);
-            _flow.AddUp(datagram.Length);
+            Flow.AddUp(datagram.Length);
         }
         catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
         {
@@ -447,43 +575,84 @@ internal sealed class UdpSession : IAsyncDisposable
             }
 
             LastActivityUtc = DateTimeOffset.UtcNow;
-            try
-            {
-                await _reply.SendToAsync(buffer.AsMemory(offset, received - offset), _client, ct).ConfigureAwait(false);
-                _flow.AddDown(received - offset);
-            }
-            catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
-            {
-                return;
-            }
+            _learn?.Learn(buffer.AsSpan(offset, received - offset));
+            await _replies.SendAsync(_original, _client, buffer.AsMemory(offset, received - offset)).ConfigureAwait(false);
+            Flow.AddDown(received - offset);
         }
     }
 
-    private static async Task<byte[]> ReadExactlyAsync(Socket socket, int count, CancellationToken ct)
-    {
-        var buffer = new byte[count];
-        var offset = 0;
-        while (offset < count)
-        {
-            var read = await socket.ReceiveAsync(buffer.AsMemory(offset), ct).ConfigureAwait(false);
-            if (read == 0)
-            {
-                throw new ProxyHandshakeException("The proxy closed the connection during UDP ASSOCIATE.");
-            }
-
-            offset += read;
-        }
-
-        return buffer;
-    }
-
-    public ValueTask DisposeAsync()
+    public override ValueTask DisposeAsync()
     {
         _closing.Cancel();
-        _flow.MarkClosed();
+        Flow.MarkClosed();
         _relay.Dispose();
-        _reply.Dispose();
         _control.Dispose();
+        _closing.Dispose();
+        return ValueTask.CompletedTask;
+    }
+}
+
+/// <summary>
+/// Carries DNS for a route that cannot relay UDP by sending each query over a TCP tunnel
+/// (RFC 1035 §4.2.2: two-byte length prefix) and returning the answer as a datagram.
+/// </summary>
+internal sealed class DnsOverTcpSession : UdpSession
+{
+    private readonly ReplySocketPool _replies;
+    private readonly IReadOnlyList<ProxyHop> _hops;
+    private readonly IPEndPoint _client;
+    private readonly IPEndPoint _original;
+    private readonly DnsCache? _learn;
+    private readonly CancellationTokenSource _closing = new();
+
+    private DnsOverTcpSession(
+        ReplySocketPool replies, IReadOnlyList<ProxyHop> hops, IPEndPoint client, IPEndPoint original, Flow flow, DnsCache? learn)
+        : base(flow)
+    {
+        _replies = replies;
+        _hops = hops;
+        _client = client;
+        _original = original;
+        _learn = learn;
+    }
+
+    public static DnsOverTcpSession Open(
+        ReplySocketPool replies, IReadOnlyList<ProxyHop> hops, IPEndPoint client, IPEndPoint original, Flow flow,
+        DnsCache? learn, CancellationToken ct)
+    {
+        replies.Reserve(original);
+        return new DnsOverTcpSession(replies, hops, client, original, flow, learn);
+    }
+
+    public override async Task SendAsync(byte[] datagram)
+    {
+        LastActivityUtc = DateTimeOffset.UtcNow;
+        try
+        {
+            await using var leg = await ProxyDialer.OpenAsync(_hops, _original, _closing.Token).ConfigureAwait(false);
+            var framed = new byte[2 + datagram.Length];
+            BinaryPrimitives.WriteUInt16BigEndian(framed, (ushort)datagram.Length);
+            datagram.CopyTo(framed, 2);
+            await leg.Stream.WriteAsync(framed, _closing.Token).ConfigureAwait(false);
+            await leg.Stream.FlushAsync(_closing.Token).ConfigureAwait(false);
+            Flow.AddUp(datagram.Length);
+
+            var length = await ProxyDialer.ReadExactlyAsync(leg.Stream, 2, _closing.Token).ConfigureAwait(false);
+            var answer = await ProxyDialer.ReadExactlyAsync(leg.Stream, BinaryPrimitives.ReadUInt16BigEndian(length), _closing.Token).ConfigureAwait(false);
+            _learn?.Learn(answer);
+            await _replies.SendAsync(_original, _client, answer).ConfigureAwait(false);
+            Flow.AddDown(answer.Length);
+        }
+        catch (Exception e) when (e is ProxyHandshakeException or SocketException or IOException or ObjectDisposedException or OperationCanceledException)
+        {
+            // The resolver retries; one lost answer is what UDP DNS expects anyway.
+        }
+    }
+
+    public override ValueTask DisposeAsync()
+    {
+        _closing.Cancel();
+        Flow.MarkClosed();
         _closing.Dispose();
         return ValueTask.CompletedTask;
     }

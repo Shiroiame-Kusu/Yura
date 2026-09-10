@@ -77,6 +77,12 @@ public sealed record ProxyEndpoint
     /// </summary>
     public string? PasswordRef { get; init; }
 
+    /// <summary>
+    /// For <see cref="ProxyProtocol.Https"/>: accept a certificate that does not validate.
+    /// Off by default; an explicit, visible choice for self-signed corporate proxies.
+    /// </summary>
+    public bool AllowInvalidCertificate { get; init; }
+
     /// <summary>Last measured state. Null until a probe has been run.</summary>
     public ProxyProbeResult? LastProbe { get; init; }
 
@@ -112,10 +118,11 @@ public sealed record ProxyEndpoint
 /// An ordered list of proxies traversed in sequence. Element 0 is dialled first.
 /// </summary>
 /// <remarks>
-/// Chaining is TCP-only in this release: relaying UDP through more than one hop needs
-/// every hop to support UDP ASSOCIATE and to agree on the relay address, which we cannot
-/// verify end to end. <see cref="SupportsUdp"/> therefore reports Unsupported for chains
-/// of length &gt; 1 rather than letting a game silently lose its UDP traffic.
+/// Chaining is TCP-only: relaying UDP through more than one hop needs every hop to support
+/// UDP ASSOCIATE and to agree on the relay address, which cannot be verified end to end.
+/// <see cref="SupportsUdp"/> therefore reports Unsupported for chains of length &gt; 1 rather
+/// than letting a game silently lose its UDP traffic. A chain of one hop behaves exactly
+/// like that endpoint.
 /// </remarks>
 public sealed record ProxyChain
 {

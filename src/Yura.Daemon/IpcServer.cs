@@ -1,15 +1,32 @@
 using System.Diagnostics;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
-using Yura.Core.Connections;
 using Yura.Core.Ipc;
-using Yura.Core.Proxies;
+using Yura.Core.Rules;
+using Yura.Daemon.Diagnostics;
 using Yura.Daemon.Forwarding;
 using Yura.Daemon.Linux;
 using Yura.Daemon.Runtime;
 
 namespace Yura.Daemon;
+
+/// <summary>Facts about the machine and the daemon's startup, reported through status.</summary>
+public sealed record DaemonEnvironment
+{
+    public required string SocketPath { get; init; }
+
+    public required IReadOnlyCollection<uint> AllowedUids { get; init; }
+
+    public string? KernelRelease { get; init; }
+
+    public string? NftVersion { get; init; }
+
+    public IReadOnlyList<CheckDto> Checks { get; init; } = [];
+
+    public Func<string?>? ProcessWatcherState { get; init; }
+}
 
 /// <summary>
 /// The daemon's only door: a Unix domain socket speaking newline-delimited JSON.
@@ -26,6 +43,11 @@ public sealed class IpcServer : IAsyncDisposable
     private readonly RuleRuntime _runtime;
     private readonly FlowRegistry _flows;
     private readonly SocketOwnership _ownership;
+    private readonly ConnectionLister _connections;
+    private readonly NftablesManager _nftables;
+    private readonly CommandRunner _commands;
+    private readonly LogBuffer _logBuffer;
+    private readonly DaemonEnvironment _environment;
     private readonly Action<string> _log;
     private readonly Stopwatch _uptime = Stopwatch.StartNew();
     private readonly CancellationTokenSource _stopping = new();
@@ -38,6 +60,11 @@ public sealed class IpcServer : IAsyncDisposable
         RuleRuntime runtime,
         FlowRegistry flows,
         SocketOwnership ownership,
+        ConnectionLister connections,
+        NftablesManager nftables,
+        CommandRunner commands,
+        LogBuffer logBuffer,
+        DaemonEnvironment environment,
         Action<string> log)
     {
         _socketPath = socketPath;
@@ -45,6 +72,11 @@ public sealed class IpcServer : IAsyncDisposable
         _runtime = runtime;
         _flows = flows;
         _ownership = ownership;
+        _connections = connections;
+        _nftables = nftables;
+        _commands = commands;
+        _logBuffer = logBuffer;
+        _environment = environment;
         _log = log;
     }
 
@@ -167,7 +199,16 @@ public sealed class IpcServer : IAsyncDisposable
                         Version = Program.Version,
                         ActiveRules = _runtime.Rules.Count,
                         ActiveFlows = _flows.ActiveCount,
+                        ActiveGroups = _runtime.Groups.Count,
                         UptimeSeconds = (long)_uptime.Elapsed.TotalSeconds,
+                        ProcessWatcher = _environment.ProcessWatcherState?.Invoke(),
+                        DnsPolicy = _runtime.Options.DnsPolicy,
+                        KernelRelease = _environment.KernelRelease,
+                        NftVersion = _environment.NftVersion,
+                        CgroupRoot = CgroupManager.Root,
+                        SocketPath = _socketPath,
+                        AllowedUids = _allowedUids.ToList(),
+                        Checks = _environment.Checks.ToList(),
                     },
                 };
 
@@ -176,7 +217,20 @@ public sealed class IpcServer : IAsyncDisposable
                 var proxies = (request.Proxies ?? [])
                     .Select(p => (p.ToEndpoint(), p.Password))
                     .ToList();
-                var outcome = await _runtime.SetProxiesAsync(proxies, ct).ConfigureAwait(false);
+                var chains = (request.Chains ?? []).Select(c => c.ToChain()).ToList();
+                var outcome = await _runtime.SetProxiesAsync(proxies, chains, ct).ConfigureAwait(false);
+                return FromOutcome(outcome);
+            }
+
+            case "set-options":
+            {
+                if (request.Options is null)
+                {
+                    return IpcResponse.Failure("set-options needs options.");
+                }
+
+                var outcome = await _runtime.SetOptionsAsync(new DaemonOptions { DnsPolicy = request.Options.DnsPolicy }, ct)
+                    .ConfigureAwait(false);
                 return FromOutcome(outcome);
             }
 
@@ -208,6 +262,9 @@ public sealed class IpcServer : IAsyncDisposable
             case "list-flows":
                 return new IpcResponse { Ok = true, Flows = _flows.Snapshot().Select(ToDto).ToList() };
 
+            case "list-connections":
+                return new IpcResponse { Ok = true, Connections = _connections.List(request.Pid) };
+
             case "connection-counts":
                 return new IpcResponse
                 {
@@ -227,8 +284,80 @@ public sealed class IpcServer : IAsyncDisposable
                 return new IpcResponse { Ok = true, Probe = probe };
             }
 
+            case "measure":
+            {
+                if (request.Measure is null)
+                {
+                    return IpcResponse.Failure("measure needs a target.");
+                }
+
+                IPAddress address;
+                try
+                {
+                    address = await ProxyDialer.ResolveAsync(request.Measure.Host, ct).ConfigureAwait(false);
+                }
+                catch (SocketException e)
+                {
+                    return IpcResponse.Failure($"The measurement target '{request.Measure.Host}' could not be resolved.", e.Message);
+                }
+
+                IReadOnlyList<ProxyHop>? route = null;
+                if (request.Measure.ChainId is { } chainId)
+                {
+                    var (hops, _, failure) = _runtime.State.ResolveRoute(new RuleAction.Chain(chainId));
+                    if (failure is not null)
+                    {
+                        return IpcResponse.Failure(failure);
+                    }
+
+                    route = hops;
+                }
+                else if (request.Measure.ProxyId is { } proxyId)
+                {
+                    var (hops, _, failure) = _runtime.State.ResolveRoute(new RuleAction.Proxy(proxyId));
+                    if (failure is not null)
+                    {
+                        return IpcResponse.Failure(failure);
+                    }
+
+                    route = hops;
+                }
+
+                var measurement = await NetworkMeasurer.MeasureAsync(
+                    new IPEndPoint(address, request.Measure.Port), route, request.Measure.Samples, ct).ConfigureAwait(false);
+                return new IpcResponse { Ok = true, Measurement = measurement };
+            }
+
+            case "dump-ruleset":
+            {
+                var table = await _nftables.DumpAsync(ct).ConfigureAwait(false);
+                var rules = await _commands.RunAsync("ip", ["rule", "show"], cancellationToken: ct).ConfigureAwait(false);
+                var routes = await _commands.RunAsync("ip", ["route", "show", "table", PolicyRouting.RoutingTable.ToString()],
+                    cancellationToken: ct).ConfigureAwait(false);
+                var groups = string.Join('\n', _runtime.Groups.OrderBy(g => g.Index).Select(g =>
+                    $"{g.Name}: pids [{string.Join(", ", ReadMembers(g.Name))}] rules [{string.Join(", ", g.RuleIds.Select(id => _runtime.Rules.FirstOrDefault(r => r.Id == id)?.Name ?? id.ToString()))}]"));
+                var text = $"# nft list table inet yura\n{table}\n# ip rule show\n{rules.StandardOutput}\n# ip route show table {PolicyRouting.RoutingTable}\n{routes.StandardOutput}\n# process groups\n{groups}\n";
+                return new IpcResponse { Ok = true, Ruleset = text };
+            }
+
+            case "log":
+                return new IpcResponse { Ok = true, Log = _logBuffer.Tail(request.Lines ?? 200).ToList() };
+
             default:
                 return IpcResponse.Failure($"Unknown operation '{request.Op}'.");
+        }
+    }
+
+    private static IReadOnlyList<int> ReadMembers(string groupName)
+    {
+        try
+        {
+            return File.ReadAllLines($"{CgroupManager.PathFor(groupName)}/cgroup.procs")
+                .Where(l => l.Length > 0).Select(int.Parse).ToArray();
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or FormatException)
+        {
+            return [];
         }
     }
 
@@ -256,16 +385,13 @@ public sealed class IpcServer : IAsyncDisposable
         Destination = flow.OriginalDestination.ToString(),
         Protocol = flow.Protocol,
         State = flow.State,
-        // The daemon holds both sockets of every flow it lists, which is the one and only
-        // condition under which "proxied" may be claimed.
-        Route = flow.State switch
-        {
-            ConnectionState.Failed => RouteObservation.Unknown,
-            ConnectionState.Establishing => RouteObservation.Pending,
-            _ => RouteObservation.ConfirmedProxied,
-        },
+        Route = flow.Route,
         RuleId = flow.RuleId,
+        RuleName = flow.RuleName,
         ProxyName = flow.ProxyName,
+        OwnerPid = flow.OwnerPid,
+        ProcessName = flow.ProcessName,
+        Host = flow.Host,
         BytesUp = flow.BytesUp,
         BytesDown = flow.BytesDown,
         CreatedAtUtc = flow.CreatedAtUtc,

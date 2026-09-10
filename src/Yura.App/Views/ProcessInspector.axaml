@@ -117,14 +117,47 @@
 
                 <CheckBox IsChecked="{Binding IncludeChildren}"
                           Content="{loc:Tr Processes.Action.IncludeChildren}" />
+                <TextBlock Classes="FieldHint" Text="{loc:Tr Processes.Scope.ExcludeHint}"
+                           IsVisible="{Binding !IncludeChildren}" />
 
                 <Button HorizontalAlignment="Stretch"
                         Command="{Binding RemoveOverrideCommand}"
                         Content="{loc:Tr Processes.Action.RemoveOverride}" />
 
+                <Grid ColumnDefinitions="*,8,*">
+                  <Button Grid.Column="0" HorizontalAlignment="Stretch"
+                          Command="{Binding InspectConnectionsCommand}"
+                          Content="{loc:Tr Processes.Action.InspectConnections}" />
+                  <Button Grid.Column="2" HorizontalAlignment="Stretch"
+                          Command="{Binding AddAsGameCommand}"
+                          Content="{loc:Tr Processes.Action.AddAsGame}" />
+                </Grid>
+
                 <!-- Why an action is unavailable, beside the control rather than in a tooltip. -->
                 <TextBlock Classes="FieldHint" Text="{Binding ApplyBlockedReason}"
                            IsVisible="{Binding ApplyBlockedReason, Converter={x:Static ObjectConverters.IsNotNull}}" />
+              </StackPanel>
+
+              <!-- Every rule that covers this process, in evaluation order, so precedence is
+                   visible where the decision is made rather than only on the Rules page. -->
+              <StackPanel Spacing="6" IsVisible="{Binding HasCoveringRules}">
+                <Border Classes="Divider" />
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Processes.RulesCovering}" />
+                <ItemsControl ItemsSource="{Binding CoveringRules}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="vm:CoveringRule">
+                      <Grid ColumnDefinitions="Auto,*" Margin="0,2" ColumnSpacing="8">
+                        <Border Grid.Column="0" Classes="Badge" Classes.Accent="{Binding IsWinner}">
+                          <TextBlock Text="{Binding Position}" />
+                        </Border>
+                        <StackPanel Grid.Column="1" Spacing="0">
+                          <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
+                          <TextBlock Classes="Caption" Text="{Binding Detail}" TextWrapping="Wrap" />
+                        </StackPanel>
+                      </Grid>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
               </StackPanel>
 
               <!-- Result of the last apply: separates "new connections" from "existing". -->

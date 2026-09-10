@@ -10,6 +10,7 @@
 
   <conv:EnumToBoolConverter x:Key="EnumToBool" />
   <conv:ProtocolDisplayConverter x:Key="ProtocolDisplay" />
+  <conv:DnsPolicyDisplayConverter x:Key="DnsPolicyDisplay" />
 
   <!-- The routing-policy cell. Pairs a colour with a word so colour never carries the
        meaning on its own, and stays fixed width so the column does not jitter. -->

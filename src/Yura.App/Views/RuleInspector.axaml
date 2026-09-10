@@ -1,0 +1,190 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:Yura.App.ViewModels"
+             xmlns:loc="using:Yura.App.Localization"
+             xmlns:views="using:Yura.App.Views"
+             mc:Ignorable="d"
+             x:Class="Yura.App.Views.RuleInspector"
+             x:DataType="vm:RulesPageViewModel">
+
+  <!--
+    The rule inspector: what the selected rule matches, how to reorder or change it, and the
+    editor.
+
+    In its own control because the page shows it in two positions — docked beside the table on
+    a wide window, floating over it on a narrow one — and duplicated markup would drift.
+  -->
+  <Border Classes="Panel">
+    <ScrollViewer>
+          <StackPanel Margin="16" Spacing="14">
+
+            <!-- Nothing selected and nothing being edited -->
+            <TextBlock Classes="Subtitle" Text="{loc:Tr Rules.SelectToInspect}" TextWrapping="Wrap"
+                       IsVisible="{Binding !HasSelection}" />
+
+            <!-- Selected rule: what it does and what can be done to it -->
+            <StackPanel Spacing="12" IsVisible="{Binding HasSelection}">
+              <StackPanel Spacing="4">
+                <TextBlock Classes="SectionTitle" Text="{Binding SelectedRule.Name}" TextWrapping="Wrap" />
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                  <Border Classes="Badge">
+                    <TextBlock Text="{Binding SelectedRule.OriginDisplay}" />
+                  </Border>
+                  <Border Classes="Badge">
+                    <TextBlock Text="{Binding SelectedRule.LifetimeDisplay}" />
+                  </Border>
+                </StackPanel>
+              </StackPanel>
+
+              <StackPanel Spacing="2">
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Rules.Column.Process}" />
+                <TextBlock Classes="Mono" Text="{Binding SelectedRule.ProcessDisplay}" TextWrapping="Wrap" />
+              </StackPanel>
+
+              <StackPanel Spacing="2">
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Rules.Column.Destination}" />
+                <TextBlock Classes="Mono" Text="{Binding SelectedRule.DestinationDisplay}" TextWrapping="Wrap" />
+              </StackPanel>
+
+              <Border Classes="Divider" />
+
+              <Grid ColumnDefinitions="*,8,*">
+                <Button Grid.Column="0" HorizontalAlignment="Stretch"
+                        Command="{Binding MoveEarlierCommand}"
+                        Content="{loc:Tr Rules.MoveEarlier}"
+                        AutomationProperties.Name="{loc:Tr Rules.MoveEarlier}" />
+                <Button Grid.Column="2" HorizontalAlignment="Stretch"
+                        Command="{Binding MoveLaterCommand}"
+                        Content="{loc:Tr Rules.MoveLater}"
+                        AutomationProperties.Name="{loc:Tr Rules.MoveLater}" />
+              </Grid>
+
+              <Button HorizontalAlignment="Stretch" Command="{Binding EditRuleCommand}"
+                      IsEnabled="{Binding SelectedRule.IsEditable}"
+                      Content="{loc:Tr Rules.Editor.TitleEdit}" />
+
+              <Button HorizontalAlignment="Stretch" Command="{Binding ToggleEnabledCommand}"
+                      Content="{loc:Tr Rules.Disable}" IsVisible="{Binding SelectedRule.Rule.Enabled}" />
+              <Button HorizontalAlignment="Stretch" Command="{Binding ToggleEnabledCommand}"
+                      Content="{loc:Tr Rules.Enable}" IsVisible="{Binding !SelectedRule.Rule.Enabled}" />
+
+              <Button HorizontalAlignment="Stretch" Command="{Binding RemoveCommand}"
+                      Content="{loc:Tr Common.Remove}" />
+            </StackPanel>
+
+            <!-- Editor. The visibility check sits on an outer element: a DataContext set on
+                 the same element would be the one IsVisible binds against. -->
+            <Panel IsVisible="{Binding Editor.IsOpen}">
+            <StackPanel Spacing="12"
+                        DataContext="{Binding Editor}" x:DataType="vm:RuleEditorViewModel">
+              <Border Classes="Divider" />
+              <TextBlock Classes="SectionTitle" Text="{Binding Title}" />
+
+              <StackPanel>
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Rules.Column.Name}" />
+                <TextBox Text="{Binding Name}" AutomationProperties.Name="{loc:Tr Rules.Column.Name}" />
+              </StackPanel>
+
+              <StackPanel>
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Rules.Editor.ProcessKind}" />
+                <ComboBox ItemsSource="{Binding ProcessKinds}" SelectedItem="{Binding ProcessKind}"
+                          HorizontalAlignment="Stretch"
+                          AutomationProperties.Name="{loc:Tr Rules.Editor.ProcessKind}" />
+              </StackPanel>
+
+              <StackPanel IsVisible="{Binding NeedsProcessValue}">
+                <TextBlock Classes="FieldLabel" Text="{Binding ProcessValueLabel}" />
+                <TextBox Text="{Binding ProcessValue}" Classes="Mono"
+                         AutomationProperties.Name="{Binding ProcessValueLabel}" />
+              </StackPanel>
+
+              <CheckBox IsChecked="{Binding IncludeChildren}" Content="{loc:Tr Rules.Editor.IncludeChildren}" />
+
+              <Expander Header="{loc:Tr Rules.Editor.Destination}" IsExpanded="True">
+                <StackPanel Spacing="10" Margin="0,6,0,0">
+                  <StackPanel>
+                    <TextBlock Classes="FieldLabel" Text="{loc:Tr Rules.Editor.Hosts}" />
+                    <TextBox Text="{Binding Hosts}" Classes="Mono"
+                             PlaceholderText="{loc:Tr Rules.Editor.HostsPlaceholder}"
+                             AutomationProperties.Name="{loc:Tr Rules.Editor.Hosts}" />
+                  </StackPanel>
+                  <StackPanel>
+                    <TextBlock Classes="FieldLabel" Text="{loc:Tr Rules.Editor.Networks}" />
+                    <TextBox Text="{Binding Networks}" Classes="Mono"
+                             PlaceholderText="{loc:Tr Rules.Editor.NetworksPlaceholder}"
+                             AutomationProperties.Name="{loc:Tr Rules.Editor.Networks}" />
+                  </StackPanel>
+                  <StackPanel>
+                    <TextBlock Classes="FieldLabel" Text="{loc:Tr Rules.Editor.Ports}" />
+                    <TextBox Text="{Binding Ports}" Classes="Mono"
+                             PlaceholderText="{loc:Tr Rules.Editor.PortsPlaceholder}"
+                             AutomationProperties.Name="{loc:Tr Rules.Editor.Ports}" />
+                  </StackPanel>
+                  <StackPanel>
+                    <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Protocol}" />
+                    <ComboBox ItemsSource="{Binding Protocols}" SelectedItem="{Binding Protocol}"
+                              HorizontalAlignment="Stretch"
+                              AutomationProperties.Name="{loc:Tr Proxy.Protocol}" />
+                  </StackPanel>
+                </StackPanel>
+              </Expander>
+
+              <StackPanel>
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Rules.Editor.Action}" />
+                <ComboBox ItemsSource="{Binding Actions}" SelectedItem="{Binding Action}"
+                          HorizontalAlignment="Stretch"
+                          AutomationProperties.Name="{loc:Tr Rules.Editor.Action}" />
+              </StackPanel>
+
+              <StackPanel IsVisible="{Binding NeedsRoute}">
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Rules.Editor.Route}" />
+                <ComboBox ItemsSource="{Binding Routes}" SelectedItem="{Binding Route}"
+                          HorizontalAlignment="Stretch"
+                          PlaceholderText="{loc:Tr Games.SelectRoute}"
+                          AutomationProperties.Name="{loc:Tr Rules.Editor.Route}">
+                  <ComboBox.ItemTemplate>
+                    <DataTemplate>
+                      <TextBlock Text="{Binding Name}" />
+                    </DataTemplate>
+                  </ComboBox.ItemTemplate>
+                </ComboBox>
+              </StackPanel>
+
+              <TextBlock Classes="FieldError" Text="{Binding ValidationMessage}" TextWrapping="Wrap"
+                         IsVisible="{Binding ValidationMessage, Converter={x:Static ObjectConverters.IsNotNull}}" />
+
+              <Grid ColumnDefinitions="*,8,*">
+                <Button Grid.Column="0" Classes="accent" HorizontalAlignment="Stretch"
+                        Command="{Binding $parent[views:RuleInspector].((vm:RulesPageViewModel)DataContext).SaveEditCommand}"
+                        Content="{loc:Tr Common.Save}" />
+                <Button Grid.Column="2" HorizontalAlignment="Stretch"
+                        Command="{Binding CloseCommand}"
+                        Content="{loc:Tr Common.Cancel}" />
+              </Grid>
+            </StackPanel>
+            </Panel>
+
+            <!-- Outcome of the last operation -->
+            <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraAccentSubtle}"
+                    BorderBrush="{DynamicResource YuraAccent}"
+                    IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+              <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
+            </Border>
+
+            <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraDangerSubtle}"
+                    BorderBrush="{DynamicResource YuraDanger}"
+                    IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+              <StackPanel Spacing="6">
+                <TextBlock FontWeight="SemiBold" Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
+                <Expander Header="{loc:Tr Common.Details}"
+                          IsVisible="{Binding ErrorDiagnostics, Converter={x:Static ObjectConverters.IsNotNull}}">
+                  <SelectableTextBlock Classes="Mono" Text="{Binding ErrorDiagnostics}" TextWrapping="Wrap" />
+                </Expander>
+              </StackPanel>
+            </Border>
+          </StackPanel>
+        </ScrollViewer>
+      </Border>
+</UserControl>

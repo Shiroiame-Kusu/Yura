@@ -5,6 +5,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Yura.App.Localization;
 using Yura.App.Services;
+using Yura.Core.Games;
 using Yura.Core.Processes;
 using Yura.Core.Proxies;
 using Yura.Core.Rules;
@@ -18,7 +19,7 @@ public sealed record NavigationItem(string Key, string LabelKey, FluentIcons.Com
 }
 
 /// <summary>The application shell: navigation, daemon status, configuration and settings.</summary>
-public sealed partial class ShellViewModel : ObservableObject
+public sealed partial class ShellViewModel : ObservableObject, IDisposable
 {
     private readonly IDaemonClient _daemon;
     private readonly ISecretStore _secrets;
@@ -44,10 +45,41 @@ public sealed partial class ShellViewModel : ObservableObject
         var source = new ProcProcessSource();
 
         Processes = new ProcessesPageViewModel(source, _daemon, Rules);
-        Games = new GamesPageViewModel(Rules, _daemon);
+        Games = new GamesPageViewModel(Rules, _daemon, source);
+        Connections = new ConnectionsPageViewModel(_daemon, Rules);
         Proxies = new ProxiesPageViewModel(Rules, _daemon, _secrets);
+        RulesPage = new RulesPageViewModel(Rules, _daemon);
+        Diagnostics = new DiagnosticsPageViewModel(_daemon, _config, _secrets);
+        Settings = new SettingsPageViewModel(this, _daemon);
 
         SelectedPage = Pages[0];
+
+        // The Processes page hands work to two other pages: inspecting connections, and
+        // turning a selected process into a game profile.
+        Processes.InspectConnectionsRequested += (_, process) =>
+        {
+            Connections.FilterTo(process.Identity.Pid, process.DisplayName);
+            SelectedPage = Pages.First(p => p.Key == "connections");
+        };
+        Processes.AddAsGameRequested += (_, process) =>
+        {
+            Games.AddFromProcess(process);
+            SelectedPage = Pages.First(p => p.Key == "games");
+        };
+
+        // A rule drafted from a connection is finished on the Rules page: it needs an action.
+        Connections.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(ConnectionsPageViewModel.RuleDraft) &&
+                Connections.RuleDraft is { } draft)
+            {
+                RulesPage.EditDraft(draft);
+                SelectedPage = Pages.First(p => p.Key == "rules");
+                Connections.RuleDraft = null;
+            }
+        };
+
+        Games.ProfilesChanged += (_, _) => ScheduleSave();
 
         // Coalesced: a burst of edits produces one write, and the file is never rewritten
         // in the middle of the user still typing.
@@ -70,6 +102,7 @@ public sealed partial class ShellViewModel : ObservableObject
 
         Rules.Changed += (_, _) => ScheduleSave();
         Rules.Proxies.CollectionChanged += (_, _) => ScheduleSave();
+        Rules.Chains.CollectionChanged += (_, _) => ScheduleSave();
     }
 
     public RuleStore Rules { get; }
@@ -78,7 +111,15 @@ public sealed partial class ShellViewModel : ObservableObject
 
     public GamesPageViewModel Games { get; }
 
+    public ConnectionsPageViewModel Connections { get; }
+
     public ProxiesPageViewModel Proxies { get; }
+
+    public RulesPageViewModel RulesPage { get; }
+
+    public DiagnosticsPageViewModel Diagnostics { get; }
+
+    public SettingsPageViewModel Settings { get; }
 
     public IReadOnlyList<NavigationItem> Pages { get; } =
     [
@@ -98,21 +139,57 @@ public sealed partial class ShellViewModel : ObservableObject
 
     public bool IsGamesSelected => SelectedPage.Key == "games";
 
+    public bool IsConnectionsSelected => SelectedPage.Key == "connections";
+
     public bool IsProxiesSelected => SelectedPage.Key == "proxies";
 
-    /// <summary>True for pages that are navigable but not built yet in this milestone.</summary>
-    public bool IsPlaceholderSelected =>
-        !IsProcessesSelected && !IsGamesSelected && !IsProxiesSelected;
+    public bool IsRulesSelected => SelectedPage.Key == "rules";
 
-    public string PlaceholderTitle => SelectedPage.Label;
+    public bool IsDiagnosticsSelected => SelectedPage.Key == "diagnostics";
 
+    public bool IsSettingsSelected => SelectedPage.Key == "settings";
+
+    /// <summary>
+    /// Starts and stops the pages that poll, so a page nobody is looking at costs nothing.
+    /// </summary>
     partial void OnSelectedPageChanged(NavigationItem value)
     {
         OnPropertyChanged(nameof(IsProcessesSelected));
         OnPropertyChanged(nameof(IsGamesSelected));
+        OnPropertyChanged(nameof(IsConnectionsSelected));
         OnPropertyChanged(nameof(IsProxiesSelected));
-        OnPropertyChanged(nameof(IsPlaceholderSelected));
-        OnPropertyChanged(nameof(PlaceholderTitle));
+        OnPropertyChanged(nameof(IsRulesSelected));
+        OnPropertyChanged(nameof(IsDiagnosticsSelected));
+        OnPropertyChanged(nameof(IsSettingsSelected));
+
+        if (IsConnectionsSelected)
+        {
+            Connections.Activate();
+        }
+        else
+        {
+            Connections.Deactivate();
+        }
+
+        if (IsDiagnosticsSelected)
+        {
+            Diagnostics.Activate();
+        }
+        else
+        {
+            Diagnostics.Deactivate();
+        }
+
+        if (IsGamesSelected)
+        {
+            Games.Activate();
+        }
+        else
+        {
+            Games.Deactivate();
+        }
+
+        Processes.SetActive(IsProcessesSelected);
     }
 
     // -- configuration -------------------------------------------------------
@@ -120,8 +197,13 @@ public sealed partial class ShellViewModel : ObservableObject
     /// <summary>Where the configuration lives, shown in Settings and in diagnostics.</summary>
     public string ConfigPath => _config.FilePath;
 
+    public string ConfigDirectory => _config.Directory;
+
     /// <summary>Where proxy passwords are kept. Stated plainly rather than assumed.</summary>
     public string SecretStoreDescription => _secrets.Description;
+
+    /// <summary>False when there is no secret service, so passwords last only this session.</summary>
+    public bool HasSecretStore => _secrets.IsAvailable;
 
     /// <summary>
     /// A problem with loading or saving settings. Persistent, not a toast: it stays true
@@ -141,11 +223,21 @@ public sealed partial class ShellViewModel : ObservableObject
             IsDarkTheme = !string.Equals(document.Settings.Theme, "light", StringComparison.OrdinalIgnoreCase);
             IsChinese = document.Settings.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase);
             ReducedMotion = document.Settings.ReducedMotion;
+            DnsPolicy = document.Settings.DnsPolicy;
+            Processes.FilterScope = document.Settings.ShowAllProcesses
+                ? ProcessFilterScope.AllProcesses
+                : ProcessFilterScope.MyProcesses;
 
             Rules.Proxies.Clear();
             foreach (var proxy in document.Proxies)
             {
                 Rules.Proxies.Add(proxy.ToEndpoint());
+            }
+
+            Rules.Chains.Clear();
+            foreach (var chain in document.Chains)
+            {
+                Rules.Chains.Add(chain.ToChain());
             }
 
             // Rules arrive unapplied. They describe what the user wants, not what the kernel
@@ -164,6 +256,8 @@ public sealed partial class ShellViewModel : ObservableObject
             }
 
             Rules.LoadPersisted(restored);
+            Games.LoadProfiles(document.Games.Select(g => g.ToProfile()));
+            Settings.NotifyShellChanged();
         }
         finally
         {
@@ -182,17 +276,29 @@ public sealed partial class ShellViewModel : ObservableObject
         _saveDebounce.Start();
     }
 
+    /// <summary>Lets a page ask for its change to be persisted, on the same debounce.</summary>
+    public void RequestSave() => ScheduleSave();
+
     /// <summary>Writes the configuration now, bypassing the debounce. Used on shutdown.</summary>
     public async Task SaveConfigurationAsync()
     {
-        var settings = new PersistedSettings
+        var snapshot = new ConfigSnapshot
         {
-            Theme = IsDarkTheme ? "dark" : "light",
-            Language = IsChinese ? "zh-Hans" : "en",
-            ReducedMotion = ReducedMotion,
+            Settings = new PersistedSettings
+            {
+                Theme = IsDarkTheme ? "dark" : "light",
+                Language = IsChinese ? "zh-Hans" : "en",
+                ReducedMotion = ReducedMotion,
+                DnsPolicy = DnsPolicy,
+                ShowAllProcesses = Processes.FilterScope == ProcessFilterScope.AllProcesses,
+            },
+            Proxies = Rules.Proxies,
+            Chains = Rules.Chains,
+            Games = Games.Profiles,
+            Rules = Rules.Rules,
         };
 
-        var error = await _config.SaveAsync(settings, Rules.Proxies, Rules.Rules).ConfigureAwait(true);
+        var error = await _config.SaveAsync(snapshot).ConfigureAwait(true);
         if (error is not null)
         {
             ConfigWarning = error;
@@ -223,8 +329,8 @@ public sealed partial class ShellViewModel : ObservableObject
     /// </summary>
     /// <remarks>
     /// The daemon keeps nothing across a restart, so the app is the source of truth and
-    /// re-sends its proxies and persistent rules on every connection. That is what makes a
-    /// persistent rule survive a restart of either process.
+    /// re-sends its proxies, chains, options and persistent rules on every connection. That is
+    /// what makes a persistent rule survive a restart of either process.
     /// </remarks>
     public async Task RefreshDaemonStateAsync()
     {
@@ -240,16 +346,12 @@ public sealed partial class ShellViewModel : ObservableObject
         OnPropertyChanged(nameof(DaemonBannerDetail));
         OnPropertyChanged(nameof(DaemonDiagnostics));
         Processes.NotifyDaemonStateChanged();
+        Games.NotifyDaemonStateChanged();
     }
 
     private async Task PushConfigurationToDaemonAsync()
     {
-        if (_daemon is not UnixSocketDaemonClient socketClient)
-        {
-            return;
-        }
-
-        if (Rules.Proxies.Count > 0)
+        if (Rules.Proxies.Count > 0 || Rules.Chains.Count > 0)
         {
             // Secrets are read here, in the unprivileged app, and handed over the local
             // socket. The daemon never reads the user's keyring and stores nothing at rest.
@@ -262,12 +364,14 @@ public sealed partial class ShellViewModel : ObservableObject
                 withSecrets.Add((proxy, password));
             }
 
-            await socketClient.SetProxiesAsync(withSecrets).ConfigureAwait(true);
+            await _daemon.SetProxiesAsync(withSecrets, Rules.Chains).ConfigureAwait(true);
         }
+
+        await _daemon.SetDnsPolicyAsync(DnsPolicy).ConfigureAwait(true);
 
         foreach (var rule in Rules.Rules.Where(r => r.Lifetime == RuleLifetime.Persistent && r.Enabled))
         {
-            var result = await socketClient.ApplyRuleAsync(rule).ConfigureAwait(true);
+            var result = await _daemon.ApplyRuleAsync(rule).ConfigureAwait(true);
             if (result.Succeeded)
             {
                 Rules.MarkApplied(rule.Id, result.ConfirmedAtUtc);
@@ -291,6 +395,7 @@ public sealed partial class ShellViewModel : ObservableObject
             app.RequestedThemeVariant = value ? ThemeVariant.Dark : ThemeVariant.Light;
         }
 
+        Settings.NotifyShellChanged();
         ScheduleSave();
     }
 
@@ -302,7 +407,7 @@ public sealed partial class ShellViewModel : ObservableObject
         Loc.Current.Language = value ? "zh-Hans" : "en";
         OnPropertyChanged(nameof(DaemonStatusText));
         OnPropertyChanged(nameof(DaemonBannerDetail));
-        OnPropertyChanged(nameof(PlaceholderTitle));
+        Settings.NotifyShellChanged();
         ScheduleSave();
     }
 
@@ -322,6 +427,23 @@ public sealed partial class ShellViewModel : ObservableObject
             resources["YuraDurationSlow"] = value ? TimeSpan.Zero : TimeSpan.FromMilliseconds(280);
         }
 
+        Settings.NotifyShellChanged();
         ScheduleSave();
+    }
+
+    /// <summary>
+    /// Whether DNS from proxied processes goes through the proxy. Global rather than per rule,
+    /// because it changes the shape of the installed ruleset.
+    /// </summary>
+    [ObservableProperty]
+    public partial DnsPolicy DnsPolicy { get; set; } = DnsPolicy.ThroughProxy;
+
+    public void Dispose()
+    {
+        _saveDebounce.Stop();
+        Processes.Dispose();
+        Games.Dispose();
+        Connections.Dispose();
+        Diagnostics.Dispose();
     }
 }

@@ -134,3 +134,20 @@ Worth recording, because each one would have produced a confident wrong answer:
 - **Orphaned helpers hold ports.** Killing a backgrounded subshell does not kill what
   `setpriv` exec'd inside it. `spikes/kill-orphans.sh` clears them; it lives in a file
   because a `pkill -f` pattern typed at a shell also matches that shell.
+
+## What changed after the spike
+
+The spike proved the mechanism; the daemon that grew out of it differs in three ways worth
+recording, each because the spike's simplification turned out to be wrong at scale:
+
+- **One cgroup per rule became one cgroup per rule *set*.** A process can be in only one
+  cgroup, so a process covered by two rules could satisfy only one of them. Grouping by the
+  set of rules that cover a process is what makes first-match evaluation hold when rules
+  overlap.
+- **Fixed listener ports became kernel-assigned ones.** `ip_local_port_range` on this machine
+  is 1024–65535, so the spike's tidy `17800 + index` scheme collides with ordinary outgoing
+  connections.
+- **The UDP reply socket had to be drained, not just written to.** Binding transparently to
+  the application's original destination also captures traffic addressed there, ahead of the
+  TPROXY redirect — so the second datagram to any destination was silently lost until those
+  sockets were read as a second delivery path.

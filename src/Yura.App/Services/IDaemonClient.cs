@@ -1,5 +1,5 @@
 using Yura.Core.Connections;
-using Yura.Core.Processes;
+using Yura.Core.Ipc;
 using Yura.Core.Proxies;
 using Yura.Core.Rules;
 
@@ -32,7 +32,43 @@ public sealed record RuleApplyResult
     /// therefore still on their previous route. Null when the daemon could not count them.
     /// </summary>
     public int? PreExistingConnections { get; init; }
+
+    /// <summary>Things the daemon could not do, that did not stop the rule being installed.</summary>
+    public IReadOnlyList<string> Warnings { get; init; } = [];
 }
+
+/// <summary>What the daemon reports about itself, for the Diagnostics page.</summary>
+public sealed record DaemonStatus
+{
+    public required string Version { get; init; }
+
+    public int ActiveRules { get; init; }
+
+    public int ActiveFlows { get; init; }
+
+    public int ActiveGroups { get; init; }
+
+    public TimeSpan Uptime { get; init; }
+
+    /// <summary>"netlink" when process events come from the kernel, otherwise why they do not.</summary>
+    public string? ProcessWatcher { get; init; }
+
+    public DnsPolicy DnsPolicy { get; init; }
+
+    public string? KernelRelease { get; init; }
+
+    public string? NftVersion { get; init; }
+
+    public string? CgroupRoot { get; init; }
+
+    public string? SocketPath { get; init; }
+
+    public IReadOnlyList<uint> AllowedUids { get; init; } = [];
+
+    public IReadOnlyList<DaemonCheck> Checks { get; init; } = [];
+}
+
+public sealed record DaemonCheck(string Name, bool Passed, string? Detail);
 
 /// <summary>
 /// The unprivileged app's only channel to the privileged daemon.
@@ -41,6 +77,9 @@ public sealed record RuleApplyResult
 /// Everything that needs privilege lives behind this interface, which keeps the app itself
 /// unprivileged and makes the trust boundary a single, reviewable surface. The app never
 /// touches nftables, cgroups or raw sockets.
+///
+/// Every method returns a result rather than throwing: the app must stay usable when the
+/// daemon is absent, and "this did not work, here is why" is information the UI shows.
 /// </remarks>
 public interface IDaemonClient
 {
@@ -53,17 +92,29 @@ public interface IDaemonClient
 
     Task ConnectAsync(CancellationToken cancellationToken = default);
 
+    Task<DaemonStatus?> GetStatusAsync(CancellationToken cancellationToken = default);
+
     /// <summary>
     /// Per-process socket counts. Only the daemon can attribute sockets to processes it
     /// does not own, so an unconnected daemon yields an empty map rather than zeros.
     /// </summary>
     Task<IReadOnlyDictionary<int, int>> GetConnectionCountsAsync(CancellationToken cancellationToken = default);
 
-    Task<IReadOnlyList<ConnectionRecord>> GetConnectionsAsync(CancellationToken cancellationToken = default);
+    /// <summary>Every connection the daemon can see, or those of one process.</summary>
+    Task<IReadOnlyList<ConnectionRecord>> GetConnectionsAsync(
+        int? pid = null, CancellationToken cancellationToken = default);
 
     Task<RuleApplyResult> ApplyRuleAsync(RoutingRule rule, CancellationToken cancellationToken = default);
 
     Task<RuleApplyResult> RemoveRuleAsync(Guid ruleId, CancellationToken cancellationToken = default);
+
+    /// <summary>Replaces the daemon's proxy and chain list. Passwords travel only here.</summary>
+    Task<RuleApplyResult> SetProxiesAsync(
+        IReadOnlyList<(ProxyEndpoint Endpoint, string? Password)> proxies,
+        IReadOnlyList<ProxyChain> chains,
+        CancellationToken cancellationToken = default);
+
+    Task<RuleApplyResult> SetDnsPolicyAsync(DnsPolicy policy, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Tests an endpoint. The password is passed in rather than read by the daemon: only the
@@ -71,6 +122,16 @@ public interface IDaemonClient
     /// </summary>
     Task<ProxyProbeResult> ProbeProxyAsync(
         ProxyEndpoint endpoint, string? password, CancellationToken cancellationToken = default);
+
+    /// <summary>Measures one target directly and, when a route is given, through it.</summary>
+    Task<MeasurementDto?> MeasureAsync(
+        string host, ushort port, Guid? proxyId, Guid? chainId, int samples,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>The nftables table, policy routing and group membership the daemon installed.</summary>
+    Task<string?> DumpRulesetAsync(CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<string>> GetLogAsync(int lines = 200, CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -78,8 +139,8 @@ public interface IDaemonClient
 /// </summary>
 /// <remarks>
 /// It refuses every privileged operation with an actionable message instead of throwing or
-/// pretending to succeed. This is the default: the app is fully usable for browsing and
-/// composing rules with the daemon absent, and says plainly that nothing will take effect.
+/// pretending to succeed. The app is fully usable for browsing and composing rules with the
+/// daemon absent, and says plainly that nothing will take effect.
 /// </remarks>
 public sealed class DisconnectedDaemonClient : IDaemonClient
 {
@@ -96,20 +157,33 @@ public sealed class DisconnectedDaemonClient : IDaemonClient
     }
 
     public string? UnavailableReason =>
-        $"No daemon is listening on {_socketPath}. Start it with: systemctl start yura-daemon";
+        $"No daemon is listening on {_socketPath}. Start it with: sudo systemctl start yura-daemon";
 
     public Task ConnectAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+    public Task<DaemonStatus?> GetStatusAsync(CancellationToken cancellationToken = default) =>
+        Task.FromResult<DaemonStatus?>(null);
 
     public Task<IReadOnlyDictionary<int, int>> GetConnectionCountsAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult<IReadOnlyDictionary<int, int>>(new Dictionary<int, int>());
 
-    public Task<IReadOnlyList<ConnectionRecord>> GetConnectionsAsync(CancellationToken cancellationToken = default) =>
+    public Task<IReadOnlyList<ConnectionRecord>> GetConnectionsAsync(
+        int? pid = null, CancellationToken cancellationToken = default) =>
         Task.FromResult<IReadOnlyList<ConnectionRecord>>([]);
 
     public Task<RuleApplyResult> ApplyRuleAsync(RoutingRule rule, CancellationToken cancellationToken = default) =>
         Task.FromResult(Refused());
 
     public Task<RuleApplyResult> RemoveRuleAsync(Guid ruleId, CancellationToken cancellationToken = default) =>
+        Task.FromResult(Refused());
+
+    public Task<RuleApplyResult> SetProxiesAsync(
+        IReadOnlyList<(ProxyEndpoint Endpoint, string? Password)> proxies,
+        IReadOnlyList<ProxyChain> chains,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult(Refused());
+
+    public Task<RuleApplyResult> SetDnsPolicyAsync(DnsPolicy policy, CancellationToken cancellationToken = default) =>
         Task.FromResult(Refused());
 
     public Task<ProxyProbeResult> ProbeProxyAsync(
@@ -121,6 +195,17 @@ public sealed class DisconnectedDaemonClient : IDaemonClient
             FailureReason = "The daemon is not running, so the proxy could not be tested.",
             Diagnostics = UnavailableReason,
         });
+
+    public Task<MeasurementDto?> MeasureAsync(
+        string host, ushort port, Guid? proxyId, Guid? chainId, int samples,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult<MeasurementDto?>(null);
+
+    public Task<string?> DumpRulesetAsync(CancellationToken cancellationToken = default) =>
+        Task.FromResult<string?>(null);
+
+    public Task<IReadOnlyList<string>> GetLogAsync(int lines = 200, CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<string>>([]);
 
     private RuleApplyResult Refused() => new()
     {

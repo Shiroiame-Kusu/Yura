@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Yura.Core.Games;
 using Yura.Core.Ipc;
 using Yura.Core.Proxies;
 using Yura.Core.Rules;
@@ -24,6 +25,8 @@ public sealed class PersistedProxy
     /// <summary>Key into the secret store. The secret itself lives there, not here.</summary>
     public string? PasswordRef { get; init; }
 
+    public bool AllowInvalidCertificate { get; init; }
+
     public static PersistedProxy From(ProxyEndpoint endpoint) => new()
     {
         Id = endpoint.Id,
@@ -33,6 +36,7 @@ public sealed class PersistedProxy
         Port = endpoint.Port,
         Username = endpoint.Username,
         PasswordRef = endpoint.PasswordRef,
+        AllowInvalidCertificate = endpoint.AllowInvalidCertificate,
     };
 
     public ProxyEndpoint ToEndpoint() => new()
@@ -44,6 +48,78 @@ public sealed class PersistedProxy
         Port = Port,
         Username = Username,
         PasswordRef = PasswordRef,
+        AllowInvalidCertificate = AllowInvalidCertificate,
+    };
+}
+
+/// <summary>An ordered chain of proxies as written to disk.</summary>
+public sealed class PersistedChain
+{
+    public required Guid Id { get; init; }
+
+    public required string Name { get; init; }
+
+    public List<Guid> Hops { get; init; } = [];
+
+    public static PersistedChain From(ProxyChain chain) => new()
+    {
+        Id = chain.Id,
+        Name = chain.Name,
+        Hops = chain.Hops.ToList(),
+    };
+
+    public ProxyChain ToChain() => new() { Id = Id, Name = Name, Hops = Hops.ToArray() };
+}
+
+/// <summary>A game profile as written to disk.</summary>
+public sealed class PersistedGame
+{
+    public required Guid Id { get; init; }
+
+    public required string Name { get; init; }
+
+    public string? ExecutablePath { get; init; }
+
+    public string? WineTargetExecutable { get; init; }
+
+    public string? SteamAppId { get; init; }
+
+    public GameSource Source { get; init; }
+
+    public Guid? RouteId { get; init; }
+
+    public bool RouteIsChain { get; init; }
+
+    public string? MeasurementHost { get; init; }
+
+    public ushort MeasurementPort { get; init; }
+
+    public static PersistedGame From(GameProfile game) => new()
+    {
+        Id = game.Id,
+        Name = game.Name,
+        ExecutablePath = game.ExecutablePath,
+        WineTargetExecutable = game.WineTargetExecutable,
+        SteamAppId = game.SteamAppId,
+        Source = game.Source,
+        RouteId = game.RouteId,
+        RouteIsChain = game.RouteIsChain,
+        MeasurementHost = game.MeasurementHost,
+        MeasurementPort = game.MeasurementPort,
+    };
+
+    public GameProfile ToProfile() => new()
+    {
+        Id = Id,
+        Name = Name,
+        ExecutablePath = ExecutablePath,
+        WineTargetExecutable = WineTargetExecutable,
+        SteamAppId = SteamAppId,
+        Source = Source,
+        RouteId = RouteId,
+        RouteIsChain = RouteIsChain,
+        MeasurementHost = MeasurementHost,
+        MeasurementPort = MeasurementPort,
     };
 }
 
@@ -55,6 +131,12 @@ public sealed class PersistedSettings
     public string Language { get; set; } = "en";
 
     public bool ReducedMotion { get; set; }
+
+    /// <summary>Whether DNS from proxied processes goes through the proxy. See <see cref="DnsPolicy"/>.</summary>
+    public DnsPolicy DnsPolicy { get; set; } = DnsPolicy.ThroughProxy;
+
+    /// <summary>Include processes owned by other users in the Processes list.</summary>
+    public bool ShowAllProcesses { get; set; }
 }
 
 /// <summary>The whole configuration file.</summary>
@@ -67,8 +149,26 @@ public sealed class ConfigDocument
 
     public List<PersistedProxy> Proxies { get; set; } = [];
 
+    public List<PersistedChain> Chains { get; set; } = [];
+
+    public List<PersistedGame> Games { get; set; } = [];
+
     /// <summary>Only persistent rules. See <see cref="ConfigStore.SaveAsync"/>.</summary>
     public List<RuleDto> Rules { get; set; } = [];
+}
+
+/// <summary>Everything the app hands to the config store in one write.</summary>
+public sealed record ConfigSnapshot
+{
+    public required PersistedSettings Settings { get; init; }
+
+    public IEnumerable<ProxyEndpoint> Proxies { get; init; } = [];
+
+    public IEnumerable<ProxyChain> Chains { get; init; } = [];
+
+    public IEnumerable<GameProfile> Games { get; init; } = [];
+
+    public IEnumerable<RoutingRule> Rules { get; init; } = [];
 }
 
 /// <summary>What happened when the configuration was loaded.</summary>
@@ -185,25 +285,29 @@ public sealed class ConfigStore
     /// <summary>
     /// Writes the configuration atomically.
     /// </summary>
-    /// <param name="rules">
-    /// Every rule in the store. Only <see cref="RuleLifetime.Persistent"/> ones are written:
-    /// an instance rule names a pid and a start time, which mean nothing after a reboot, and
-    /// a session rule is scoped to a daemon that has since exited.
-    /// </param>
-    public async Task<string?> SaveAsync(
-        PersistedSettings settings,
-        IEnumerable<ProxyEndpoint> proxies,
-        IEnumerable<RoutingRule> rules,
-        CancellationToken cancellationToken = default)
+    /// <remarks>
+    /// Only <see cref="RuleLifetime.Persistent"/> rules are written: an instance rule names a
+    /// pid and a start time, which mean nothing after a reboot, and a session rule is scoped
+    /// to a daemon that has since exited.
+    /// </remarks>
+    public async Task<string?> SaveAsync(ConfigSnapshot snapshot, CancellationToken cancellationToken = default)
     {
         var document = new ConfigDocument
         {
             Version = 1,
-            Settings = settings,
-            Proxies = proxies.Select(PersistedProxy.From).ToList(),
-            Rules = rules.Where(r => r.Lifetime == RuleLifetime.Persistent)
-                         .Select(RuleDto.From)
-                         .ToList(),
+            Settings = snapshot.Settings,
+            Proxies = snapshot.Proxies.Select(PersistedProxy.From).ToList(),
+            Chains = snapshot.Chains.Select(PersistedChain.From).ToList(),
+            // A game is only worth remembering once the user has told us something about it
+            // that rediscovery cannot: a route, a path, or where to measure.
+            Games = snapshot.Games
+                .Where(g => g.RouteId is not null || g.Source == GameSource.Manual ||
+                            g.ExecutablePath is not null || g.MeasurementHost is not null)
+                .Select(PersistedGame.From)
+                .ToList(),
+            Rules = snapshot.Rules.Where(r => r.Lifetime == RuleLifetime.Persistent)
+                                  .Select(RuleDto.From)
+                                  .ToList(),
         };
 
         await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);

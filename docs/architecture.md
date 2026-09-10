@@ -9,10 +9,11 @@ Two processes, one narrow interface between them.
 │ Yura.App (unprivileged)      │        │ yura-daemon (privileged)         │
 │                              │        │                                  │
 │  Processes / Games / Rules   │  Unix  │  cgroup manager                  │
-│  reads /proc directly        │◄──────►│  nftables ruleset                │
-│  composes rules              │ socket │  policy routing                  │
-│  explains decisions          │        │  transparent forwarder ──► your  │
-│                              │        │  process/socket attribution      proxy
+│  Connections / Diagnostics   │◄──────►│  nftables ruleset                │
+│  reads /proc directly        │ socket │  policy routing                  │
+│  composes rules              │        │  kernel process events           │
+│  owns the configuration      │        │  transparent forwarder ──► your  │
+│  explains decisions          │        │  socket attribution         proxy│
 └──────────────────────────────┘        └──────────────────────────────────┘
 ```
 
@@ -58,7 +59,7 @@ snapshot. The spike re-verifies the start time between selecting a process and m
 
 ### 2. Classification
 
-The daemon creates `/sys/fs/cgroup/yura/<rule-id>` and writes the target PID into
+The daemon creates a cgroup under `/sys/fs/cgroup/yura/` and writes the target PID into
 `cgroup.procs`. This migrates a *running* process — no restart, no wrapper, no uid change.
 That single write is what makes running-process selection possible at all.
 
@@ -68,23 +69,40 @@ nftables then matches on cgroup membership rather than on executable path:
 chain classify {
     type route hook output priority mangle;
 
-    meta mark 0x712 return                       # loop prevention: our own upstream
-    ip daddr <proxy> tcp dport <port> return     # never capture traffic to the proxy
+    meta mark 0x7200 return                      # loop prevention: our own upstream
+    oifname "lo" return                          # loopback is never proxied
+    ip daddr <proxy> th dport <port> return      # never capture traffic to the proxy
 
+    # s001: cs2 (pid 4821)
     meta l4proto { tcp, udp } \
-        socket cgroupv2 level 2 "yura/<rule-id>" meta mark set 0x711
+        socket cgroupv2 level 2 "yura/g001" meta mark set 0x7101 counter accept
 }
 
 chain capture {
     type filter hook prerouting priority mangle;
-    meta mark 0x711 meta l4proto tcp tproxy ip to :<port> accept
-    meta mark 0x711 meta l4proto udp tproxy ip to :<port> accept
+    meta mark 0x7101 meta l4proto tcp tproxy ip to :44231 counter accept
+    meta mark 0x7101 meta l4proto udp tproxy ip to :44231 counter accept
 }
 ```
 
 Because the match is on cgroup and not on path, a second instance of the same executable is
 untouched, and Wine/Proton games that share a runtime binary are distinguishable — which is
 the only reason that requirement is satisfiable at all.
+
+**A cgroup is not a rule.** It is a set of processes covered by exactly the same set of rules.
+A process can be in only one cgroup, but several rules may cover it — an instance rule and an
+executable rule on the same program, with different destination facets. If each rule owned a
+cgroup, a process could satisfy only one of them and first-match evaluation would silently
+break for the rest. Grouping by rule *set* instead lets the ruleset emit every rule's match
+against every cgroup that contains it, in rule order, so the kernel evaluates exactly what
+the rule list says. Acceptance test 9 is what proves it: one process covered by a manual rule
+and a game profile reaches the higher rule's proxy, and reversing the order reverses which.
+
+**The listener port is asked of the kernel, not chosen.** A fixed range looks tidier and is
+wrong: `ip_local_port_range` commonly starts low enough to include whatever range we picked,
+so an unrelated outgoing connection can be holding the port, and the rule fails to install
+for a reason no user can act on. Each listener binds port 0 and the ruleset names the port it
+was given.
 
 ### 3. Capture
 
@@ -104,14 +122,38 @@ it addressed.
 Loop prevention: every socket the forwarder opens toward the proxy carries `SO_MARK`, and
 the classifier returns early on that mark. Without it the forwarder would feed itself.
 
-## What falls out for free
+### 5. Names
+
+The kernel sees addresses; rules can name hosts. Two mechanisms close that gap, and both live
+in the daemon because both need to see the traffic:
+
+- **DNS answers.** When a proxied process resolves a name, the answer comes back through the
+  relay. Every A/AAAA record in it is attributed to the question name, so a later flow to one
+  of those addresses has a name to match against.
+- **SNI and Host headers.** The first bytes of a captured TCP flow are peeked — not consumed —
+  and a TLS `ClientHello`'s `server_name` or an HTTP `Host` header gives the name directly.
+  Only done when some enabled rule actually names a host, because the peek costs a
+  server-speaks-first protocol a few hundred milliseconds and buys nothing otherwise.
+
+A rule that names a host is therefore always a *capture* rule whatever its action: the flow
+has to reach the listener before the name is knowable. A host rule with no process selector
+is refused rather than installed, because capturing everything to look for a name would mean
+capturing the whole machine.
+
+## What falls out for free, and what does not
 
 - **Child processes.** A forked child inherits its parent's cgroup, so process-tree rules
-  need no extra machinery. *Excluding* children is the case that costs work: the daemon has
-  to move them back out on the fork event.
+  need no extra machinery. *Excluding* them is a race that cannot be won outright — see
+  [the exclusion race](daemon-acceptance.md#the-exclusion-race).
 - **Pre-existing connections.** A socket's cgroup is fixed at creation (`sk_cgrp_data`), so
   sockets opened before a rule was applied keep their original route. This is the correct
   semantic and the UI reports it truthfully rather than claiming the flow is proxied.
+- **Process lifecycle.** The kernel's process connector (`NETLINK_CONNECTOR` / `CN_IDX_PROC`)
+  reports fork, exec and exit. Exec is what lets a persistent executable rule catch a process
+  before its first connection; exit is what expires an instance rule before its pid can be
+  reused. A periodic sweep re-derives everything from `/proc` regardless, so a dropped event
+  costs latency rather than correctness, and the Diagnostics page reports which mechanism is
+  actually running.
 
 ## Rule evaluation
 
@@ -130,6 +172,11 @@ that answer and the evaluator treats it as authoritative.
 
 Unmatched traffic defaults to Direct.
 
+Because the listener re-evaluates the whole ordered list for each flow it captures — with the
+kernel's answer for the process side and the learned name for the destination side — a rule
+that only becomes decidable once the flow exists (a host-name rule) still wins over a lower
+rule that the kernel could match on its own. The kernel narrows; it does not decide.
+
 ## Honesty in the model
 
 Several types exist specifically to stop the UI asserting more than is known:
@@ -145,9 +192,12 @@ Several types exist specifically to stop the UI asserting more than is known:
 ## Known trade-offs
 
 - **Migrating a process out of its systemd user slice** means `systemctl --user stop` and
-  systemd's resource accounting no longer cover it. The obvious alternative — nesting our
-  cgroup under the process's existing one — collides with cgroup v2's "no internal
-  processes" rule once controllers are enabled. Documented rather than hidden.
+  systemd's resource accounting no longer cover it while the rule is in effect. The obvious
+  alternative — nesting our cgroup under the process's existing one — collides with cgroup
+  v2's "no internal processes" rule once controllers are enabled. What the daemon does
+  instead is remember where each process came from and put it back there when its rule goes
+  away, so leaving Yura's tree returns a process to its own scope rather than dumping it in
+  the root cgroup.
 - **`socket cgroupv2` resolves the path to a cgroup id at rule-load time.** Deleting and
   recreating a cgroup silently breaks matching, so the daemon must reload the ruleset
   whenever it recreates one. This is a sharp edge and is called out in the spike.
@@ -155,4 +205,10 @@ Several types exist specifically to stop the UI asserting more than is known:
 - **Proxy chains are TCP-only.** Relaying UDP through more than one hop needs every hop to
   support UDP ASSOCIATE and to agree on the relay address, which cannot be verified end to
   end — so `ProxyChain.SupportsUdp` reports Unsupported rather than letting a game silently
-  lose its UDP traffic.
+  lose its UDP traffic. DNS is the exception: a query has a TCP form (RFC 1035 §4.2.2), so a
+  process behind a chain or an HTTP proxy still resolves names instead of failing entirely.
+- **A transparent socket bound to a foreign address steals traffic addressed there.** That is
+  how a UDP reply appears to come from the peer the application addressed, and it also makes
+  the kernel's early demux prefer that socket over the TPROXY redirect. The daemon therefore
+  drains those sockets and re-dispatches what arrives on them, so both delivery paths reach
+  the same session. Without it, only the first datagram to a destination ever works.

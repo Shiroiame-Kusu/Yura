@@ -84,3 +84,20 @@ absence of passwords in the file, permissions, the corrupt-file path, the newer-
 path, and `XDG_CONFIG_HOME`. End to end, the application writes `config.json` at mode 600
 in a 700 directory on first run, and restores proxies and rules from a hand-written file —
 see `docs/screenshots/16-proxies-restored-from-config.png`.
+
+## What else is in the file
+
+Beyond settings, proxies and persistent rules, the configuration also holds:
+
+- **Proxy chains**, as an ordered list of proxy ids. The order is the whole meaning of a
+  chain — element 0 is dialled first — so it round-trips exactly. A chain whose hop no longer
+  exists is kept and shown with the missing hop marked rather than silently repaired.
+- **Game profiles**, but only once the user has told Yura something rediscovery cannot find
+  again: a chosen route, a path learned by attaching to a running process, or a measurement
+  target. A game that is merely installed is rediscovered from the Steam library on every
+  start, so the file does not fill up with games nobody has configured.
+- **The DNS policy**, which is global rather than per rule because it changes the shape of the
+  installed nftables ruleset.
+
+A game profile's id is derived from its Steam app id, so a saved route survives the library
+moving to another drive or being rescanned.

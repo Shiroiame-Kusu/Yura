@@ -144,8 +144,10 @@ public static class RuleEvaluator
         // for this connection, its answer is authoritative: re-deriving membership from the
         // current /proc state would give the wrong answer for a process that has since
         // exited, or for a child that has been re-parented.
+        // When the owning process could not be read at all, the classifier's answer is the
+        // only evidence there is, so it decides every process-scoped rule.
         if (request.ClassifierMatchedRuleIds is { } classified &&
-            (rule.Process.IsInstanceScoped || rule.Process.Descendants != DescendantPolicy.Exclude))
+            (rule.Process.IsInstanceScoped || rule.Process.Descendants != DescendantPolicy.Exclude || request.Process is null))
         {
             return classified.Contains(rule.Id);
         }

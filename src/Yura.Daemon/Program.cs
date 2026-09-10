@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using Yura.Core.Ipc;
 using Yura.Core.Processes;
+using Yura.Daemon.Diagnostics;
 using Yura.Daemon.Forwarding;
 using Yura.Daemon.Linux;
 using Yura.Daemon.Runtime;
@@ -12,7 +13,7 @@ namespace Yura.Daemon;
 
 internal static class Program
 {
-    public const string Version = "0.1.0";
+    public const string Version = "0.2.0";
 
     public static async Task<int> Main(string[] args)
     {
@@ -31,6 +32,7 @@ internal static class Program
         var socketPath = IpcProtocol.DefaultSocketPath;
         var allowedUids = new HashSet<uint> { 0 };
         var verbose = false;
+        var noWatcher = false;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -46,8 +48,11 @@ internal static class Program
                 case "--verbose":
                     verbose = true;
                     break;
+                case "--no-process-events":
+                    noWatcher = true;
+                    break;
                 case "-h" or "--help":
-                    Console.WriteLine("yura-daemon [--socket PATH] [--allow-uid UID]... [--verbose]");
+                    Console.WriteLine("yura-daemon [--socket PATH] [--allow-uid UID]... [--verbose] [--no-process-events]");
                     Console.WriteLine("yura-daemon ctl [--socket PATH] <op> [json]");
                     return 0;
             }
@@ -60,22 +65,35 @@ internal static class Program
             allowedUids.Add(parsedSudoUid);
         }
 
+        var logBuffer = new LogBuffer();
         void Log(string message)
         {
-            if (verbose || !message.StartsWith("exec:", StringComparison.Ordinal) && !message.StartsWith("stdin:", StringComparison.Ordinal))
+            var line = $"{DateTimeOffset.Now:HH:mm:ss.fff} {message}";
+            var noisy = message.StartsWith("exec:", StringComparison.Ordinal) || message.StartsWith("stdin:", StringComparison.Ordinal);
+            if (!noisy)
             {
-                Console.WriteLine($"{DateTimeOffset.Now:HH:mm:ss.fff} {message}");
+                logBuffer.Append(line);
+            }
+
+            if (verbose || !noisy)
+            {
+                Console.WriteLine(line);
             }
         }
 
         // ---- preflight: fail fast with a reason a person can act on.
+        var checks = new List<CheckDto>();
         if (geteuid() != 0)
         {
             Console.Error.WriteLine("yura-daemon must run as root: it configures nftables, policy routing and cgroups.");
             return 1;
         }
 
-        if (!CgroupManager.IsCgroup2Available())
+        checks.Add(new CheckDto { Name = "Running as root", Passed = true });
+
+        var cgroup2 = CgroupManager.IsCgroup2Available();
+        checks.Add(new CheckDto { Name = "cgroup v2 unified hierarchy", Passed = cgroup2, Detail = cgroup2 ? "/sys/fs/cgroup" : "cgroup.controllers not found at /sys/fs/cgroup" });
+        if (!cgroup2)
         {
             Console.Error.WriteLine("cgroup v2 unified hierarchy is not mounted at /sys/fs/cgroup.");
             return 1;
@@ -83,13 +101,15 @@ internal static class Program
 
         var commands = new CommandRunner(Log);
         var probe = await commands.RunAsync("nft", ["--version"]).ConfigureAwait(false);
+        checks.Add(new CheckDto { Name = "nft available", Passed = probe.Succeeded, Detail = probe.Succeeded ? probe.StandardOutput.Trim() : probe.FailureText });
         if (!probe.Succeeded)
         {
             Console.Error.WriteLine($"nft is not usable: {probe.FailureText}");
             return 1;
         }
 
-        Log($"yura-daemon {Version} starting; {probe.StandardOutput.Trim()}");
+        var kernel = ReadTrimmed("/proc/sys/kernel/osrelease");
+        Log($"yura-daemon {Version} starting on kernel {kernel}; {probe.StandardOutput.Trim()}");
 
         var processes = new ProcProcessSource();
         var cgroups = new CgroupManager(Log, processes);
@@ -100,7 +120,9 @@ internal static class Program
 
         await using var runtime = new RuleRuntime(cgroups, nftables, processes, flows, ownership, Log);
 
-        if (!await routing.InstallAsync().ConfigureAwait(false))
+        var routingOk = await routing.InstallAsync().ConfigureAwait(false);
+        checks.Add(new CheckDto { Name = "Policy routing installed", Passed = routingOk, Detail = routingOk ? $"fwmark 0x{PolicyRouting.MarkBase:x}/0x{PolicyRouting.MarkMask:x} -> table {PolicyRouting.RoutingTable}" : "see daemon log" });
+        if (!routingOk)
         {
             Console.Error.WriteLine("could not install policy routing; see log above.");
             return 1;
@@ -110,6 +132,7 @@ internal static class Program
         // startup rather than on the first rule.
         var empty = NftablesManager.Build([], []);
         var check = await nftables.CheckAsync(empty).ConfigureAwait(false);
+        checks.Add(new CheckDto { Name = "Kernel accepts the base ruleset (nft_socket, nft_tproxy)", Passed = check.Succeeded, Detail = check.Succeeded ? null : check.FailureText });
         if (!check.Succeeded)
         {
             Console.Error.WriteLine($"the kernel rejected Yura's base ruleset: {check.FailureText}");
@@ -119,11 +142,40 @@ internal static class Program
         }
 
         await nftables.ApplyAsync(empty).ConfigureAwait(false);
-
-        await using var ipc = new IpcServer(socketPath, allowedUids, runtime, flows, ownership, Log);
-        ipc.Start();
+        checks.Add(new CheckDto { Name = "rp_filter relaxed on lo and all", Passed = ReadTrimmed("/proc/sys/net/ipv4/conf/lo/rp_filter") == "0" && ReadTrimmed("/proc/sys/net/ipv4/conf/all/rp_filter") == "0" });
 
         using var shutdown = new CancellationTokenSource();
+
+        // Process events from the kernel, with the sweep below as the fallback either way.
+        using var watcher = new ProcessEventWatcher(Log)
+        {
+            // Excluding a child is the one decision that cannot wait for the event queue.
+            OnForkFastPath = runtime.TryExcludeChildFast,
+        };
+        var watching = !noWatcher && watcher.Start();
+        if (!watching)
+        {
+            Log($"process events: unavailable ({watcher.UnavailableReason ?? "disabled"}); membership is polled");
+        }
+
+        checks.Add(new CheckDto { Name = "Kernel process events (netlink connector)", Passed = watching, Detail = watching ? null : watcher.UnavailableReason ?? "disabled with --no-process-events" });
+
+        var environment = new DaemonEnvironment
+        {
+            SocketPath = socketPath,
+            AllowedUids = allowedUids,
+            KernelRelease = kernel,
+            NftVersion = probe.StandardOutput.Trim(),
+            Checks = checks,
+            ProcessWatcherState = () => watcher.IsRunning
+                ? watcher.DroppedEvents == 0 ? "netlink" : $"netlink ({watcher.DroppedEvents} events dropped, recovered by sweep)"
+                : $"polling: {watcher.UnavailableReason ?? "disabled"}",
+        };
+
+        var connections = new ConnectionLister(runtime, flows, ownership, processes);
+        await using var ipc = new IpcServer(socketPath, allowedUids, runtime, flows, ownership, connections, nftables, commands, logBuffer, environment, Log);
+        ipc.Start();
+
         // The registrations must be held. PosixSignalRegistration unregisters the handler
         // when it is finalised, so dropping the return value lets the GC silently disarm
         // the signal and the daemon dies without removing its rules from the kernel.
@@ -132,19 +184,47 @@ internal static class Program
         using var sigint = PosixSignalRegistration.Create(
             PosixSignal.SIGINT, ctx => { ctx.Cancel = true; shutdown.Cancel(); });
 
-        // Until the netlink process-event watcher lands, both halves of process tracking are
-        // polled: instance rules expiring, and executable rules picking up new processes.
-        // The interval is short because a process that connects before it is migrated keeps
-        // the route it started with — a socket's cgroup is fixed at creation.
+        var eventPump = Task.Run(async () =>
+        {
+            if (!watching)
+            {
+                return;
+            }
+
+            try
+            {
+                await foreach (var evt in watcher.Events.ReadAllAsync(shutdown.Token).ConfigureAwait(false))
+                {
+                    try
+                    {
+                        await runtime.HandleProcessEventAsync(evt, shutdown.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                    catch (Exception e)
+                    {
+                        Log($"process event {evt.Kind} pid {evt.Pid} failed: {e.Message}");
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        });
+
+        // The sweep re-derives membership from /proc and expires dead instances. With events
+        // flowing it is a safety net and can run slowly; without them it is the mechanism.
+        var sweepInterval = watching ? TimeSpan.FromSeconds(2) : TimeSpan.FromMilliseconds(500);
         var sweep = Task.Run(async () =>
         {
             while (!shutdown.IsCancellationRequested)
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromMilliseconds(500), shutdown.Token).ConfigureAwait(false);
-                    await runtime.RefreshMembershipAsync(shutdown.Token).ConfigureAwait(false);
-                    await runtime.ExpireDeadInstancesAsync(shutdown.Token).ConfigureAwait(false);
+                    await Task.Delay(sweepInterval, shutdown.Token).ConfigureAwait(false);
+                    await runtime.SweepAsync(shutdown.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -167,12 +247,24 @@ internal static class Program
         }
 
         Log("shutting down");
-        await sweep.ConfigureAwait(false);
+        await Task.WhenAll(sweep, eventPump).ConfigureAwait(false);
         await runtime.TeardownAsync().ConfigureAwait(false);
         await routing.RemoveAsync().ConfigureAwait(false);
         routing.RestoreSysctls();
         Log("clean shutdown: rules, routing and cgroups removed");
         return 0;
+    }
+
+    private static string? ReadTrimmed(string path)
+    {
+        try
+        {
+            return File.ReadAllText(path).Trim();
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     [DllImport("libc")]

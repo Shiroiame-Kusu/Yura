@@ -9,9 +9,9 @@ endpoint, and Yura decides which process's traffic goes there.
 
 > **Status: working end to end.** The privileged daemon routes selected running processes
 > through user-supplied proxies, verified by
-> [29 acceptance tests](docs/daemon-acceptance.md) driven through its real IPC socket, and
-> the desktop application drives it. Persistence, the Connections page and the process-event
-> watcher are still missing. See [Current state](#current-state).
+> [64 acceptance checks](docs/daemon-acceptance.md) driven through its real IPC socket, and
+> the desktop application drives it. All eleven mandatory acceptance tests are covered. See
+> [Current state](#current-state) for what is proven and what is not.
 
 ## Why per-process routing is hard on Linux
 
@@ -31,6 +31,8 @@ Yura's answer:
 | Child processes | Free: a forked child inherits its parent's cgroup |
 | Wine/Proton isolation | Classification is by cgroup, not executable path, so shared runtimes don't collide |
 | Pre-existing connections | Keep their old route, because a socket's cgroup is fixed at creation |
+| Process lifecycle | The kernel's **process connector** reports fork, exec and exit; a sweep re-derives from `/proc` as a safety net |
+| Destination host names | Learned from DNS answers passing through the relay, and from TLS SNI / HTTP `Host` |
 
 That last row is a feature, not a limitation: it is exactly the semantic the UI reports.
 
@@ -82,7 +84,7 @@ Useful flags:
 | --- | --- |
 | `--theme light\|dark` | Start in a theme |
 | `--lang en\|zh-Hans` | Start in a language |
-| `--page processes\|games\|proxies` | Start on a page |
+| `--page processes\|games\|connections\|proxies\|rules\|diagnostics\|settings` | Start on a page |
 | `--demo` | Populate from a **simulated** daemon, for design review only |
 | `--font-report` | Print what Avalonia's font manager actually resolves |
 | `--config-report` | Print where configuration and secrets are stored |
@@ -129,8 +131,9 @@ it via sudo. On SIGTERM it removes every rule, route and cgroup it created.
 ```bash
 yura-daemon ctl status
 yura-daemon ctl list-rules
-yura-daemon ctl list-flows
-yura-daemon ctl connection-counts
+yura-daemon ctl list-connections
+yura-daemon ctl dump-ruleset
+yura-daemon ctl log
 ```
 
 ## Acceptance tests
@@ -139,10 +142,11 @@ yura-daemon ctl connection-counts
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-32 checks against a controlled network on a dummy interface, where each marker payload is
-reachable only through one specific proxy. **32 passed, 0 failed.** Mandatory acceptance
-tests 1, 2, 3, 4, 5, 6, 7, 8 (inclusion) and 11 are verified; see
-[docs/daemon-acceptance.md](docs/daemon-acceptance.md) for what is not.
+64 checks against a controlled network on a dummy interface, where each marker payload is
+reachable only through one specific proxy. **64 passed, 0 failed.** All eleven mandatory
+acceptance tests are covered, including child exclusion, rule precedence in the kernel, and
+Wine/Proton isolation. See [docs/daemon-acceptance.md](docs/daemon-acceptance.md) for the
+evidence behind each one and for the limits that remain.
 
 ## Configuration
 
@@ -173,30 +177,34 @@ All 52 required foreground/background pairs meet their target in both themes.
 **Built and verified**
 
 - Domain model with ordered first-match rule evaluation, instance identity and PID-reuse
-  defence (26 passing tests)
+  defence
 - Live `/proc` reader that degrades honestly on permission-denied and deleted executables
-- Design system, and the Processes, Games and Proxy Editor screens
-- Screenshot harness covering both themes, both languages, 960×640 and 1280×800, and
-  100–200% scaling
-- **Routing spike passing 12/12** and the **daemon acceptance suite passing 29/29**: a
-  running process migrated into a cgroup live, classified by nftables, captured by TPROXY
-  and forwarded to a SOCKS5 proxy — for TCP and UDP, per instance, with the process still
-  running as its original user
+- All seven pages: Processes, Games, Connections, Proxies, Rules, Diagnostics, Settings
+- Design system, both themes, both languages, 960×640 to 1280×800, 100–200% scaling —
+  see [docs/ux-verification.md](docs/ux-verification.md)
+- **Routing spike passing 12/12** and the **daemon acceptance suite passing 64/64**: a running
+  process migrated into a cgroup live, classified by nftables, captured by TPROXY and
+  forwarded to a SOCKS5 proxy — TCP and UDP, per instance, with the process still running as
+  its original user
 - The privileged daemon: cgroup manager, nftables ruleset builder, transparent TCP and UDP
-  forwarder, SOCKS5 and HTTP CONNECT clients, socket-ownership attribution, and a
-  peer-credential-authorised IPC server
-- The app driving the real daemon over its socket, including live per-process connection
-  counts
+  forwarder, SOCKS5 / HTTP CONNECT / HTTPS clients, proxy chains, socket-ownership
+  attribution, kernel process events, DNS name learning, SNI and `Host` sniffing, a
+  direct-versus-routed measurement, and a peer-credential-authorised IPC server
+- 93 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+  wire format, the DNS parser, the SNI parser, the Steam library reader, the rule store and
+  the configuration file
 - Configuration under `~/.config/Yura`, with passwords in the desktop secret service and
   persistent rules reapplied to the daemon on every connection
 
-**Not yet built**
+**Known limits, stated where they matter**
 
-- The netlink process-event watcher. New processes are picked up by a 500 ms poll, so a
-  process that starts *and connects* within one interval keeps its original route; child
-  *exclusion* is also unimplemented
-- Connections, Rules, Diagnostics and Settings pages
-- Proxy chains, and IPv6 in the UDP path
-
-See [docs/ux-verification.md](docs/ux-verification.md) for what was checked and what could
-not be.
+- **Child exclusion is a race.** A child inherits its parent's cgroup at fork and a socket's
+  cgroup is fixed at creation, so a child that connects in its first millisecond keeps the
+  parent's route. The daemon narrows the window with an inline fork handler and a 1 ms guard;
+  closing it needs an eBPF hook at socket creation, which is not built. Measured, bounded and
+  reported — see [the exclusion race](docs/daemon-acceptance.md#the-exclusion-race).
+- **UDP through a chain, or through an HTTP proxy, is refused rather than lost.** DNS is
+  carried over TCP in that case so name resolution still works.
+- **IPv6** works for TCP; the UDP path is IPv4-only by construction.
+- Keyboard-only walkthroughs, screen-reader behaviour and real application icons are not
+  verified — see [docs/ux-verification.md](docs/ux-verification.md#not-verified).

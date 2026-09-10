@@ -22,8 +22,14 @@ public sealed record OwnedSocket(
 /// processes. That is why the count lives in the daemon and the app shows "Unavailable"
 /// when the daemon is not there.
 ///
-/// It is inherently racy — a socket can close between the table read and the fd scan — so
-/// callers get a snapshot, never a guarantee. Ownership that could not be established is
+/// Two paths exist. The full scan behind <see cref="Snapshot"/> joins every socket with every
+/// process and is cached briefly; it feeds the process table's connection counts. The
+/// targeted lookup behind <see cref="FindOwnerPid"/> is for attributing a single freshly
+/// captured flow: it reads the socket's inode from the kernel table and scans only the few
+/// processes that could possibly own it, so per-connection attribution stays cheap.
+///
+/// Both are inherently racy — a socket can close between the table read and the fd scan —
+/// so callers get a snapshot, never a guarantee. Ownership that could not be established is
 /// reported as null rather than guessed.
 /// </remarks>
 public sealed class SocketOwnership
@@ -42,15 +48,10 @@ public sealed class SocketOwnership
                 return _cached;
             }
 
-            var sockets = new List<OwnedSocket>(256);
-            sockets.AddRange(ReadTable("/proc/net/tcp", ProtocolType.Tcp, AddressFamily.InterNetwork));
-            sockets.AddRange(ReadTable("/proc/net/tcp6", ProtocolType.Tcp, AddressFamily.InterNetworkV6));
-            sockets.AddRange(ReadTable("/proc/net/udp", ProtocolType.Udp, AddressFamily.InterNetwork));
-            sockets.AddRange(ReadTable("/proc/net/udp6", ProtocolType.Udp, AddressFamily.InterNetworkV6));
-
-            var owners = MapInodesToPids(sockets.Select(s => s.Inode).Where(i => i > 0).ToHashSet());
+            var sockets = ReadAllTables();
+            var owners = MapInodesToPids(sockets.Select(s => s.Inode).Where(i => i > 0).ToHashSet(), null);
             _cached = sockets
-                .Select(s => s with { OwnerPid = owners.GetValueOrDefault(s.Inode) is 0 ? null : owners.GetValueOrDefault(s.Inode) })
+                .Select(s => s with { OwnerPid = owners.TryGetValue(s.Inode, out var pid) ? pid : null })
                 .ToArray();
             _cachedAt = DateTimeOffset.UtcNow;
             return _cached;
@@ -74,9 +75,70 @@ public sealed class SocketOwnership
         return counts;
     }
 
-    /// <summary>Finds the owner of the socket bound to <paramref name="local"/>, if it is still open.</summary>
-    public int? OwnerOf(IPEndPoint local, ProtocolType protocol) =>
-        Snapshot().FirstOrDefault(s => s.Protocol == protocol && s.Local.Equals(local))?.OwnerPid;
+    /// <summary>
+    /// Finds the owner of one specific socket, checking <paramref name="candidates"/> first
+    /// and falling back to the cached full map.
+    /// </summary>
+    /// <param name="local">The application's side: its source address and port.</param>
+    /// <param name="remote">The application's peer, or null for an unconnected UDP socket.</param>
+    public int? FindOwnerPid(ProtocolType protocol, IPEndPoint local, IPEndPoint? remote, IReadOnlyCollection<int> candidates)
+    {
+        var inode = FindInode(protocol, local, remote);
+        if (inode is null)
+        {
+            return null;
+        }
+
+        if (candidates.Count > 0)
+        {
+            var owners = MapInodesToPids([inode.Value], candidates);
+            if (owners.TryGetValue(inode.Value, out var pid))
+            {
+                return pid;
+            }
+        }
+
+        return Snapshot().FirstOrDefault(s => s.Inode == inode.Value)?.OwnerPid;
+    }
+
+    private static long? FindInode(ProtocolType protocol, IPEndPoint local, IPEndPoint? remote)
+    {
+        var family = local.AddressFamily;
+        var table = (protocol, family) switch
+        {
+            (ProtocolType.Tcp, AddressFamily.InterNetworkV6) => "/proc/net/tcp6",
+            (ProtocolType.Tcp, _) => "/proc/net/tcp",
+            (_, AddressFamily.InterNetworkV6) => "/proc/net/udp6",
+            _ => "/proc/net/udp",
+        };
+
+        foreach (var socket in ReadTable(table, protocol, family))
+        {
+            if (!socket.Local.Equals(local))
+            {
+                continue;
+            }
+
+            if (remote is not null && socket.Remote.Port != 0 && !socket.Remote.Equals(remote))
+            {
+                continue;
+            }
+
+            return socket.Inode;
+        }
+
+        return null;
+    }
+
+    private static List<OwnedSocket> ReadAllTables()
+    {
+        var sockets = new List<OwnedSocket>(256);
+        sockets.AddRange(ReadTable("/proc/net/tcp", ProtocolType.Tcp, AddressFamily.InterNetwork));
+        sockets.AddRange(ReadTable("/proc/net/tcp6", ProtocolType.Tcp, AddressFamily.InterNetworkV6));
+        sockets.AddRange(ReadTable("/proc/net/udp", ProtocolType.Udp, AddressFamily.InterNetwork));
+        sockets.AddRange(ReadTable("/proc/net/udp6", ProtocolType.Udp, AddressFamily.InterNetworkV6));
+        return sockets;
+    }
 
     // -- /proc/net/{tcp,udp}{,6} ------------------------------------------
 
@@ -152,7 +214,15 @@ public sealed class SocketOwnership
             }
         }
 
-        endpoint = new IPEndPoint(new IPAddress(bytes), port);
+        var address = new IPAddress(bytes);
+        // An IPv4 client of a dual-stack socket appears as ::ffff:a.b.c.d; normalise so it
+        // compares equal to the IPv4 endpoint the listener reports.
+        if (address.IsIPv4MappedToIPv6)
+        {
+            address = address.MapToIPv4();
+        }
+
+        endpoint = new IPEndPoint(address, port);
         return true;
     }
 
@@ -174,7 +244,7 @@ public sealed class SocketOwnership
 
     // -- /proc/[pid]/fd ------------------------------------------------------
 
-    private static Dictionary<long, int> MapInodesToPids(HashSet<long> wanted)
+    private static Dictionary<long, int> MapInodesToPids(HashSet<long> wanted, IReadOnlyCollection<int>? onlyPids)
     {
         var map = new Dictionary<long, int>(wanted.Count);
         if (wanted.Count == 0)
@@ -182,18 +252,16 @@ public sealed class SocketOwnership
             return map;
         }
 
-        foreach (var directory in Directory.EnumerateDirectories("/proc"))
-        {
-            var leaf = Path.GetFileName(directory);
-            if (!int.TryParse(leaf, NumberStyles.None, CultureInfo.InvariantCulture, out var pid))
-            {
-                continue;
-            }
+        IEnumerable<int> pids = onlyPids ?? Directory.EnumerateDirectories("/proc")
+            .Select(d => int.TryParse(Path.GetFileName(d), NumberStyles.None, CultureInfo.InvariantCulture, out var p) ? p : -1)
+            .Where(p => p > 0);
 
+        foreach (var pid in pids)
+        {
             IEnumerable<string> fds;
             try
             {
-                fds = Directory.EnumerateFiles($"{directory}/fd");
+                fds = Directory.EnumerateFiles($"/proc/{pid}/fd");
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
@@ -222,6 +290,10 @@ public sealed class SocketOwnership
                     wanted.Contains(inode))
                 {
                     map.TryAdd(inode, pid);
+                    if (map.Count == wanted.Count)
+                    {
+                        return map;
+                    }
                 }
             }
         }

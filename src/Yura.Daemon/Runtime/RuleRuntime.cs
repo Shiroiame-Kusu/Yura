@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Sockets;
 using Yura.Core.Processes;
 using Yura.Core.Proxies;
 using Yura.Core.Rules;
@@ -15,7 +17,7 @@ public sealed record ApplyOutcome
 
     public string? Diagnostics { get; init; }
 
-    /// <summary>Processes migrated into the rule's cgroup right now.</summary>
+    /// <summary>Processes migrated into a group right now.</summary>
     public int MigratedProcesses { get; init; }
 
     /// <summary>
@@ -31,20 +33,83 @@ public sealed record ApplyOutcome
 }
 
 /// <summary>
+/// An immutable view of everything a per-flow decision needs. Replaced wholesale on every
+/// reconcile so listeners can read it without taking the runtime's lock.
+/// </summary>
+public sealed record DeciderState
+{
+    public static readonly DeciderState Empty = new();
+
+    public IReadOnlyList<RoutingRule> OrderedRules { get; init; } = [];
+
+    public IReadOnlyDictionary<string, ProcessGroup> GroupsByName { get; init; } = new Dictionary<string, ProcessGroup>();
+
+    public IReadOnlyDictionary<Guid, ProxyEndpoint> Proxies { get; init; } = new Dictionary<Guid, ProxyEndpoint>();
+
+    public IReadOnlyDictionary<Guid, string?> Passwords { get; init; } = new Dictionary<Guid, string?>();
+
+    public IReadOnlyDictionary<Guid, ProxyChain> Chains { get; init; } = new Dictionary<Guid, ProxyChain>();
+
+    public bool HasHostRules { get; init; }
+
+    /// <summary>Resolves a rule's action to the hops the dialler needs, or explains why it cannot.</summary>
+    public (IReadOnlyList<ProxyHop>? Hops, string RouteName, string? Failure) ResolveRoute(RuleAction action)
+    {
+        switch (action)
+        {
+            case RuleAction.Proxy p:
+                if (!Proxies.TryGetValue(p.EndpointId, out var endpoint))
+                {
+                    return (null, "Proxy", "The rule refers to a proxy the daemon does not know about.");
+                }
+
+                return ([new ProxyHop(endpoint, Passwords.GetValueOrDefault(endpoint.Id))], endpoint.Name, null);
+
+            case RuleAction.Chain c:
+                if (!Chains.TryGetValue(c.ChainId, out var chain) || chain.Hops.Count == 0)
+                {
+                    return (null, "Chain", "The rule refers to a proxy chain the daemon does not know about.");
+                }
+
+                var hops = new List<ProxyHop>(chain.Hops.Count);
+                foreach (var hopId in chain.Hops)
+                {
+                    if (!Proxies.TryGetValue(hopId, out var hop))
+                    {
+                        return (null, chain.Name, $"Chain '{chain.Name}' refers to a proxy that no longer exists.");
+                    }
+
+                    hops.Add(new ProxyHop(hop, Passwords.GetValueOrDefault(hop.Id)));
+                }
+
+                return (hops, chain.Name, null);
+
+            default:
+                return ([], action is RuleAction.Block ? "Blocked" : "Direct", null);
+        }
+    }
+}
+
+/// <summary>
 /// Keeps the kernel in step with the rule list.
 /// </summary>
 /// <remarks>
 /// The runtime is reconciliation-based: every change recomputes the full desired state —
-/// slots, cgroups, cgroup membership, listeners, ruleset — and applies the difference. That
-/// is slower than surgical updates but it means the kernel state is a pure function of the
-/// rule list, so there is no sequence of operations that can leave it inconsistent, and a
-/// restart after a crash converges to the same state as a clean start.
+/// slots, process groups, group membership, listeners, ruleset — and applies the difference.
+/// That is slower than surgical updates but it means the kernel state is a pure function of
+/// the rule list plus the process table, so there is no sequence of operations that can
+/// leave it inconsistent, and a restart after a crash converges to the same state as a
+/// clean start.
+///
+/// Processes are placed in cgroups by the <em>set</em> of rules that cover them, not by one
+/// rule, so several rules on one process all get to match in order. Membership is driven by
+/// kernel process events when they are available and re-derived from <c>/proc</c> on a
+/// periodic sweep either way.
 ///
 /// A slot index, once assigned to a rule, is kept for that rule's lifetime. Changing it
-/// would change the rule's cgroup path and listener port, which would force every process
-/// in it to be migrated again for no reason.
+/// would change the rule's listener port for no reason.
 /// </remarks>
-public sealed class RuleRuntime : IAsyncDisposable
+public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
 {
     private readonly CgroupManager _cgroups;
     private readonly NftablesManager _nftables;
@@ -57,10 +122,54 @@ public sealed class RuleRuntime : IAsyncDisposable
     private readonly Dictionary<Guid, RoutingRule> _rules = [];
     private readonly Dictionary<Guid, ProxyEndpoint> _proxies = [];
     private readonly Dictionary<Guid, string?> _passwords = [];
+    private readonly Dictionary<Guid, ProxyChain> _chains = [];
     private readonly Dictionary<Guid, int> _slotIndexByRule = [];
-    private readonly Dictionary<int, TransparentTcpListener> _listeners = [];
-    private readonly Dictionary<int, TransparentUdpListener> _udpListeners = [];
+    private readonly Dictionary<string, ProcessGroup> _groupsByKey = [];
+    private readonly Dictionary<string, ProcessGroup> _groupsByName = [];
+
+    /// <summary>Rules whose selector matches each pid directly, from the last evaluation.</summary>
+    private readonly Dictionary<int, HashSet<Guid>> _direct = [];
+
+    /// <summary>Pids covered by each rule through its descendant policy.</summary>
+    private readonly Dictionary<Guid, HashSet<int>> _tree = [];
+
+    /// <summary>
+    /// The group each pid was last placed in by us. Concurrent because the fork fast path
+    /// reads it from the netlink thread without taking the gate.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, string> _placed = new();
+
+    /// <summary>
+    /// Groups a forked child must be moved straight back out of.
+    /// </summary>
+    /// <remarks>
+    /// Only groups whose every rule is instance-scoped and excludes descendants qualify. That
+    /// is the precise condition under which a child cannot match any of the group's rules in
+    /// its own right, so moving it out on sight cannot be wrong. Replaced wholesale on each
+    /// reconcile so the fast path needs no lock.
+    /// </remarks>
+    private volatile IReadOnlySet<string> _fastExcludeGroups = new HashSet<string>();
+
+    /// <summary>
+    /// For each excluding group, the pids that belong in it: the identities its rules name.
+    /// </summary>
+    /// <remarks>
+    /// Taken from the rules rather than from <see cref="_placed"/> so the guard can never evict
+    /// the very process the rule is about, which <see cref="_placed"/> would allow during the
+    /// window between creating a group and recording the migration into it.
+    /// </remarks>
+    private volatile IReadOnlyDictionary<string, IReadOnlySet<int>> _fastExcludeMembers =
+        new Dictionary<string, IReadOnlySet<int>>();
+
+    private long _excludedChildren;
+    private long _excludeMisses;
+    private readonly CancellationTokenSource _guardStopping = new();
+    private Thread? _exclusionGuard;
+
+    private readonly Dictionary<int, SlotListener> _listeners = [];
+    private DaemonOptions _options = new();
     private IReadOnlyList<RuleSlot> _installedSlots = [];
+    private volatile DeciderState _state = DeciderState.Empty;
     private bool _tornDown;
 
     public RuleRuntime(
@@ -79,47 +188,132 @@ public sealed class RuleRuntime : IAsyncDisposable
         _log = log;
     }
 
-    public IReadOnlyList<RoutingRule> Rules
-    {
-        get
-        {
-            _gate.Wait();
-            try
-            {
-                return RuleEvaluator.Sort(_rules.Values);
-            }
-            finally
-            {
-                _gate.Release();
-            }
-        }
-    }
+    public DnsCache Dns { get; } = new();
 
-    public IReadOnlyList<ProxyEndpoint> Proxies
-    {
-        get
-        {
-            _gate.Wait();
-            try
-            {
-                return _proxies.Values.ToArray();
-            }
-            finally
-            {
-                _gate.Release();
-            }
-        }
-    }
+    public IReadOnlyList<RoutingRule> Rules => _state.OrderedRules;
+
+    public IReadOnlyList<ProxyEndpoint> Proxies => _state.Proxies.Values.ToArray();
+
+    public IReadOnlyList<ProxyChain> Chains => _state.Chains.Values.ToArray();
+
+    public DaemonOptions Options => _options;
 
     public IReadOnlyList<RuleSlot> InstalledSlots => _installedSlots;
 
-    /// <summary>Which slot, if any, owns a listener port. Used to attribute captured flows.</summary>
-    public RuleSlot? SlotForPort(int port) => _installedSlots.FirstOrDefault(s => s.Port == port);
+    public IReadOnlyCollection<ProcessGroup> Groups => _state.GroupsByName.Values.ToArray();
 
-    // -- proxies -------------------------------------------------------------
+    public DeciderState State => _state;
+
+    public bool SniffHosts => _state.HasHostRules;
+
+    /// <summary>Children moved out of a group that excludes descendants, and failures to do so.</summary>
+    public (long Excluded, long Failed) ExclusionCounters =>
+        (Interlocked.Read(ref _excludedChildren), Interlocked.Read(ref _excludeMisses));
+
+    /// <summary>
+    /// Watches the cgroups of rules that exclude descendants and evicts anything that is not
+    /// the rule's own process.
+    /// </summary>
+    /// <remarks>
+    /// A child inherits its parent's cgroup at fork, so excluding it is always a race against
+    /// the child creating a socket — a socket's cgroup is fixed when it is created. The fork
+    /// notification is the fast path, but its latency is at the kernel's and the scheduler's
+    /// discretion. This bounds the window to the poll interval instead, which is the one part
+    /// Yura controls. Reading one small file per group costs microseconds, and the thread only
+    /// exists while a rule actually excludes descendants.
+    ///
+    /// It does not close the race. A child that connects within the interval keeps the route it
+    /// inherited, and that is reported rather than hidden.
+    /// </remarks>
+    private void ExclusionGuardLoop()
+    {
+        var token = _guardStopping.Token;
+        while (!token.IsCancellationRequested)
+        {
+            var groups = _fastExcludeGroups;
+            if (groups.Count == 0)
+            {
+                // Nothing to guard: wait to be woken rather than spinning.
+                token.WaitHandle.WaitOne(100);
+                continue;
+            }
+
+            var members = _fastExcludeMembers;
+            foreach (var group in groups)
+            {
+                if (!members.TryGetValue(group, out var belong))
+                {
+                    continue;
+                }
+
+                foreach (var pid in _cgroups.ReadMembers(group))
+                {
+                    // The rule's own process belongs here; everything else only inherited it.
+                    if (belong.Contains(pid))
+                    {
+                        continue;
+                    }
+
+                    if (_cgroups.RestoreToResolved(pid, _cgroups.ResolvedOriginOf(pid)))
+                    {
+                        Interlocked.Increment(ref _excludedChildren);
+                    }
+                }
+            }
+
+            Thread.Sleep(1);
+        }
+    }
+
+    private void EnsureExclusionGuard()
+    {
+        if (_exclusionGuard is not null || _fastExcludeGroups.Count == 0)
+        {
+            return;
+        }
+
+        _exclusionGuard = new Thread(ExclusionGuardLoop)
+        {
+            IsBackground = true,
+            Name = "yura-exclusion-guard",
+            // It sleeps almost all the time, and the one thing it does is latency-critical:
+            // under load at normal priority it loses the race it exists to win.
+            Priority = ThreadPriority.AboveNormal,
+        };
+        _exclusionGuard.Start();
+    }
+
+    /// <summary>
+    /// Moves a just-forked child out of a group that excludes descendants, on the netlink
+    /// thread, before it can create a socket. Returns true when it did.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately lock-free and /proc-free: a dictionary lookup and one write. The full
+    /// handler still runs afterwards for bookkeeping — by then the child is already out, and
+    /// moving it to the same place twice is harmless.
+    /// </remarks>
+    public bool TryExcludeChildFast(int parentPid, int childPid)
+    {
+        if (!_placed.TryGetValue(parentPid, out var group) || !_fastExcludeGroups.Contains(group))
+        {
+            return false;
+        }
+
+        // The child would have landed wherever its parent came from, so that is where it goes.
+        // Taken from the parent rather than /proc, and pre-resolved, so this costs one write.
+        // Nothing is logged here: formatting a line and writing it would delay the next fork's
+        // move, which is the only thing this path exists to make fast. The event handler logs
+        // it a moment later, off this thread.
+        var moved = _cgroups.RestoreToResolved(childPid, _cgroups.ResolvedOriginOf(parentPid));
+        Interlocked.Increment(ref moved ? ref _excludedChildren : ref _excludeMisses);
+        return moved;
+    }
+
+    // -- configuration ---------------------------------------------------------
 
     public async Task<ApplyOutcome> SetProxiesAsync(
         IReadOnlyList<(ProxyEndpoint Endpoint, string? Password)> proxies,
+        IReadOnlyList<ProxyChain> chains,
         CancellationToken ct = default)
     {
         await _gate.WaitAsync(ct).ConfigureAwait(false);
@@ -127,10 +321,16 @@ public sealed class RuleRuntime : IAsyncDisposable
         {
             _proxies.Clear();
             _passwords.Clear();
+            _chains.Clear();
             foreach (var (endpoint, password) in proxies)
             {
                 _proxies[endpoint.Id] = endpoint;
                 _passwords[endpoint.Id] = password;
+            }
+
+            foreach (var chain in chains)
+            {
+                _chains[chain.Id] = chain;
             }
 
             return await ReconcileAsync(ct).ConfigureAwait(false);
@@ -141,7 +341,22 @@ public sealed class RuleRuntime : IAsyncDisposable
         }
     }
 
-    // -- rules ---------------------------------------------------------------
+    public async Task<ApplyOutcome> SetOptionsAsync(DaemonOptions options, CancellationToken ct = default)
+    {
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            _options = options;
+            _log($"options: dns policy {options.DnsPolicy}");
+            return await ReconcileAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    // -- rules -----------------------------------------------------------------
 
     public async Task<ApplyOutcome> ApplyRuleAsync(RoutingRule rule, CancellationToken ct = default)
     {
@@ -158,13 +373,27 @@ public sealed class RuleRuntime : IAsyncDisposable
                 };
             }
 
-            if (rule.Action is RuleAction.Chain)
+            if (rule.Action is RuleAction.Chain chain)
             {
-                return new ApplyOutcome
+                if (!_chains.TryGetValue(chain.ChainId, out var known))
                 {
-                    Succeeded = false,
-                    FailureReason = "Proxy chains are not supported by the forwarder yet.",
-                };
+                    return new ApplyOutcome
+                    {
+                        Succeeded = false,
+                        FailureReason = "The rule refers to a proxy chain the daemon does not know about.",
+                        Diagnostics = $"chain id {chain.ChainId} is not in the daemon's chain list",
+                    };
+                }
+
+                var missing = known.Hops.FirstOrDefault(h => !_proxies.ContainsKey(h));
+                if (known.Hops.Count == 0 || missing != Guid.Empty)
+                {
+                    return new ApplyOutcome
+                    {
+                        Succeeded = false,
+                        FailureReason = $"Chain '{known.Name}' has a hop that is not a configured proxy.",
+                    };
+                }
             }
 
             if (rule.Process.Kind == ProcessSelectorKind.Instance && rule.Process.Identity is { } identity)
@@ -186,18 +415,49 @@ public sealed class RuleRuntime : IAsyncDisposable
                 }
             }
 
+            var snapshot = _processes.Enumerate();
+
             // Counted BEFORE the rule is installed: afterwards these sockets are
             // indistinguishable from ones opened under the new rule, and they are exactly
             // the connections that will keep their previous route.
-            var preExisting = CountExistingSockets(rule);
+            var preExisting = CountExistingSockets(rule, snapshot);
 
+            var previous = _rules.GetValueOrDefault(rule.Id);
             _rules[rule.Id] = rule;
-            var outcome = await ReconcileAsync(ct).ConfigureAwait(false);
+
+            // Existing descendants are only swept in when the rule says so, and only once,
+            // at apply time. Everything forked afterwards arrives through fork events.
+            if (rule.Process.Descendants == DescendantPolicy.IncludeExistingAndFuture)
+            {
+                var roots = snapshot.Where(rule.Process.MatchesProcess).Select(p => p.Identity.Pid).ToList();
+                var members = _tree.TryGetValue(rule.Id, out var existing) ? existing : (_tree[rule.Id] = []);
+                foreach (var root in roots)
+                {
+                    foreach (var descendant in Descendants(root, snapshot))
+                    {
+                        members.Add(descendant.Identity.Pid);
+                    }
+                }
+            }
+            else if (previous is null || previous.Process.Descendants != rule.Process.Descendants)
+            {
+                _tree.Remove(rule.Id);
+            }
+
+            var outcome = await ReconcileAsync(ct, snapshot).ConfigureAwait(false);
             outcome = outcome with { PreExistingConnections = preExisting };
             if (!outcome.Succeeded)
             {
                 // Do not keep a rule the kernel refused; the list must describe reality.
-                _rules.Remove(rule.Id);
+                if (previous is null)
+                {
+                    _rules.Remove(rule.Id);
+                }
+                else
+                {
+                    _rules[rule.Id] = previous;
+                }
+
                 await ReconcileAsync(ct).ConfigureAwait(false);
             }
 
@@ -219,6 +479,7 @@ public sealed class RuleRuntime : IAsyncDisposable
                 return new ApplyOutcome { Succeeded = true, ConfirmedAtUtc = DateTimeOffset.UtcNow };
             }
 
+            _tree.Remove(ruleId);
             return await ReconcileAsync(ct).ConfigureAwait(false);
         }
         finally
@@ -227,36 +488,30 @@ public sealed class RuleRuntime : IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Drops instance rules whose process has exited. Called periodically until the
-    /// process-event watcher makes it event-driven.
-    /// </summary>
-    public async Task<int> ExpireDeadInstancesAsync(CancellationToken ct = default)
+    // -- process events --------------------------------------------------------
+
+    public async Task HandleProcessEventAsync(ProcessEvent evt, CancellationToken ct = default)
     {
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var dead = _rules.Values
-                .Where(r => r.Lifetime == RuleLifetime.Instance && r.Process.Identity is not null)
-                .Where(r =>
-                {
-                    var current = _processes.TryRead(r.Process.Identity!.Pid);
-                    return current is null || !r.Process.Identity.Matches(current.Identity);
-                })
-                .ToList();
-
-            foreach (var rule in dead)
+            if (_tornDown)
             {
-                _rules.Remove(rule.Id);
-                _log($"rule '{rule.Name}' expired: its process instance is gone");
+                return;
             }
 
-            if (dead.Count > 0)
+            switch (evt.Kind)
             {
-                await ReconcileAsync(ct).ConfigureAwait(false);
+                case ProcessEventKind.Fork:
+                    await OnForkAsync(evt.Pid, evt.ChildPid, ct).ConfigureAwait(false);
+                    break;
+                case ProcessEventKind.Exec:
+                    await OnExecAsync(evt.Pid, ct).ConfigureAwait(false);
+                    break;
+                case ProcessEventKind.Exit:
+                    await OnExitAsync(evt.Pid, ct).ConfigureAwait(false);
+                    break;
             }
-
-            return dead.Count;
         }
         finally
         {
@@ -264,43 +519,165 @@ public sealed class RuleRuntime : IAsyncDisposable
         }
     }
 
+    private async Task OnForkAsync(int parent, int child, CancellationToken ct)
+    {
+        if (!_placed.TryGetValue(parent, out var inheritedName) || !_groupsByName.TryGetValue(inheritedName, out var inherited))
+        {
+            return; // The parent is not ours, so the child is not either.
+        }
+
+        if (_fastExcludeGroups.Contains(inheritedName))
+        {
+            // Already moved out on the netlink thread; nothing here can improve on that, so
+            // this is only where it gets recorded.
+            if (CgroupManager.GroupOf(child) is null)
+            {
+                _log($"fork: pid {child} excluded from {inheritedName}");
+            }
+            else
+            {
+                _log($"fork: pid {child} could not be excluded from {inheritedName}; it may keep the group's route");
+                _cgroups.Restore(child);
+            }
+
+            return;
+        }
+
+        var childSnapshot = _processes.TryRead(child);
+        if (childSnapshot is null)
+        {
+            return; // Already gone.
+        }
+
+        var members = new HashSet<Guid>();
+        var direct = new HashSet<Guid>();
+        foreach (var ruleId in inherited.RuleIds)
+        {
+            if (!_rules.TryGetValue(ruleId, out var rule))
+            {
+                continue;
+            }
+
+            // At fork time the child runs the parent's image, so any executable, name or
+            // user rule that covers the parent covers the child in its own right.
+            if (rule.Process.Kind != ProcessSelectorKind.Instance && rule.Process.MatchesProcess(childSnapshot))
+            {
+                direct.Add(ruleId);
+                members.Add(ruleId);
+            }
+
+            if (rule.Process.Descendants != DescendantPolicy.Exclude)
+            {
+                (_tree.TryGetValue(ruleId, out var set) ? set : (_tree[ruleId] = [])).Add(child);
+                members.Add(ruleId);
+            }
+        }
+
+        _direct[child] = direct;
+
+        // The child inherited its parent's origin as well as its cgroup.
+        if (_cgroups.OriginOf(parent) is { } origin)
+        {
+            _cgroups.RememberOrigin(child, origin);
+        }
+
+        if (members.Count == 0)
+        {
+            // Excluded: move it out before it can open a socket in the parent's group.
+            _cgroups.Restore(child);
+            _log($"fork: pid {child} ({childSnapshot.DisplayName}) excluded from {inherited.Name}, returned to its origin");
+            return;
+        }
+
+        var (desired, created) = GroupFor(members);
+        _placed[child] = desired.Name;
+        if (desired.Name != inherited.Name)
+        {
+            _cgroups.Move(desired.Name, child, childSnapshot.DisplayName);
+        }
+
+        if (created)
+        {
+            await ReinstallAsync(ct).ConfigureAwait(false);
+        }
+    }
+
+    private async Task OnExecAsync(int pid, CancellationToken ct)
+    {
+        var snapshot = _processes.TryRead(pid);
+        if (snapshot is null)
+        {
+            return;
+        }
+
+        var created = PlaceProcess(snapshot, null);
+        if (created)
+        {
+            await ReinstallAsync(ct).ConfigureAwait(false);
+        }
+    }
+
+    private async Task OnExitAsync(int pid, CancellationToken ct)
+    {
+        _direct.Remove(pid);
+        _placed.TryRemove(pid, out _);
+        _cgroups.Forget(pid);
+        foreach (var set in _tree.Values)
+        {
+            set.Remove(pid);
+        }
+
+        var expired = ExpireInstanceRulesFor(pid);
+        if (expired > 0)
+        {
+            await ReconcileAsync(ct).ConfigureAwait(false);
+        }
+    }
+
     /// <summary>
-    /// Migrates newly started processes into the slots whose selectors now cover them.
+    /// The periodic safety net: expires instance rules whose process is gone, re-derives
+    /// every process's membership from <c>/proc</c>, and retires empty groups. Catches
+    /// anything the event stream dropped.
     /// </summary>
-    /// <remarks>
-    /// This is what makes a persistent executable rule mean anything: the rule is installed
-    /// once, but the processes it covers come and go. Instance slots are skipped — their
-    /// membership is fixed by definition.
-    ///
-    /// Polling is a stand-in for a netlink process-event watcher, and it has a real limit: a
-    /// socket's cgroup is fixed when the socket is created, so a process that starts and
-    /// connects inside one poll interval is missed. Long-lived applications — the case this
-    /// feature exists for — are caught. Short-lived ones need the watcher.
-    /// </remarks>
-    public async Task<int> RefreshMembershipAsync(CancellationToken ct = default)
+    public async Task SweepAsync(CancellationToken ct = default)
     {
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var dynamicSlots = _installedSlots
-                .Where(s => s.UsesCgroup && s.Rule.Process.Kind != ProcessSelectorKind.Instance)
-                .ToList();
-
-            if (dynamicSlots.Count == 0)
+            if (_tornDown)
             {
-                return 0;
+                return;
             }
 
             var snapshot = _processes.Enumerate();
-            var warnings = new List<string>();
-            var migrated = dynamicSlots.Sum(slot => MigrateMembers(slot, snapshot, warnings));
-
-            if (migrated > 0)
+            var live = snapshot.Select(p => p.Identity.Pid).ToHashSet();
+            var expired = 0;
+            foreach (var rule in _rules.Values.Where(r => r.Lifetime == RuleLifetime.Instance && r.Process.Identity is not null).ToList())
             {
-                _log($"membership sweep migrated {migrated} newly started process(es)");
+                var identity = rule.Process.Identity!;
+                var current = live.Contains(identity.Pid) ? _processes.TryRead(identity.Pid) : null;
+                if (current is null || !identity.Matches(current.Identity))
+                {
+                    _rules.Remove(rule.Id);
+                    _tree.Remove(rule.Id);
+                    _log($"rule '{rule.Name}' expired: its process instance is gone");
+                    expired++;
+                }
             }
 
-            return migrated;
+            if (expired > 0)
+            {
+                await ReconcileAsync(ct, snapshot).ConfigureAwait(false);
+                return;
+            }
+
+            var warnings = new List<string>();
+            var created = RecomputeMembership(snapshot, warnings);
+            var pruned = PruneEmptyGroups();
+            if (created || pruned)
+            {
+                await ReinstallAsync(ct).ConfigureAwait(false);
+            }
         }
         finally
         {
@@ -308,42 +685,207 @@ public sealed class RuleRuntime : IAsyncDisposable
         }
     }
 
-    // -- reconciliation ------------------------------------------------------
+    private int ExpireInstanceRulesFor(int pid)
+    {
+        var expired = 0;
+        foreach (var rule in _rules.Values.Where(r => r.Lifetime == RuleLifetime.Instance && r.Process.Identity?.Pid == pid).ToList())
+        {
+            var current = _processes.TryRead(pid);
+            if (current is not null && rule.Process.Identity!.Matches(current.Identity))
+            {
+                continue; // Not actually gone; a thread exit, or a stale event.
+            }
 
-    /// <summary>Makes the kernel match the current rule and proxy lists. Caller holds the gate.</summary>
-    private async Task<ApplyOutcome> ReconcileAsync(CancellationToken ct)
+            _rules.Remove(rule.Id);
+            _tree.Remove(rule.Id);
+            _log($"rule '{rule.Name}' expired: pid {pid} exited");
+            expired++;
+        }
+
+        return expired;
+    }
+
+    // -- membership ------------------------------------------------------------
+
+    /// <summary>
+    /// Puts every process in the group its rule set calls for. Caller holds the gate.
+    /// </summary>
+    /// <returns>True when a group had to be created, which means the ruleset must be reinstalled.</returns>
+    private bool RecomputeMembership(IReadOnlyList<ProcessSnapshot> snapshot, List<string> warnings)
+    {
+        var live = snapshot.Select(p => p.Identity.Pid).ToHashSet();
+        foreach (var pid in _direct.Keys.Where(p => !live.Contains(p)).ToList())
+        {
+            _direct.Remove(pid);
+            _cgroups.Forget(pid);
+        }
+
+        foreach (var pid in _placed.Keys.Where(p => !live.Contains(p)).ToList())
+        {
+            _placed.TryRemove(pid, out _);
+            _cgroups.Forget(pid);
+        }
+
+        foreach (var set in _tree.Values)
+        {
+            set.RemoveWhere(p => !live.Contains(p));
+        }
+
+        var created = false;
+        foreach (var process in snapshot)
+        {
+            created |= PlaceProcess(process, warnings);
+        }
+
+        return created;
+    }
+
+    /// <summary>Evaluates one process's rule set and moves it if it is not where it should be.</summary>
+    private bool PlaceProcess(ProcessSnapshot process, List<string>? warnings)
+    {
+        var pid = process.Identity.Pid;
+        if (pid == 1 || pid == Environment.ProcessId)
+        {
+            return false; // Never migrate init or ourselves; a rule that matched them is a mistake.
+        }
+
+        var direct = new HashSet<Guid>();
+        foreach (var rule in _rules.Values)
+        {
+            if (rule.Enabled && rule.Process.Kind != ProcessSelectorKind.Any && rule.Process.MatchesProcess(process))
+            {
+                direct.Add(rule.Id);
+            }
+        }
+
+        var members = new HashSet<Guid>(direct);
+        foreach (var (ruleId, pids) in _tree)
+        {
+            if (pids.Contains(pid) && _rules.TryGetValue(ruleId, out var rule) && rule.Enabled)
+            {
+                members.Add(ruleId);
+            }
+        }
+
+        if (direct.Count == 0)
+        {
+            _direct.Remove(pid);
+        }
+        else
+        {
+            _direct[pid] = direct;
+        }
+
+        var tracked = _placed.ContainsKey(pid);
+        if (members.Count == 0)
+        {
+            if (tracked || CgroupManager.GroupOf(pid) is not null)
+            {
+                _cgroups.Restore(pid);
+                _placed.TryRemove(pid, out _);
+            }
+
+            return false;
+        }
+
+        var (desired, created) = GroupFor(members);
+        var actual = CgroupManager.GroupOf(pid);
+        if (actual != desired.Name)
+        {
+            var result = _cgroups.Migrate(desired.Name, process.Identity);
+            if (result.Succeeded)
+            {
+                _placed[pid] = desired.Name;
+            }
+            else if (result.Outcome != MigrationOutcome.ProcessGone)
+            {
+                warnings?.Add($"pid {pid} ({process.DisplayName}): {result.Detail}");
+            }
+        }
+        else
+        {
+            _placed[pid] = desired.Name;
+        }
+
+        return created;
+    }
+
+    private (ProcessGroup Group, bool Created) GroupFor(IReadOnlySet<Guid> ruleIds)
+    {
+        var key = ProcessGroup.KeyFor(ruleIds);
+        if (_groupsByKey.TryGetValue(key, out var existing))
+        {
+            if (!_cgroups.GroupExists(existing.Name))
+            {
+                _cgroups.CreateGroup(existing.Name);
+                return (existing, true);
+            }
+
+            return (existing, false);
+        }
+
+        var used = _groupsByName.Values.Select(g => g.Index).ToHashSet();
+        var index = 1;
+        while (used.Contains(index))
+        {
+            index++;
+        }
+
+        var group = new ProcessGroup { Index = index, RuleIds = ruleIds.ToHashSet() };
+        _groupsByKey[key] = group;
+        _groupsByName[group.Name] = group;
+        _cgroups.CreateGroup(group.Name);
+        _log($"group {group.Name} = {{{string.Join(", ", ruleIds.Select(id => _rules.TryGetValue(id, out var r) ? r.Name : id.ToString()))}}}");
+        return (group, true);
+    }
+
+    /// <summary>Retires groups nobody is in. Returns true when the ruleset must be reinstalled.</summary>
+    private bool PruneEmptyGroups()
+    {
+        var removed = false;
+        foreach (var group in _groupsByName.Values.ToList())
+        {
+            var stale = group.RuleIds.Any(id => !_rules.ContainsKey(id));
+            if (_cgroups.ReadMembers(group.Name).Count > 0 && !stale)
+            {
+                continue;
+            }
+
+            _cgroups.RemoveGroup(group.Name);
+            _groupsByName.Remove(group.Name);
+            _groupsByKey.Remove(group.Key);
+            foreach (var pid in _placed.Where(kv => kv.Value == group.Name).Select(kv => kv.Key).ToList())
+            {
+                _placed.TryRemove(pid, out _);
+            }
+
+            removed = true;
+        }
+
+        return removed;
+    }
+
+    private static IEnumerable<ProcessSnapshot> Descendants(int rootPid, IReadOnlyList<ProcessSnapshot> snapshot)
+    {
+        var children = snapshot.ToLookup(p => p.ParentPid);
+        var stack = new Stack<int>();
+        stack.Push(rootPid);
+        while (stack.Count > 0)
+        {
+            foreach (var child in children[stack.Pop()])
+            {
+                yield return child;
+                stack.Push(child.Identity.Pid);
+            }
+        }
+    }
+
+    // -- reconciliation --------------------------------------------------------
+
+    /// <summary>Makes the kernel match the current rule, proxy and process state. Caller holds the gate.</summary>
+    private async Task<ApplyOutcome> ReconcileAsync(CancellationToken ct, IReadOnlyList<ProcessSnapshot>? snapshot = null)
     {
         var warnings = new List<string>();
-
-        // 1. Slots. Rules that need no kernel presence (Direct with no process constraint)
-        //    are simply not installed; unmatched traffic is Direct anyway.
-        var slots = new List<RuleSlot>();
-        foreach (var rule in RuleEvaluator.Sort(_rules.Values))
-        {
-            if (!rule.Enabled)
-            {
-                continue;
-            }
-
-            var disposition = rule.Action switch
-            {
-                RuleAction.Proxy => SlotDisposition.Proxy,
-                RuleAction.Block => SlotDisposition.Block,
-                _ => SlotDisposition.Direct,
-            };
-
-            if (disposition == SlotDisposition.Direct && rule.Process.Kind == ProcessSelectorKind.Any)
-            {
-                continue;
-            }
-
-            slots.Add(new RuleSlot
-            {
-                Index = AllocateSlotIndex(rule.Id),
-                Rule = rule,
-                Disposition = disposition,
-            });
-        }
 
         // Release indices of rules that no longer exist.
         foreach (var ruleId in _slotIndexByRule.Keys.Where(id => !_rules.ContainsKey(id)).ToList())
@@ -351,26 +893,18 @@ public sealed class RuleRuntime : IAsyncDisposable
             _slotIndexByRule.Remove(ruleId);
         }
 
-        // 2. cgroups for every slot that selects on process.
-        foreach (var slot in slots.Where(s => s.UsesCgroup))
-        {
-            _cgroups.CreateSlot(slot.Name);
-        }
+        // 1. Membership: which processes belong in which group, decided from live /proc.
+        snapshot ??= _processes.Enumerate();
+        RecomputeMembership(snapshot, warnings);
+        PruneEmptyGroups();
 
-        // 3. Membership. Which processes belong in which slot, decided from live /proc.
-        var migrated = 0;
-        var snapshot = _processes.Enumerate();
-        foreach (var slot in slots.Where(s => s.UsesCgroup))
-        {
-            migrated += MigrateMembers(slot, snapshot, warnings);
-        }
+        // 2. Slots and listeners, then the ruleset in one transaction. The listeners are
+        //    started first because the kernel chooses their ports and the ruleset has to name
+        //    them.
+        var slots = await ReconcileListenersAsync(BuildSlots(), warnings).ConfigureAwait(false);
 
-        // 4. Listeners: start for new proxy slots, stop for slots that changed or vanished.
-        await ReconcileListenersAsync(slots).ConfigureAwait(false);
-
-        // 5. The ruleset, in one transaction.
         var skipped = new List<string>();
-        var ruleset = NftablesManager.Build(slots, _proxies.Values.ToArray(), skipped);
+        var ruleset = NftablesManager.Build(slots, _proxies.Values.ToArray(), _options, skipped);
         warnings.AddRange(skipped);
 
         var applied = await _nftables.ApplyAsync(ruleset, ct).ConfigureAwait(false);
@@ -385,27 +919,110 @@ public sealed class RuleRuntime : IAsyncDisposable
             };
         }
 
-        // 6. Only now retire cgroups of slots that are gone: their rules are no longer in
-        //    the kernel, so evicting their members cannot leave anyone half-classified.
-        var live = slots.Select(s => s.Name).ToHashSet();
-        foreach (var old in _installedSlots.Where(s => s.UsesCgroup && !live.Contains(s.Name)))
-        {
-            _cgroups.RemoveSlot(old.Name);
-        }
-
         _installedSlots = slots;
+        PublishState();
 
         return new ApplyOutcome
         {
             Succeeded = true,
             ConfirmedAtUtc = DateTimeOffset.UtcNow,
-            MigratedProcesses = migrated,
+            MigratedProcesses = _placed.Count,
             Warnings = warnings,
         };
     }
 
+    /// <summary>Reinstalls the ruleset for the current groups without re-deriving membership.</summary>
+    private async Task ReinstallAsync(CancellationToken ct)
+    {
+        var warnings = new List<string>();
+        var slots = await ReconcileListenersAsync(BuildSlots(), warnings).ConfigureAwait(false);
+        var ruleset = NftablesManager.Build(slots, _proxies.Values.ToArray(), _options);
+        var applied = await _nftables.ApplyAsync(ruleset, ct).ConfigureAwait(false);
+        if (applied.Succeeded)
+        {
+            _installedSlots = slots;
+            PublishState();
+        }
+        else
+        {
+            _log($"ruleset reinstall failed: {applied.FailureText}");
+        }
+    }
+
+    private List<RuleSlot> BuildSlots()
+    {
+        var slots = new List<RuleSlot>();
+        foreach (var rule in RuleEvaluator.Sort(_rules.Values))
+        {
+            if (!rule.Enabled)
+            {
+                continue;
+            }
+
+            var disposition = rule.Action switch
+            {
+                RuleAction.Proxy or RuleAction.Chain => SlotDisposition.Capture,
+                _ when rule.Destination.Hosts.Count > 0 => SlotDisposition.Capture,
+                RuleAction.Block => SlotDisposition.Block,
+                _ => SlotDisposition.Direct,
+            };
+
+            // Direct with no process constraint needs no kernel presence; unmatched traffic
+            // is Direct anyway.
+            if (disposition == SlotDisposition.Direct && rule.Process.Kind == ProcessSelectorKind.Any)
+            {
+                continue;
+            }
+
+            slots.Add(new RuleSlot
+            {
+                Index = AllocateSlotIndex(rule.Id),
+                Rule = rule,
+                Disposition = disposition,
+                Groups = _groupsByName.Values.Where(g => g.RuleIds.Contains(rule.Id)).OrderBy(g => g.Index).ToArray(),
+            });
+        }
+
+        return slots;
+    }
+
+    private void PublishState()
+    {
+        var ordered = RuleEvaluator.Sort(_rules.Values);
+
+        // A child can never match an instance rule in its own right, so a group made only of
+        // instance rules that exclude descendants is one a forked child must leave at once.
+        var excluding = _groupsByName.Values
+            .Where(g => g.RuleIds.All(id =>
+                _rules.TryGetValue(id, out var rule) &&
+                rule.Process.Kind == ProcessSelectorKind.Instance &&
+                rule.Process.Descendants == DescendantPolicy.Exclude))
+            .ToList();
+
+        _fastExcludeMembers = excluding.ToDictionary(
+            g => g.Name,
+            g => (IReadOnlySet<int>)g.RuleIds
+                .Select(id => _rules.TryGetValue(id, out var rule) ? rule.Process.Identity?.Pid : null)
+                .Where(pid => pid is not null)
+                .Select(pid => pid!.Value)
+                .ToHashSet());
+        _fastExcludeGroups = excluding.Select(g => g.Name).ToHashSet();
+
+        EnsureExclusionGuard();
+
+        _state = new DeciderState
+        {
+            OrderedRules = ordered,
+            GroupsByName = new Dictionary<string, ProcessGroup>(_groupsByName),
+            Proxies = new Dictionary<Guid, ProxyEndpoint>(_proxies),
+            Passwords = new Dictionary<Guid, string?>(_passwords),
+            Chains = new Dictionary<Guid, ProxyChain>(_chains),
+            HasHostRules = ordered.Any(r => r.Enabled && r.Destination.Hosts.Count > 0),
+        };
+    }
+
     /// <summary>Sockets already open for the processes a rule covers, or null if unknowable.</summary>
-    private int? CountExistingSockets(RoutingRule rule)
+    private int? CountExistingSockets(RoutingRule rule, IReadOnlyList<ProcessSnapshot> snapshot)
     {
         if (rule.Process.Kind == ProcessSelectorKind.Any)
         {
@@ -415,12 +1032,7 @@ public sealed class RuleRuntime : IAsyncDisposable
         try
         {
             var counts = _ownership.CountsByPid();
-            var snapshot = _processes.Enumerate();
-            var pids = rule.Process.Kind == ProcessSelectorKind.Instance
-                ? snapshot.Where(p => rule.Process.Identity?.Matches(p.Identity) == true)
-                : snapshot.Where(rule.Process.MatchesProcess);
-
-            return pids.Sum(p => counts.GetValueOrDefault(p.Identity.Pid));
+            return snapshot.Where(rule.Process.MatchesProcess).Sum(p => counts.GetValueOrDefault(p.Identity.Pid));
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
@@ -449,149 +1061,131 @@ public sealed class RuleRuntime : IAsyncDisposable
     }
 
     /// <summary>
-    /// Puts every process the slot's selector covers into the slot's cgroup.
+    /// Starts a listener for every Capture slot and stops the rest, returning the slots with
+    /// the ports the kernel assigned.
     /// </summary>
     /// <remarks>
-    /// Membership of a cgroup is what the kernel classifies on, so this is where the
-    /// selector semantics become real:
-    /// <list type="bullet">
-    /// <item>Instance: exactly that identity, re-verified against live /proc first.</item>
-    /// <item>Instance with existing descendants: the identity plus its current subtree.</item>
-    /// <item>Executable / name / user: every currently running match. Future matches are
-    /// the process watcher's job.</item>
-    /// </list>
-    /// Migrating a process already in the right cgroup is a harmless no-op, so this is safe
-    /// to run on every reconcile.
+    /// A listener that cannot bind is reported as a warning and its slot is dropped from the
+    /// ruleset rather than throwing: one rule that cannot be served must not stop the others
+    /// from being installed, and a Capture slot with no listener would black-hole traffic.
     /// </remarks>
-    private int MigrateMembers(RuleSlot slot, IReadOnlyList<ProcessSnapshot> snapshot, List<string> warnings)
+    private async Task<List<RuleSlot>> ReconcileListenersAsync(List<RuleSlot> slots, List<string> warnings)
     {
-        var selector = slot.Rule.Process;
-        var targets = new List<ProcessSnapshot>();
+        var wanted = slots.Where(s => s.Disposition == SlotDisposition.Capture).ToDictionary(s => s.Index);
 
-        if (selector.Kind == ProcessSelectorKind.Instance)
-        {
-            if (selector.Identity is null)
-            {
-                return 0;
-            }
-
-            var self = snapshot.FirstOrDefault(p => selector.Identity.Matches(p.Identity));
-            if (self is null)
-            {
-                warnings.Add($"{slot.Rule.Name}: the process instance is no longer running");
-                return 0;
-            }
-
-            targets.Add(self);
-            if (selector.Descendants == DescendantPolicy.IncludeExistingAndFuture)
-            {
-                targets.AddRange(Descendants(self.Identity.Pid, snapshot));
-            }
-        }
-        else
-        {
-            targets.AddRange(snapshot.Where(selector.MatchesProcess));
-            if (selector.Descendants == DescendantPolicy.IncludeExistingAndFuture)
-            {
-                foreach (var match in targets.ToList())
-                {
-                    targets.AddRange(Descendants(match.Identity.Pid, snapshot));
-                }
-            }
-        }
-
-        var already = _cgroups.ReadMembers(slot.Name).ToHashSet();
-        var migrated = 0;
-        foreach (var process in targets.DistinctBy(p => p.Identity.Pid))
-        {
-            if (already.Contains(process.Identity.Pid))
-            {
-                continue;
-            }
-
-            // Never migrate ourselves or init; a rule that matched them is a mistake.
-            if (process.Identity.Pid is 1 || process.Identity.Pid == Environment.ProcessId)
-            {
-                continue;
-            }
-
-            var result = _cgroups.Migrate(slot.Name, process.Identity);
-            if (result.Succeeded)
-            {
-                migrated++;
-            }
-            else if (result.Outcome != MigrationOutcome.ProcessGone)
-            {
-                warnings.Add($"{slot.Rule.Name}: pid {process.Identity.Pid}: {result.Detail}");
-            }
-        }
-
-        return migrated;
-    }
-
-    private static IEnumerable<ProcessSnapshot> Descendants(int rootPid, IReadOnlyList<ProcessSnapshot> snapshot)
-    {
-        var children = snapshot.ToLookup(p => p.ParentPid);
-        var stack = new Stack<int>();
-        stack.Push(rootPid);
-        while (stack.Count > 0)
-        {
-            foreach (var child in children[stack.Pop()])
-            {
-                yield return child;
-                stack.Push(child.Identity.Pid);
-            }
-        }
-    }
-
-    private async Task ReconcileListenersAsync(IReadOnlyList<RuleSlot> slots)
-    {
-        var wanted = slots
-            .Where(s => s.Disposition == SlotDisposition.Proxy)
-            .ToDictionary(s => s.Index);
-
-        // Stop listeners whose slot is gone or now points at a different proxy.
         foreach (var (index, listener) in _listeners.ToList())
         {
-            var keep = wanted.TryGetValue(index, out var slot) &&
-                       slot.Rule.Action is RuleAction.Proxy p &&
-                       listener.ProxyId == p.EndpointId;
-            if (!keep)
-            {
-                await listener.DisposeAsync().ConfigureAwait(false);
-                _listeners.Remove(index);
-                if (_udpListeners.Remove(index, out var udp))
-                {
-                    await udp.DisposeAsync().ConfigureAwait(false);
-                }
-            }
-        }
-
-        foreach (var (index, slot) in wanted)
-        {
-            if (_listeners.ContainsKey(index))
+            if (wanted.ContainsKey(index))
             {
                 continue;
             }
 
-            var proxyId = ((RuleAction.Proxy)slot.Rule.Action).EndpointId;
-            var proxy = _proxies[proxyId];
-            var password = _passwords.GetValueOrDefault(proxyId);
-
-            var tcp = new TransparentTcpListener(slot, proxy, password, _flows, _log);
-            tcp.Start();
-            _listeners[index] = tcp;
-
-            if (proxy.Protocol == ProxyProtocol.Socks5)
-            {
-                var udp = new TransparentUdpListener(slot, proxy, password, _flows, _log);
-                udp.Start();
-                _udpListeners[index] = udp;
-            }
+            await listener.DisposeAsync().ConfigureAwait(false);
+            _listeners.Remove(index);
         }
+
+        var result = new List<RuleSlot>(slots.Count);
+        foreach (var slot in slots)
+        {
+            if (slot.Disposition != SlotDisposition.Capture)
+            {
+                result.Add(slot);
+                continue;
+            }
+
+            if (!_listeners.TryGetValue(slot.Index, out var listener))
+            {
+                try
+                {
+                    // The listener only ever reads the slot's rule id; everything else about
+                    // the rule is looked up live at decision time, so a rule edit needs no
+                    // restart.
+                    listener = SlotListener.Start(slot, this, _flows, _log);
+                    _listeners[slot.Index] = listener;
+                }
+                catch (SocketException e)
+                {
+                    warnings.Add($"{slot.Rule.Name}: could not open a transparent listener ({e.SocketErrorCode}); " +
+                                 "the rule is not in effect");
+                    continue;
+                }
+            }
+
+            result.Add(slot with { Port = listener.Port });
+        }
+
+        return result;
     }
 
-    // -- lifecycle -----------------------------------------------------------
+    // -- per-flow decisions ----------------------------------------------------
+
+    /// <summary>Pids that could own a flow captured by <paramref name="slot"/>: the members of every group its rule is in.</summary>
+    public IReadOnlyCollection<int> CandidateOwners(RuleSlot slot)
+    {
+        var state = _state;
+        var pids = new List<int>();
+        foreach (var group in state.GroupsByName.Values)
+        {
+            if (group.RuleIds.Contains(slot.Rule.Id))
+            {
+                pids.AddRange(_cgroups.ReadMembers(group.Name));
+            }
+        }
+
+        return pids;
+    }
+
+    public FlowPlan Decide(RuleSlot slot, IPEndPoint client, IPEndPoint destination, TransportProtocol protocol, string? sniffedHost)
+    {
+        var state = _state;
+
+        var pid = _ownership.FindOwnerPid(
+            protocol == TransportProtocol.Tcp ? ProtocolType.Tcp : ProtocolType.Udp,
+            client,
+            protocol == TransportProtocol.Tcp ? destination : null,
+            CandidateOwners(slot));
+        var process = pid is { } p ? _processes.TryRead(p) : null;
+
+        IReadOnlySet<Guid> classified = pid is { } owner && CgroupManager.GroupOf(owner) is { } groupName &&
+                                        state.GroupsByName.TryGetValue(groupName, out var group)
+            ? group.RuleIds
+            : new HashSet<Guid> { slot.Rule.Id };
+
+        var host = sniffedHost ?? Dns.Lookup(destination.Address);
+        var decision = RuleEvaluator.Evaluate(state.OrderedRules, new RoutingRequest
+        {
+            Process = process,
+            DestinationAddress = destination.Address,
+            DestinationPort = (ushort)destination.Port,
+            Protocol = protocol,
+            DestinationHost = host,
+            ClassifierMatchedRuleIds = classified,
+        });
+
+        var (hops, routeName, failure) = state.ResolveRoute(decision.Action);
+        var kind = decision.Action switch
+        {
+            RuleAction.Block => FlowPlanKind.Block,
+            RuleAction.Direct => FlowPlanKind.Direct,
+            _ => failure is null ? FlowPlanKind.Proxy : FlowPlanKind.Fail,
+        };
+
+        return new FlowPlan
+        {
+            Kind = kind,
+            Hops = hops ?? [],
+            RouteName = routeName,
+            RuleId = decision.MatchedRule?.Id,
+            RuleName = decision.MatchedRule?.Name,
+            OwnerPid = pid,
+            ProcessName = process?.DisplayName,
+            Host = host,
+            Explanation = decision.Explanation,
+            FailureReason = failure,
+        };
+    }
+
+    // -- lifecycle -------------------------------------------------------------
 
     /// <summary>Removes every trace of the daemon from the kernel.</summary>
     public async Task TeardownAsync()
@@ -614,16 +1208,15 @@ public sealed class RuleRuntime : IAsyncDisposable
                 await listener.DisposeAsync().ConfigureAwait(false);
             }
 
-            foreach (var listener in _udpListeners.Values)
-            {
-                await listener.DisposeAsync().ConfigureAwait(false);
-            }
-
             _listeners.Clear();
-            _udpListeners.Clear();
             await _nftables.RemoveAsync().ConfigureAwait(false);
-            _cgroups.RemoveAllSlots();
+            _cgroups.RemoveAllGroups();
             _installedSlots = [];
+            _state = DeciderState.Empty;
+            _fastExcludeGroups = new HashSet<string>();
+            _guardStopping.Cancel();
+            _exclusionGuard?.Join(TimeSpan.FromSeconds(2));
+            _exclusionGuard = null;
         }
         finally
         {
@@ -634,6 +1227,7 @@ public sealed class RuleRuntime : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await TeardownAsync().ConfigureAwait(false);
+        _guardStopping.Dispose();
         _gate.Dispose();
     }
 }

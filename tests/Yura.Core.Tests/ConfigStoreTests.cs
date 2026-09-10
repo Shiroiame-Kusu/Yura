@@ -1,4 +1,5 @@
 using Yura.App.Services;
+using Yura.Core.Games;
 using Yura.Core.Processes;
 using Yura.Core.Proxies;
 using Yura.Core.Rules;
@@ -15,6 +16,20 @@ public sealed class ConfigStoreTests : IDisposable
         Path.Combine(Path.GetTempPath(), "yura-config-tests-" + Guid.NewGuid().ToString("N"));
 
     private ConfigStore NewStore() => new(_directory);
+
+    private static ConfigSnapshot Snapshot(
+        PersistedSettings? settings = null,
+        IEnumerable<ProxyEndpoint>? proxies = null,
+        IEnumerable<RoutingRule>? rules = null,
+        IEnumerable<ProxyChain>? chains = null,
+        IEnumerable<GameProfile>? games = null) => new()
+        {
+            Settings = settings ?? new PersistedSettings(),
+            Proxies = proxies ?? [],
+            Rules = rules ?? [],
+            Chains = chains ?? [],
+            Games = games ?? [],
+        };
 
     public void Dispose()
     {
@@ -94,7 +109,7 @@ public sealed class ConfigStoreTests : IDisposable
         var store = NewStore();
         var rule = Rule(RuleLifetime.Persistent, "curl always");
 
-        Assert.Null(await store.SaveAsync(new PersistedSettings(), [Proxy()], [rule]));
+        Assert.Null(await store.SaveAsync(Snapshot(proxies: [Proxy()], rules: [rule])));
 
         var (document, warning) = store.Load();
         Assert.Null(warning);
@@ -116,12 +131,12 @@ public sealed class ConfigStoreTests : IDisposable
     {
         var store = NewStore();
 
-        await store.SaveAsync(new PersistedSettings(), [],
+        await store.SaveAsync(Snapshot(rules:
         [
             Rule(RuleLifetime.Persistent, "keep"),
             Rule(RuleLifetime.Instance, "drop-instance"),
             Rule(RuleLifetime.Session, "drop-session"),
-        ]);
+        ]));
 
         // A pid and a start time mean nothing after a reboot; persisting them would let a
         // reused pid inherit a policy, which is the one thing the design forbids.
@@ -134,7 +149,7 @@ public sealed class ConfigStoreTests : IDisposable
     public async Task A_password_is_never_written_to_the_file()
     {
         var store = NewStore();
-        await store.SaveAsync(new PersistedSettings(), [Proxy(passwordRef: "aaaaaaaa-0000-4000-8000-000000000001")], []);
+        await store.SaveAsync(Snapshot(proxies: [Proxy(passwordRef: "aaaaaaaa-0000-4000-8000-000000000001")]));
 
         var text = await File.ReadAllTextAsync(store.FilePath);
 
@@ -147,21 +162,30 @@ public sealed class ConfigStoreTests : IDisposable
     public async Task Settings_round_trip()
     {
         var store = NewStore();
-        await store.SaveAsync(
-            new PersistedSettings { Theme = "light", Language = "zh-Hans", ReducedMotion = true }, [], []);
+        await store.SaveAsync(Snapshot(
+            new PersistedSettings
+            {
+                Theme = "light",
+                Language = "zh-Hans",
+                ReducedMotion = true,
+                DnsPolicy = DnsPolicy.Direct,
+                ShowAllProcesses = true,
+            }));
 
         var (document, _) = store.Load();
 
         Assert.Equal("light", document.Settings.Theme);
         Assert.Equal("zh-Hans", document.Settings.Language);
         Assert.True(document.Settings.ReducedMotion);
+        Assert.Equal(DnsPolicy.Direct, document.Settings.DnsPolicy);
+        Assert.True(document.Settings.ShowAllProcesses);
     }
 
     [Fact]
     public async Task The_config_file_is_not_readable_by_other_users()
     {
         var store = NewStore();
-        await store.SaveAsync(new PersistedSettings(), [Proxy()], []);
+        await store.SaveAsync(Snapshot(proxies: [Proxy()]));
 
         var mode = File.GetUnixFileMode(store.FilePath);
 
@@ -172,7 +196,7 @@ public sealed class ConfigStoreTests : IDisposable
     public async Task A_corrupt_file_is_preserved_rather_than_overwritten()
     {
         var store = NewStore();
-        await store.SaveAsync(new PersistedSettings(), [Proxy()], []);
+        await store.SaveAsync(Snapshot(proxies: [Proxy()]));
         await File.WriteAllTextAsync(store.FilePath, "{ this is not json");
 
         var (document, warning) = store.Load();
@@ -200,10 +224,78 @@ public sealed class ConfigStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task Chains_round_trip_and_keep_their_hop_order()
+    {
+        var store = NewStore();
+        var first = Guid.Parse("aaaaaaaa-0000-4000-8000-00000000000a");
+        var second = Guid.Parse("aaaaaaaa-0000-4000-8000-00000000000b");
+
+        await store.SaveAsync(Snapshot(chains:
+        [
+            new ProxyChain { Id = Guid.NewGuid(), Name = "A then B", Hops = [first, second] },
+        ]));
+
+        var chain = Assert.Single(store.Load().Document.Chains).ToChain();
+        Assert.Equal("A then B", chain.Name);
+        // Order is the whole meaning of a chain: element 0 is dialled first.
+        Assert.Equal([first, second], chain.Hops);
+    }
+
+    [Fact]
+    public async Task Only_games_the_user_has_told_us_something_about_are_saved()
+    {
+        var store = NewStore();
+        var route = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000001");
+
+        await store.SaveAsync(Snapshot(games:
+        [
+            // Nothing known beyond what rediscovery would find again: not worth a line.
+            new GameProfile { Id = Guid.NewGuid(), Name = "Untouched", SteamAppId = "1", Source = GameSource.Steam },
+            new GameProfile { Id = Guid.NewGuid(), Name = "Routed", SteamAppId = "2", Source = GameSource.Steam, RouteId = route },
+            new GameProfile { Id = Guid.NewGuid(), Name = "Added by hand", Source = GameSource.Manual, ExecutablePath = "/usr/bin/game" },
+        ]));
+
+        var names = store.Load().Document.Games.Select(g => g.Name).ToList();
+        Assert.Equal(2, names.Count);
+        Assert.Contains("Routed", names);
+        Assert.Contains("Added by hand", names);
+    }
+
+    [Fact]
+    public async Task A_games_route_and_measurement_target_survive_a_restart()
+    {
+        var store = NewStore();
+        var chainId = Guid.NewGuid();
+
+        await store.SaveAsync(Snapshot(games:
+        [
+            new GameProfile
+            {
+                Id = Guid.NewGuid(),
+                Name = "FFXIV",
+                WineTargetExecutable = "Z:\\games\\ffxiv_dx11.exe",
+                Source = GameSource.Steam,
+                RouteId = chainId,
+                RouteIsChain = true,
+                MeasurementHost = "204.2.229.85",
+                MeasurementPort = 54994,
+            },
+        ]));
+
+        var game = Assert.Single(store.Load().Document.Games).ToProfile();
+        Assert.Equal(chainId, game.RouteId);
+        Assert.True(game.RouteIsChain);
+        Assert.Equal("204.2.229.85", game.MeasurementHost);
+        Assert.Equal(54994, game.MeasurementPort);
+        Assert.True(game.IsMeasurable);
+        Assert.True(game.IsRoutable);
+    }
+
+    [Fact]
     public async Task Saving_leaves_no_temporary_file_behind()
     {
         var store = NewStore();
-        await store.SaveAsync(new PersistedSettings(), [Proxy()], []);
+        await store.SaveAsync(Snapshot(proxies: [Proxy()]));
 
         Assert.False(File.Exists(store.FilePath + ".tmp"));
     }

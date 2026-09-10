@@ -1,0 +1,154 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:Yura.App.ViewModels"
+             xmlns:loc="using:Yura.App.Localization"
+             xmlns:icons="using:FluentIcons.Avalonia"
+             mc:Ignorable="d"
+             x:Class="Yura.App.Views.ConnectionsPage"
+             x:DataType="vm:ConnectionsPageViewModel">
+
+  <!-- Column widths are repeated on the header grid and the row grid; Avalonia has no
+       shared-size scope, so keeping the two literals identical is what holds them aligned.
+       They are proportional rather than fixed because seven fixed columns cannot fit the
+       960-DIP minimum: at that width the destination column collapsed to nothing. Process
+       and destination share one column, stacked, since both are variable-length and both
+       matter. -->
+
+  <Grid RowDefinitions="Auto,*">
+
+    <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="24,20,24,12">
+      <StackPanel Grid.Column="0" Spacing="2">
+        <TextBlock Classes="PageTitle" Text="{loc:Tr Connections.Title}" />
+        <TextBlock Classes="Subtitle" Text="{loc:Tr Connections.Subtitle}" MaxWidth="620"
+                   HorizontalAlignment="Left" />
+      </StackPanel>
+
+      <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Top">
+        <TextBox Width="240"
+                 Text="{Binding SearchText}"
+                 PlaceholderText="{loc:Tr Connections.SearchPlaceholder}"
+                 AutomationProperties.Name="{loc:Tr Connections.SearchPlaceholder}" />
+        <ToggleButton IsChecked="{Binding IsPaused}"
+                      Content="{loc:Tr Common.Pause}"
+                      AutomationProperties.Name="{loc:Tr Common.Pause}" />
+        <Button Command="{Binding RefreshCommand}"
+                Content="{loc:Tr Common.Refresh}"
+                AutomationProperties.Name="{loc:Tr Common.Refresh}" />
+      </StackPanel>
+    </Grid>
+
+    <Grid Grid.Row="1" RowDefinitions="Auto,*" Margin="20,0,20,16">
+
+      <!-- Filtered to one process: stated, with a way out. -->
+      <Border Grid.Row="0" Classes="Panel" Padding="12,8" Margin="0,0,0,8"
+              Background="{DynamicResource YuraAccentSubtle}"
+              BorderBrush="{DynamicResource YuraAccent}"
+              IsVisible="{Binding PidFilterLabel, Converter={x:Static ObjectConverters.IsNotNull}}">
+        <Grid ColumnDefinitions="*,Auto">
+          <TextBlock Grid.Column="0" VerticalAlignment="Center" Text="{Binding PidFilterBanner}" />
+          <Button Grid.Column="1" Command="{Binding ClearPidFilterCommand}"
+                  Content="{loc:Tr Connections.ClearFilter}" />
+        </Grid>
+      </Border>
+
+      <Border Grid.Row="1" Classes="Panel" ClipToBounds="True">
+        <Grid RowDefinitions="Auto,*,Auto">
+
+          <Border Grid.Row="0" Classes="ColumnHeader">
+            <Grid Margin="12,0" ColumnDefinitions="2.4*,46,1.2*,118,88,104">
+              <TextBlock Grid.Column="0" Text="{loc:Tr Connections.Column.Process}" Margin="0,0,12,0" />
+              <TextBlock Grid.Column="1" Text="{loc:Tr Connections.Column.Protocol}" />
+              <TextBlock Grid.Column="2" Text="{loc:Tr Connections.Column.Rule}" Margin="0,0,8,0" />
+              <TextBlock Grid.Column="3" Text="{loc:Tr Connections.Column.Route}" />
+              <TextBlock Grid.Column="4" Text="{loc:Tr Connections.Column.State}" />
+              <TextBlock Grid.Column="5" Text="{loc:Tr Connections.Column.Traffic}" HorizontalAlignment="Right" />
+            </Grid>
+          </Border>
+
+          <ListBox Grid.Row="1"
+                   Classes="Table"
+                   ItemsSource="{Binding Connections}"
+                   SelectedItem="{Binding SelectedConnection}"
+                   SelectionMode="Single"
+                   ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                   AutomationProperties.Name="{loc:Tr Connections.Title}">
+            <ListBox.ItemTemplate>
+              <DataTemplate x:DataType="vm:ConnectionRowViewModel">
+                <Grid Margin="12,0" ColumnDefinitions="2.4*,46,1.2*,118,88,104" Height="42">
+                  <StackPanel Grid.Column="0" Spacing="0" VerticalAlignment="Center" Margin="0,0,12,0">
+                    <TextBlock Text="{Binding ProcessDisplay}" TextTrimming="CharacterEllipsis"
+                               ToolTip.Tip="{Binding ProcessDisplay}" />
+                    <TextBlock Classes="Mono Secondary" Text="{Binding DestinationDisplay}"
+                               TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding DestinationTooltip}" />
+                  </StackPanel>
+
+                  <TextBlock Grid.Column="1" Classes="Secondary" Text="{Binding ProtocolDisplay}"
+                             VerticalAlignment="Center" />
+
+                  <TextBlock Grid.Column="2" Classes="Secondary" Text="{Binding RuleDisplay}"
+                             VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Margin="0,0,8,0"
+                             ToolTip.Tip="{Binding RuleDisplay}" />
+
+                  <!-- Route: colour plus a word, never colour alone. -->
+                  <Border Grid.Column="3" Classes="Badge" VerticalAlignment="Center" HorizontalAlignment="Left"
+                          Classes.Accent="{Binding IsProxied}"
+                          Classes.Warning="{Binding IsPreExisting}"
+                          Classes.Danger="{Binding IsBlocked}">
+                    <TextBlock Text="{Binding RouteDisplay}" TextTrimming="CharacterEllipsis" MaxWidth="106" />
+                  </Border>
+
+                  <StackPanel Grid.Column="4" Spacing="0" VerticalAlignment="Center">
+                    <TextBlock Classes="Caption" Text="{Binding StateDisplay}"
+                               Classes.Unavailable="{Binding IsFailed}" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Classes="Caption Tertiary" Text="{Binding AgeDisplay}" />
+                  </StackPanel>
+
+                  <StackPanel Grid.Column="5" Spacing="0" VerticalAlignment="Center">
+                    <TextBlock Classes="Mono Metric Secondary" Text="{Binding UpDisplay}"
+                               HorizontalAlignment="Right" />
+                    <TextBlock Classes="Mono Metric Tertiary" Text="{Binding DownDisplay}"
+                               HorizontalAlignment="Right" />
+                  </StackPanel>
+                </Grid>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+
+          <!-- Empty: distinguishes "nothing is flowing" from "we cannot see it". -->
+          <StackPanel Grid.Row="1" IsVisible="{Binding IsEmpty}"
+                      HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="6" MaxWidth="420">
+            <TextBlock Text="{loc:Tr Connections.Empty}" HorizontalAlignment="Center"
+                       IsVisible="{Binding IsDaemonConnected}" />
+            <TextBlock Classes="Caption" Text="{loc:Tr Connections.EmptyHint}" HorizontalAlignment="Center"
+                       TextAlignment="Center" TextWrapping="Wrap" IsVisible="{Binding IsDaemonConnected}" />
+            <TextBlock Text="{loc:Tr Connections.NeedsDaemon}" HorizontalAlignment="Center"
+                       TextAlignment="Center" TextWrapping="Wrap" IsVisible="{Binding !IsDaemonConnected}" />
+            <TextBlock Classes="Caption Mono" Text="{Binding UnavailableReason}" HorizontalAlignment="Center"
+                       TextAlignment="Center" TextWrapping="Wrap" IsVisible="{Binding !IsDaemonConnected}" />
+          </StackPanel>
+
+          <Border Grid.Row="2" Background="{DynamicResource YuraSurfaceRaised}"
+                  BorderBrush="{DynamicResource YuraBorderSubtle}" BorderThickness="0,1,0,0"
+                  Padding="12,6">
+            <Grid ColumnDefinitions="Auto,Auto,*,Auto">
+              <TextBlock Grid.Column="0" Classes="Caption Metric" Text="{Binding CountSummary}" VerticalAlignment="Center" />
+              <Border Grid.Column="1" Classes="Badge Warning" HorizontalAlignment="Left" Margin="12,0,0,0"
+                      IsVisible="{Binding IsPaused}">
+                <TextBlock Text="{loc:Tr Common.Paused}" />
+              </Border>
+              <TextBlock Grid.Column="2" Classes="Caption" Margin="12,0" VerticalAlignment="Center"
+                         TextTrimming="CharacterEllipsis"
+                         Text="{Binding SelectedConnection.Detail}"
+                         IsVisible="{Binding SelectedConnection.Detail, Converter={x:Static ObjectConverters.IsNotNull}}" />
+              <Button Grid.Column="3" Command="{Binding CreateDestinationRuleCommand}"
+                      IsEnabled="{Binding HasSelection}"
+                      Content="{loc:Tr Connections.CreateRule}" />
+            </Grid>
+          </Border>
+        </Grid>
+      </Border>
+    </Grid>
+  </Grid>
+</UserControl>
