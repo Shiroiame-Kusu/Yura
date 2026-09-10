@@ -194,7 +194,7 @@ public sealed partial class ProxiesPageViewModel : ObservableObject, IDisposable
                 {
                     ChainEditor.IsOpen = false;
                 }
-                else
+                else if (!_syncingSelection)
                 {
                     ClearSelection();
                 }
@@ -210,7 +210,7 @@ public sealed partial class ProxiesPageViewModel : ObservableObject, IDisposable
                 {
                     Editor.IsOpen = false;
                 }
-                else
+                else if (!_syncingSelection)
                 {
                     ClearSelection();
                 }
@@ -249,42 +249,52 @@ public sealed partial class ProxiesPageViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     public partial ChainRowViewModel? SelectedChain { get; set; }
 
+    /// <summary>
+    /// True while a selection change is being carried out, including the editor call it makes.
+    /// </summary>
+    /// <remarks>
+    /// It has to cover the editor call, not just the paired assignment. Opening one editor
+    /// closes the other, and an editor that closes drops the selection — so without this the
+    /// act of selecting a chain would clear the chain it just selected.
+    /// </remarks>
     private bool _syncingSelection;
 
     partial void OnSelectedProxyChanged(ProxyRowViewModel? value)
     {
-        if (_syncingSelection)
-        {
-            return;
-        }
-
-        if (value is null)
+        if (_syncingSelection || value is null)
         {
             return;
         }
 
         _syncingSelection = true;
-        SelectedChain = null;
-        _syncingSelection = false;
-        Editor.BeginEdit(value.Endpoint);
+        try
+        {
+            SelectedChain = null;
+            Editor.BeginEdit(value.Endpoint);
+        }
+        finally
+        {
+            _syncingSelection = false;
+        }
     }
 
     partial void OnSelectedChainChanged(ChainRowViewModel? value)
     {
-        if (_syncingSelection)
-        {
-            return;
-        }
-
-        if (value is null)
+        if (_syncingSelection || value is null)
         {
             return;
         }
 
         _syncingSelection = true;
-        SelectedProxy = null;
-        _syncingSelection = false;
-        ChainEditor.BeginEdit(value.Chain);
+        try
+        {
+            SelectedProxy = null;
+            ChainEditor.BeginEdit(value.Chain);
+        }
+        finally
+        {
+            _syncingSelection = false;
+        }
     }
 
     /// <summary>Drops both selections, so an editor opened for something new owns the panel.</summary>

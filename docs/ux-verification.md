@@ -147,6 +147,22 @@ what it resolves, rather than trusting fontconfig. This found two real bugs:
 
 Chinese fallback is now explicit and ordered: Inter → Noto Sans CJK SC → Noto Sans.
 
+### Editors, driven the way the interface drives them
+
+The proxy and chain editors are covered by 30 view-model tests: importing a wg-quick file,
+each field's validation, keeping a saved key when the box is left blank, deleting both of an
+exit's secrets on removal, hop order and reordering, and which editor owns the panel.
+
+They found one defect a screenshot could not have shown, because it needs two interactions:
+**selecting a chain while a proxy was open cleared the chain's own selection.** Opening one
+editor closes the other, and an editor that closes drops the selection — so the act of
+selecting handed the panel over and then unselected the thing it had just selected. The guard
+now covers the editor call and not merely the paired assignment.
+
+The same tests pin the fix for a smaller one: reopening the Add form after abandoning it
+showed *Enter a name* against an empty box, because clearing the fields for a fresh form
+counts as touching them.
+
 ### Data-shape edge cases
 
 - **Long executable paths** — trimmed from the *head* so the file name stays visible, with

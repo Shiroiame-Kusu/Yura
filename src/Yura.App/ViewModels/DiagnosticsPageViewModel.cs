@@ -88,7 +88,7 @@ public sealed partial class DiagnosticsPageViewModel : ObservableObject, IDispos
         ? _secrets.Description
         : Loc.Current["Diagnostics.SecretsInMemory"];
 
-    public string AppVersion => typeof(DiagnosticsPageViewModel).Assembly.GetName().Version?.ToString(3) ?? "0.2.0";
+    public string AppVersion => typeof(DiagnosticsPageViewModel).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
 
     public string DaemonVersion => Status?.Version ?? Loc.Current["Common.Unavailable"];
 

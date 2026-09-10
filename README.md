@@ -224,10 +224,10 @@ is unreferenced.
 - A systemd service installed from Settings through polkit, with the unit and the script
   shown before anything runs as root, and start / stop / restart / uninstall from the same
   page
-- 132 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+- 162 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
   wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and
-  tunnel manager, the systemd unit generator, the Steam library reader, the rule store and
-  the configuration file
+  tunnel manager, the systemd unit generator, the Steam library reader, the rule store, the
+  proxy and chain editors, and the configuration file
 - Configuration under `~/.config/Yura`, with passwords and keys in the desktop secret service
   and persistent rules reapplied to the daemon on every connection
 

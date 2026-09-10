@@ -39,7 +39,9 @@ public sealed class SimulatedDaemonClient : IDaemonClient
     public Task<DaemonStatus?> GetStatusAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult<DaemonStatus?>(new DaemonStatus
         {
-            Version = "0.2.0 (simulated)",
+            // Derived, not typed: a literal here would eventually claim a version this build
+            // is not, in the one place whose job is to look like the real thing.
+            Version = $"{typeof(SimulatedDaemonClient).Assembly.GetName().Version?.ToString(3) ?? "0.0.0"} (simulated)",
             ActiveRules = 3,
             ActiveFlows = 12,
             ActiveGroups = 2,

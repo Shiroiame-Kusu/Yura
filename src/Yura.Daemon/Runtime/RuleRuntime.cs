@@ -449,16 +449,9 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             }
 
             // A rule on an exit that is down is still a rule: its flows are refused with the
-            // reason until the exit comes up, and the reason is said here too.
-            string? exitWarning = null;
-            if (rule.Action is RuleAction.Proxy onExit &&
-                _proxies.TryGetValue(onExit.EndpointId, out var exit) && exit.Protocol == ProxyProtocol.WireGuard &&
-                !_wireguard.Tunnels.ContainsKey(exit.Id))
-            {
-                exitWarning = _wireguard.Failures.TryGetValue(exit.Id, out var why)
-                    ? $"WireGuard exit '{exit.Name}' is not up: {why}. Connections under this rule are refused until it is."
-                    : $"WireGuard exit '{exit.Name}' is not up. Connections under this rule are refused until it is.";
-            }
+            // reason until the exit comes up, and the reason is said here too. A chain counts:
+            // its first hop is the exit, so the whole chain is unusable while that is down.
+            var exitWarning = DescribeDownExit(rule.Action);
 
             if (rule.Process.Kind == ProcessSelectorKind.Instance && rule.Process.Identity is { } identity)
             {
@@ -535,6 +528,29 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         {
             _gate.Release();
         }
+    }
+
+    /// <summary>Why a rule's route cannot carry traffic yet, when its WireGuard exit is down.</summary>
+    private string? DescribeDownExit(RuleAction action)
+    {
+        var endpointId = action switch
+        {
+            RuleAction.Proxy p => p.EndpointId,
+            RuleAction.Chain c => _chains.TryGetValue(c.ChainId, out var chain) && chain.Hops.Count > 0
+                ? chain.Hops[0]
+                : (Guid?)null,
+            _ => null,
+        };
+
+        if (endpointId is not { } id || !_proxies.TryGetValue(id, out var exit) ||
+            exit.Protocol != ProxyProtocol.WireGuard || _wireguard.Tunnels.ContainsKey(id))
+        {
+            return null;
+        }
+
+        return _wireguard.Failures.TryGetValue(id, out var why)
+            ? $"WireGuard exit '{exit.Name}' is not up: {why}. Connections under this rule are refused until it is."
+            : $"WireGuard exit '{exit.Name}' is not up. Connections under this rule are refused until it is.";
     }
 
     public async Task<ApplyOutcome> RemoveRuleAsync(Guid ruleId, CancellationToken ct = default)
