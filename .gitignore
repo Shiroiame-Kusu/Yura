@@ -14,3 +14,4 @@ spikes/.run/
 # intermediate captures are not.
 docs/screenshots/.scratch/
 tests/acceptance/.run/
+tests/acceptance/.run-last*.log
