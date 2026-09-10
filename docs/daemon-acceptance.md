@@ -8,7 +8,7 @@ dotnet build src/Yura.Daemon
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-**29 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7.
+**32 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7.
 
 Nothing in the harness touches nftables, cgroups or policy routing directly. Every kernel
 change is made by `yura-daemon` in response to a rule sent over the Unix socket, which is
@@ -20,7 +20,7 @@ exactly the path the desktop application uses.
 | --- | --- | --- | --- |
 | 1 | Start an ordinary application, then select it; new connections traverse the proxy | **Verified** | Instance A receives `YURA-VIA-PROXY-A`, a payload only reachable through proxy A |
 | 2 | Two instances of one executable; proxy one, the other stays direct | **Verified** | B keeps timing out while A is proxied; proxy B's log stays empty |
-| 3 | Persistent executable rule survives an application restart | Not covered | Needs config persistence, which is not built |
+| 3 | Persistent executable rule survives an application restart | **Verified** | An executable rule applied while nothing is running proxies 11 connections from an instance started afterwards; `ConfigStoreTests` covers the save/restore half |
 | 4 | Rule expires on process exit and cannot affect a reused PID | **Verified** | Killing A removes the rule and its cgroup; a fresh instance of the same binary is unaffected |
 | 5 | Two processes through different proxies simultaneously | **Verified** | A receives proxy A's marker while B receives proxy B's, in the same window |
 | 6 | Direct and Block for selected processes | **Verified** | Block yields `ConnectionRefused` (a reset, not a timeout); Direct returns to timing out |
@@ -40,6 +40,7 @@ exactly the path the desktop application uses.
 | Pre-existing connections are counted at apply time | `preExistingConnections: 2` |
 | Socket ownership attribution | 24 processes with sockets; top process 103 |
 | Clean shutdown removes the nft table, the ip rule and the cgroup subtree | All three verified absent afterwards |
+| A rule outlives the process that prompted it, and covers later instances | Verified by test 3 |
 
 ## Bugs this suite found
 
@@ -66,9 +67,12 @@ every rule are now permanent for exactly this reason.
 
 ## Not proven here
 
-- Persistent rules across a restart, child exclusion, and Wine/Proton isolation. Each needs a
-  piece that is not built: config persistence, the process-event watcher, and a Wine runtime
-  in the harness.
+- **Short-lived processes.** Membership is refreshed by a 500 ms poll, and a socket's cgroup
+  is fixed when the socket is created, so a process that starts and connects inside one
+  interval keeps its original route. Long-lived applications — the case the feature exists
+  for — are caught. Closing this properly needs the netlink process-event watcher.
+- Child exclusion and Wine/Proton isolation. Each needs a piece that is not built: the
+  process-event watcher, and a Wine runtime in the harness.
 - Behaviour under a hostile connection rate, or with a proxy that stalls mid-handshake.
 - IPv6. The classifier renders IPv6 destination rules, but every test here is IPv4, and the
   UDP path is IPv4-only by construction.

@@ -57,6 +57,7 @@ public sealed class SimulatedDaemonClient : IDaemonClient
 
     public async Task<ProxyProbeResult> ProbeProxyAsync(
         ProxyEndpoint endpoint,
+        string? password,
         CancellationToken cancellationToken = default)
     {
         await Task.Delay(500, cancellationToken).ConfigureAwait(false);

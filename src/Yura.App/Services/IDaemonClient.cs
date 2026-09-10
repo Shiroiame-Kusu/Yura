@@ -65,7 +65,12 @@ public interface IDaemonClient
 
     Task<RuleApplyResult> RemoveRuleAsync(Guid ruleId, CancellationToken cancellationToken = default);
 
-    Task<ProxyProbeResult> ProbeProxyAsync(ProxyEndpoint endpoint, CancellationToken cancellationToken = default);
+    /// <summary>
+    /// Tests an endpoint. The password is passed in rather than read by the daemon: only the
+    /// app can reach the user's secret store, and the daemon holds no credentials at rest.
+    /// </summary>
+    Task<ProxyProbeResult> ProbeProxyAsync(
+        ProxyEndpoint endpoint, string? password, CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -107,7 +112,8 @@ public sealed class DisconnectedDaemonClient : IDaemonClient
     public Task<RuleApplyResult> RemoveRuleAsync(Guid ruleId, CancellationToken cancellationToken = default) =>
         Task.FromResult(Refused());
 
-    public Task<ProxyProbeResult> ProbeProxyAsync(ProxyEndpoint endpoint, CancellationToken cancellationToken = default) =>
+    public Task<ProxyProbeResult> ProbeProxyAsync(
+        ProxyEndpoint endpoint, string? password, CancellationToken cancellationToken = default) =>
         Task.FromResult(new ProxyProbeResult
         {
             TimestampUtc = DateTimeOffset.UtcNow,

@@ -24,12 +24,52 @@ public sealed class RuleStore
 
     public event EventHandler? Changed;
 
+    /// <summary>
+    /// Replaces the rule list with what was loaded from disk.
+    /// </summary>
+    /// <remarks>
+    /// Used once at startup, before anything is applied. Rules arrive without
+    /// <see cref="RoutingRule.AppliedAtUtc"/> set: a rule that was live in a previous session
+    /// is not live now, and showing it as active before the daemon has confirmed it would be
+    /// the exact lie the pending state exists to prevent.
+    /// </remarks>
+    public void LoadPersisted(IEnumerable<RoutingRule> rules)
+    {
+        _rules.Clear();
+        foreach (var rule in rules)
+        {
+            _rules.Add(rule with { AppliedAtUtc = null });
+        }
+
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
+
     public void Add(RoutingRule rule)
     {
         // A new selection for the same process replaces the previous one rather than
         // stacking, so the effective policy is never the result of two competing overrides.
         _rules.RemoveAll(r => r.Origin == rule.Origin && SameSubject(r, rule));
         _rules.Add(rule);
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// Records that the daemon confirmed a rule is live in the kernel.
+    /// </summary>
+    /// <remarks>
+    /// Nothing else may set <see cref="RoutingRule.AppliedAtUtc"/>. It is the difference
+    /// between "the user asked for this" and "the kernel is doing this", and the UI renders
+    /// the two differently on purpose.
+    /// </remarks>
+    public void MarkApplied(Guid id, DateTimeOffset? confirmedAtUtc)
+    {
+        var index = _rules.FindIndex(r => r.Id == id);
+        if (index < 0)
+        {
+            return;
+        }
+
+        _rules[index] = _rules[index] with { AppliedAtUtc = confirmedAtUtc ?? DateTimeOffset.UtcNow };
         Changed?.Invoke(this, EventArgs.Empty);
     }
 

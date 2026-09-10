@@ -89,12 +89,13 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
         return ToApplyResult(response);
     }
 
-    public async Task<ProxyProbeResult> ProbeProxyAsync(ProxyEndpoint endpoint, CancellationToken cancellationToken = default)
+    public async Task<ProxyProbeResult> ProbeProxyAsync(
+        ProxyEndpoint endpoint, string? password, CancellationToken cancellationToken = default)
     {
         var response = await SendAsync(new IpcRequest
         {
             Op = "probe-proxy",
-            Proxy = ProxyDto.From(endpoint, null),
+            Proxy = ProxyDto.From(endpoint, password),
         }, cancellationToken).ConfigureAwait(false);
 
         if (!response.Ok || response.Probe is null)

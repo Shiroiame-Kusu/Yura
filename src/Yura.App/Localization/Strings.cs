@@ -173,6 +173,9 @@ internal static class Strings
         ["Proxy.TestPassed"] = "Reachable in {0} ms",
         ["Proxy.TestFailed"] = "Could not reach the proxy",
         ["Proxy.Hint"] = "Yura does not run a proxy for you. Point it at one you already run.",
+        ["Proxy.SecretHint"] = "The password is saved in {0}, never in the configuration file.",
+        ["Proxy.SecretHintUnavailable"] =
+            "No desktop secret service was found, so the password is kept for this session only. It is never written to the configuration file.",
 
         ["Proxy.Validation.NameRequired"] = "Enter a name so you can recognise this proxy.",
         ["Proxy.Validation.NameDuplicate"] = "Another proxy already uses this name.",
@@ -332,6 +335,9 @@ internal static class Strings
         ["Proxy.TestPassed"] = "可达，用时 {0} 毫秒",
         ["Proxy.TestFailed"] = "无法连接到代理",
         ["Proxy.Hint"] = "Yura 不会为你运行代理，请指向你已在运行的代理。",
+        ["Proxy.SecretHint"] = "密码保存在{0}，不会写入配置文件。",
+        ["Proxy.SecretHintUnavailable"] = "未找到桌面密钥服务，密码仅在本次会话中保留，且不会写入配置文件。",
+        ["Proxy.SecretStore"] = "桌面密钥服务",
 
         ["Proxy.Validation.NameRequired"] = "请输入名称，以便识别此代理。",
         ["Proxy.Validation.NameDuplicate"] = "已有同名代理。",

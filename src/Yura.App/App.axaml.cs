@@ -26,12 +26,22 @@ public sealed partial class YuraApplication : Application
                 ? new SimulatedDaemonClient()
                 : new UnixSocketDaemonClient();
 
+            // Design review and screenshots must never touch the real configuration: they
+            // would otherwise overwrite the user's proxies with demo data.
+            var isolated = options.Demo || options.ScreenshotMode;
+            var config = options.ConfigDirectory is { Length: > 0 } explicitDirectory
+                ? new ConfigStore(explicitDirectory)
+                : isolated
+                    ? new ConfigStore(Path.Combine(Path.GetTempPath(), $"yura-scratch-{Environment.ProcessId}"))
+                    : new ConfigStore();
+            ISecretStore secrets = isolated ? new InMemorySecretStore() : new SecretToolSecretStore();
+
             Loc.Current.Language = options.Language;
             RequestedThemeVariant = options.Theme.Equals("light", StringComparison.OrdinalIgnoreCase)
                 ? ThemeVariant.Light
                 : ThemeVariant.Dark;
 
-            var shell = new ShellViewModel(daemon)
+            var shell = new ShellViewModel(daemon, secrets, config)
             {
                 IsDarkTheme = !options.Theme.Equals("light", StringComparison.OrdinalIgnoreCase),
                 IsChinese = options.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase),
@@ -55,6 +65,9 @@ public sealed partial class YuraApplication : Application
             _ = shell.RefreshDaemonStateAsync();
 
             var window = new MainWindow { DataContext = shell };
+
+            // Flush any debounced change before the process goes away.
+            desktop.ShutdownRequested += (_, _) => shell.SaveConfigurationAsync().GetAwaiter().GetResult();
             if (options.ScreenshotMode)
             {
                 window.Width = options.Width;

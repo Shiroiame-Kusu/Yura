@@ -264,6 +264,50 @@ public sealed class RuleRuntime : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Migrates newly started processes into the slots whose selectors now cover them.
+    /// </summary>
+    /// <remarks>
+    /// This is what makes a persistent executable rule mean anything: the rule is installed
+    /// once, but the processes it covers come and go. Instance slots are skipped — their
+    /// membership is fixed by definition.
+    ///
+    /// Polling is a stand-in for a netlink process-event watcher, and it has a real limit: a
+    /// socket's cgroup is fixed when the socket is created, so a process that starts and
+    /// connects inside one poll interval is missed. Long-lived applications — the case this
+    /// feature exists for — are caught. Short-lived ones need the watcher.
+    /// </remarks>
+    public async Task<int> RefreshMembershipAsync(CancellationToken ct = default)
+    {
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var dynamicSlots = _installedSlots
+                .Where(s => s.UsesCgroup && s.Rule.Process.Kind != ProcessSelectorKind.Instance)
+                .ToList();
+
+            if (dynamicSlots.Count == 0)
+            {
+                return 0;
+            }
+
+            var snapshot = _processes.Enumerate();
+            var warnings = new List<string>();
+            var migrated = dynamicSlots.Sum(slot => MigrateMembers(slot, snapshot, warnings));
+
+            if (migrated > 0)
+            {
+                _log($"membership sweep migrated {migrated} newly started process(es)");
+            }
+
+            return migrated;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     // -- reconciliation ------------------------------------------------------
 
     /// <summary>Makes the kernel match the current rule and proxy lists. Caller holds the gate.</summary>

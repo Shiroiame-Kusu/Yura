@@ -132,14 +132,18 @@ internal static class Program
         using var sigint = PosixSignalRegistration.Create(
             PosixSignal.SIGINT, ctx => { ctx.Cancel = true; shutdown.Cancel(); });
 
-        // Until the process-event watcher lands, instance rules expire on a short poll.
-        var expiry = Task.Run(async () =>
+        // Until the netlink process-event watcher lands, both halves of process tracking are
+        // polled: instance rules expiring, and executable rules picking up new processes.
+        // The interval is short because a process that connects before it is migrated keeps
+        // the route it started with — a socket's cgroup is fixed at creation.
+        var sweep = Task.Run(async () =>
         {
             while (!shutdown.IsCancellationRequested)
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(2), shutdown.Token).ConfigureAwait(false);
+                    await Task.Delay(TimeSpan.FromMilliseconds(500), shutdown.Token).ConfigureAwait(false);
+                    await runtime.RefreshMembershipAsync(shutdown.Token).ConfigureAwait(false);
                     await runtime.ExpireDeadInstancesAsync(shutdown.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
@@ -148,7 +152,7 @@ internal static class Program
                 }
                 catch (Exception e)
                 {
-                    Log($"expiry sweep failed: {e.Message}");
+                    Log($"process sweep failed: {e.Message}");
                 }
             }
         });
@@ -163,7 +167,7 @@ internal static class Program
         }
 
         Log("shutting down");
-        await expiry.ConfigureAwait(false);
+        await sweep.ConfigureAwait(false);
         await runtime.TeardownAsync().ConfigureAwait(false);
         await routing.RemoveAsync().ConfigureAwait(false);
         routing.RestoreSysctls();

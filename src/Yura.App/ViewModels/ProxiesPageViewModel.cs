@@ -15,11 +15,11 @@ public sealed partial class ProxiesPageViewModel : ObservableObject
     private readonly RuleStore _rules;
     private readonly IDaemonClient _daemon;
 
-    public ProxiesPageViewModel(RuleStore rules, IDaemonClient daemon)
+    public ProxiesPageViewModel(RuleStore rules, IDaemonClient daemon, ISecretStore secrets)
     {
         _rules = rules;
         _daemon = daemon;
-        Editor = new ProxyEditorViewModel(rules, daemon);
+        Editor = new ProxyEditorViewModel(rules, daemon, secrets);
     }
 
     public ObservableCollection<ProxyEndpoint> Proxies => _rules.Proxies;
@@ -45,15 +45,36 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
 {
     private readonly RuleStore _rules;
     private readonly IDaemonClient _daemon;
+    private readonly ISecretStore _secrets;
     private readonly HashSet<string> _touched = [];
-    private Guid? _editingId;
+    private Guid _editingId = Guid.NewGuid();
+    private bool _isNew = true;
     private CancellationTokenSource? _testCts;
+    private bool _passwordAlreadyStored;
 
-    public ProxyEditorViewModel(RuleStore rules, IDaemonClient daemon)
+    public ProxyEditorViewModel(RuleStore rules, IDaemonClient daemon, ISecretStore secrets)
     {
         _rules = rules;
         _daemon = daemon;
+        _secrets = secrets;
     }
+
+    /// <summary>
+    /// Where passwords are kept, stated in the UI rather than assumed. A missing secret
+    /// service is a different sentence, not the same sentence with an awkward clause
+    /// wedged into it.
+    /// </summary>
+    public string SecretStoreDescription => _secrets.IsAvailable
+        ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Proxy.SecretHint"],
+            Loc.Current.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+                ? Loc.Current["Proxy.SecretStore"]
+                : _secrets.Description)
+        : Loc.Current["Proxy.SecretHintUnavailable"];
+
+    /// <summary>Shown when a saved password exists but is not displayed back.</summary>
+    public string PasswordPlaceholder => _passwordAlreadyStored
+        ? "Saved — leave blank to keep"
+        : Loc.Current["Proxy.Optional"];
 
     public IReadOnlyList<ProxyProtocol> Protocols { get; } =
         [ProxyProtocol.Socks5, ProxyProtocol.Http, ProxyProtocol.Https];
@@ -61,7 +82,7 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
     [ObservableProperty]
     public partial bool IsOpen { get; set; }
 
-    public string Title => _editingId is null
+    public string Title => _isNew
         ? Loc.Current["Proxy.Editor.TitleNew"]
         : Loc.Current["Proxy.Editor.TitleEdit"];
 
@@ -192,7 +213,10 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
 
     public void BeginAdd()
     {
-        _editingId = null;
+        // Allocated now, not at save time, so the password can be stored against the same
+        // id the endpoint will carry.
+        _editingId = Guid.NewGuid();
+        _isNew = true;
         _touched.Clear();
         Name = string.Empty;
         Protocol = ProxyProtocol.Socks5;
@@ -200,15 +224,18 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         Port = "1080";
         Username = string.Empty;
         Password = string.Empty;
+        _passwordAlreadyStored = false;
         ShowAdvanced = false;
         ClearTest();
         IsOpen = true;
         OnPropertyChanged(nameof(Title));
+        OnPropertyChanged(nameof(PasswordPlaceholder));
     }
 
     public void BeginEdit(ProxyEndpoint endpoint)
     {
         _editingId = endpoint.Id;
+        _isNew = false;
         _touched.Clear();
         Name = endpoint.Name;
         Protocol = endpoint.Protocol;
@@ -216,6 +243,8 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         Port = endpoint.Port.ToString(CultureInfo.InvariantCulture);
         Username = endpoint.Username ?? string.Empty;
         Password = string.Empty; // Never round-trips through the UI.
+        _passwordAlreadyStored = endpoint.PasswordRef is not null;
+        OnPropertyChanged(nameof(PasswordPlaceholder));
         ShowAdvanced = false;
         ClearTest();
         IsOpen = true;
@@ -243,7 +272,11 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
 
         try
         {
-            var result = await _daemon.ProbeProxyAsync(Build(), token).ConfigureAwait(true);
+            var endpoint = Build();
+            var password = !string.IsNullOrEmpty(Password)
+                ? Password
+                : await _secrets.GetAsync(endpoint.Id.ToString(), token).ConfigureAwait(true);
+            var result = await _daemon.ProbeProxyAsync(endpoint, password, token).ConfigureAwait(true);
             if (token.IsCancellationRequested)
             {
                 return;
@@ -268,7 +301,7 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
     }
 
     [RelayCommand]
-    private void Save()
+    private async Task SaveAsync()
     {
         // Mark everything touched so a click on a disabled-looking form surfaces every
         // problem at once rather than one at a time.
@@ -279,6 +312,14 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         }
 
         var endpoint = Build();
+
+        // The password goes to the secret store, never into the configuration file. An
+        // empty box on an existing proxy means "keep what is saved", not "clear it".
+        if (!string.IsNullOrEmpty(Password))
+        {
+            await _secrets.SetAsync(endpoint.Id.ToString(), Password).ConfigureAwait(true);
+        }
+
         var existing = _rules.Proxies.FirstOrDefault(p => p.Id == endpoint.Id);
         if (existing is not null)
         {
@@ -301,13 +342,16 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
 
     private ProxyEndpoint Build() => new()
     {
-        Id = _editingId ?? Guid.NewGuid(),
+        Id = _editingId,
         Name = Name.Trim(),
         Protocol = Protocol,
         Host = Host.Trim(),
         Port = ushort.TryParse(Port.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var p) ? p : (ushort)0,
         Username = string.IsNullOrWhiteSpace(Username) ? null : Username.Trim(),
-        PasswordRef = string.IsNullOrEmpty(Password) ? null : $"secret:{Name.Trim()}",
+        // Keyed on the id, not the name: renaming a proxy must not orphan its password.
+        PasswordRef = string.IsNullOrEmpty(Password) && !_passwordAlreadyStored
+            ? null
+            : _editingId.ToString(),
     };
 
     private void ClearTest()

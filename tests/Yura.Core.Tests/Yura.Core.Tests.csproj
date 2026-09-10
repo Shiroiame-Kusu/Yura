@@ -15,6 +15,9 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/Yura.Core/Yura.Core.csproj" />
+    <!-- The configuration layer lives in the app because the app owns ~/.config/Yura; the
+         daemon runs as root and must not write there. -->
+    <ProjectReference Include="../../src/Yura.App/Yura.App.csproj" />
   </ItemGroup>
 
 </Project>

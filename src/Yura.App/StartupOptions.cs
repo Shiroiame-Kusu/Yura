@@ -28,6 +28,12 @@ public sealed record StartupOptions
     /// </remarks>
     public bool Demo { get; init; }
 
+    /// <summary>
+    /// Override the configuration directory. Used by the verification harness to load a
+    /// seeded configuration without touching the real one.
+    /// </summary>
+    public string? ConfigDirectory { get; init; }
+
     public static StartupOptions Parse(string[] args)
     {
         var options = new StartupOptions();
@@ -58,6 +64,9 @@ public sealed record StartupOptions
                     break;
                 case "--page" when i + 1 < args.Length:
                     options = options with { Page = args[++i] };
+                    break;
+                case "--config-dir" when i + 1 < args.Length:
+                    options = options with { ConfigDirectory = args[++i] };
                     break;
             }
         }

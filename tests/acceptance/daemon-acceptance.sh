@@ -255,6 +255,30 @@ sleep 6
 check "8: curl children forked after the rule are proxied" bash -c "n=\$(grep -c '$MARK_A' '$RUN/tree.out'); [[ \$n -ge 2 ]] && echo \"\$n child curls received the marker\""
 
 # ---------------------------------------------------------------------------
+step "Acceptance 3: a persistent executable rule covers instances started later"
+# A private copy of curl, so the rule names a path nothing else on the machine uses.
+TESTAPP="$RUN/yura-testapp"
+cp /usr/bin/curl "$TESTAPP"; chmod 755 "$TESTAPP"
+RULE_E="44444444-0000-4000-8000-000000000004"
+BOOT="$(cat /proc/sys/kernel/random/boot_id)"
+# Applied while NOTHING is running: the rule has to reach into the future to mean anything.
+check "daemon applies an executable rule before any instance exists" ctl apply-rule   "{\"rule\":{\"id\":\"$RULE_E\",\"order\":103,\"name\":\"testapp via proxy A\",\"enabled\":true,\"origin\":\"manual\",\"lifetime\":\"persistent\",\"createdAtUtc\":\"2026-09-10T00:00:00Z\",\"processKind\":\"executablePath\",\"executablePath\":\"$TESTAPP\",\"descendants\":\"exclude\",\"protocol\":\"any\",\"action\":\"proxy\",\"proxyId\":\"$PROXY_A_ID\"}}"
+sleep 1
+# One long-lived process making a sequence of connections: the membership sweep migrates it,
+# and every connection it opens after that must be proxied.
+as_user "$TESTAPP" -s --max-time 3 \
+  $(for _ in $(seq 1 12); do printf 'http://%s:8080/ ' "$UNREACHABLE"; done) \
+  > "$RUN/testapp.out" 2>&1 &
+BG+=($!)
+sleep 12
+# grep -c counts matching LINES; curl concatenates its responses without newlines, so
+# occurrences have to be counted with grep -o.
+check "3: an instance started after the rule is proxied" bash -c "
+  n=\$(grep -o '$MARK_A' '$RUN/testapp.out' | wc -l)
+  [[ \$n -ge 2 ]] && echo \"\$n of the new instance's connections received proxy A's marker\""
+check "3: the rule survives in the daemon's rule list" bash -c "'$DAEMON' ctl --socket '$SOCK' list-rules | grep -q '$RULE_E' && echo listed"
+
+# ---------------------------------------------------------------------------
 step "Acceptance 4: instance rule expires when its process exits"
 check "rule A is listed while A runs" bash -c "'$DAEMON' ctl --socket '$SOCK' list-rules | grep -q '$RULE_A' && echo listed"
 SLOT_DIR="$( { grep -l "^${PID_A}\$" /sys/fs/cgroup/yura/*/cgroup.procs 2>/dev/null || true; } | head -1 | xargs -r dirname)"

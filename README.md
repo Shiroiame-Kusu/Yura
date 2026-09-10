@@ -85,6 +85,8 @@ Useful flags:
 | `--page processes\|games\|proxies` | Start on a page |
 | `--demo` | Populate from a **simulated** daemon, for design review only |
 | `--font-report` | Print what Avalonia's font manager actually resolves |
+| `--config-report` | Print where configuration and secrets are stored |
+| `--config-dir DIR` | Use a different configuration directory |
 
 ## The routing spike
 
@@ -137,10 +139,20 @@ yura-daemon ctl connection-counts
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-29 checks against a controlled network on a dummy interface, where each marker payload is
-reachable only through one specific proxy. **29 passed, 0 failed.** Mandatory acceptance
-tests 1, 2, 4, 5, 6, 7, 8 and 11 are verified; see
+32 checks against a controlled network on a dummy interface, where each marker payload is
+reachable only through one specific proxy. **32 passed, 0 failed.** Mandatory acceptance
+tests 1, 2, 3, 4, 5, 6, 7, 8 (inclusion) and 11 are verified; see
 [docs/daemon-acceptance.md](docs/daemon-acceptance.md) for what is not.
+
+## Configuration
+
+Settings, proxies and persistent rules live in **`~/.config/Yura/config.json`**
+(`$XDG_CONFIG_HOME` is honoured). Passwords are kept in the desktop secret service, never in
+that file. See [docs/configuration.md](docs/configuration.md).
+
+```bash
+dotnet run --project src/Yura.App -- --config-report
+```
 
 ## Design system
 
@@ -175,13 +187,14 @@ All 52 required foreground/background pairs meet their target in both themes.
   peer-credential-authorised IPC server
 - The app driving the real daemon over its socket, including live per-process connection
   counts
+- Configuration under `~/.config/Yura`, with passwords in the desktop secret service and
+  persistent rules reapplied to the daemon on every connection
 
 **Not yet built**
 
-- Configuration persistence: rules and proxies live in memory and are lost on restart,
-  so acceptance test 3 (a persistent executable rule surviving a restart) is not met
-- The process-event watcher. Persistent rules only cover processes running when the rule is
-  applied, and child *exclusion* is unimplemented
+- The netlink process-event watcher. New processes are picked up by a 500 ms poll, so a
+  process that starts *and connects* within one interval keeps its original route; child
+  *exclusion* is also unimplemented
 - Connections, Rules, Diagnostics and Settings pages
 - Proxy chains, and IPv6 in the UDP path
 

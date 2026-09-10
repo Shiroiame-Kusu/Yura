@@ -121,10 +121,13 @@
               <StackPanel Grid.Column="2">
                 <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Password}" />
                 <TextBox Text="{Binding Password}" PasswordChar="•"
-                         PlaceholderText="{loc:Tr Proxy.Optional}"
+                         PlaceholderText="{Binding PasswordPlaceholder}"
                          AutomationProperties.Name="{loc:Tr Proxy.Password}" />
               </StackPanel>
             </Grid>
+
+            <!-- Where the password actually goes, stated rather than assumed. -->
+            <TextBlock Classes="FieldHint" Text="{Binding SecretStoreDescription}" />
 
             <Expander Header="{loc:Tr Proxy.Advanced}" IsExpanded="{Binding ShowAdvanced}">
               <TextBlock Classes="FieldHint" Text="{loc:Tr Proxy.AdvancedHint}" />

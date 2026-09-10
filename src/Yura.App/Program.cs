@@ -17,6 +17,11 @@ internal static class Program
             return FontReport.Run(args.Contains("--verbose"));
         }
 
+        if (args.Contains("--config-report"))
+        {
+            return ConfigReport.Run();
+        }
+
         return BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
     }
 
