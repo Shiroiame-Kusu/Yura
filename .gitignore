@@ -1,0 +1,15 @@
+bin/
+obj/
+artifacts/
+*.user
+.vs/
+.idea/
+.vscode/
+
+# Local runtime state produced by the spike harness and the daemon.
+spikes/.run/
+/tmp-yura/
+
+# Screenshots produced by the UI verification harness are committed on purpose;
+# intermediate captures are not.
+docs/screenshots/.scratch/

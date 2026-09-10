@@ -1,0 +1,276 @@
+<!--
+  Yura control styles.
+
+  These sit on top of FluentAvalonia and only adjust density, colour and typography. Where
+  a FluentAvalonia control already behaves correctly it is left alone, so the application
+  inherits its accessibility and keyboard behaviour rather than reimplementing it.
+-->
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:views="using:Yura.App.Views">
+
+  <Design.PreviewWith>
+    <Border Padding="24" Background="{DynamicResource YuraSurfaceBase}">
+      <StackPanel Spacing="12" Width="360">
+        <TextBlock Classes="PageTitle" Text="Page title" />
+        <TextBlock Classes="Subtitle" Text="Supporting sentence for the page." />
+        <TextBlock Text="Body text" />
+        <TextBlock Classes="Mono" Text="/usr/lib/wine/wine64-preloader" />
+        <TextBlock Classes="Metric" Text="128.5 ms" />
+        <TextBlock Classes="Caption" Text="Caption" />
+      </StackPanel>
+    </Border>
+  </Design.PreviewWith>
+
+  <!-- ============================ Typography ============================ -->
+
+  <Style Selector="TextBlock">
+    <Setter Property="FontFamily" Value="{DynamicResource YuraFontUi}" />
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeBody}" />
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextPrimary}" />
+    <Setter Property="TextWrapping" Value="NoWrap" />
+  </Style>
+
+  <Style Selector="TextBlock.PageTitle">
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeTitle}" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+  </Style>
+
+  <Style Selector="TextBlock.SectionTitle">
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeSubtitle}" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+  </Style>
+
+  <Style Selector="TextBlock.Subtitle">
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextSecondary}" />
+    <Setter Property="TextWrapping" Value="Wrap" />
+  </Style>
+
+  <Style Selector="TextBlock.Caption">
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeCaption}" />
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextTertiary}" />
+  </Style>
+
+  <Style Selector="TextBlock.Secondary">
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextSecondary}" />
+  </Style>
+
+  <Style Selector="TextBlock.Tertiary">
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextTertiary}" />
+  </Style>
+
+  <!-- Addresses, paths and identifiers: monospace so columns of them align and so an
+       IPv6 literal cannot be misread. -->
+  <Style Selector="TextBlock.Mono">
+    <Setter Property="FontFamily" Value="{DynamicResource YuraFontMono}" />
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeSmall}" />
+    <!-- Pinned explicitly: without it the Linux font stack resolves an oblique face for
+         the monospace family, which makes every path in the table look italic. -->
+    <Setter Property="FontStyle" Value="Normal" />
+  </Style>
+
+  <!-- A value the application could not determine. Styled as a class rather than through a
+       converter so it re-resolves when the theme changes. -->
+  <Style Selector="TextBlock.Unavailable">
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextDisabled}" />
+    <Setter Property="FontStyle" Value="Italic" />
+  </Style>
+
+  <!-- Daemon connection dot. Always accompanied by a text label; colour alone never
+       carries the meaning. -->
+  <Style Selector="Ellipse.StatusDot">
+    <Setter Property="Fill" Value="{DynamicResource YuraNeutralState}" />
+  </Style>
+
+  <Style Selector="Ellipse.StatusDot.Connected">
+    <Setter Property="Fill" Value="{DynamicResource YuraSuccess}" />
+  </Style>
+
+  <!-- Changing numbers: tabular figures stop the column width jittering as values change. -->
+  <Style Selector="TextBlock.Metric">
+    <Setter Property="FontFeatures" Value="tnum=1" />
+  </Style>
+
+  <Style Selector="TextBlock.Numeric">
+    <Setter Property="FontFeatures" Value="tnum=1" />
+    <Setter Property="HorizontalAlignment" Value="Right" />
+  </Style>
+
+  <!-- ============================= Surfaces ============================= -->
+
+  <Style Selector="Border.Panel">
+    <Setter Property="Background" Value="{DynamicResource YuraSurfaceRaised}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource YuraBorderSubtle}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="{DynamicResource YuraRadiusMd}" />
+  </Style>
+
+  <Style Selector="Border.Sunken">
+    <Setter Property="Background" Value="{DynamicResource YuraSurfaceSunken}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource YuraBorderSubtle}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="{DynamicResource YuraRadiusMd}" />
+  </Style>
+
+  <Style Selector="Border.Divider">
+    <Setter Property="Background" Value="{DynamicResource YuraBorderSubtle}" />
+    <Setter Property="Height" Value="1" />
+  </Style>
+
+  <!-- ============================== Badges ==============================
+       Every badge pairs colour with a text label; colour alone never carries meaning. -->
+
+  <Style Selector="Border.Badge">
+    <Setter Property="CornerRadius" Value="{DynamicResource YuraRadiusSm}" />
+    <Setter Property="Padding" Value="6,1" />
+    <Setter Property="VerticalAlignment" Value="Center" />
+    <Setter Property="Background" Value="{DynamicResource YuraSurfaceHover}" />
+  </Style>
+
+  <Style Selector="Border.Badge > TextBlock">
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeCaption}" />
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextSecondary}" />
+  </Style>
+
+  <Style Selector="Border.Badge.Success">
+    <Setter Property="Background" Value="{DynamicResource YuraSuccessSubtle}" />
+  </Style>
+  <Style Selector="Border.Badge.Success > TextBlock">
+    <Setter Property="Foreground" Value="{DynamicResource YuraSuccess}" />
+  </Style>
+
+  <Style Selector="Border.Badge.Warning">
+    <Setter Property="Background" Value="{DynamicResource YuraWarningSubtle}" />
+  </Style>
+  <Style Selector="Border.Badge.Warning > TextBlock">
+    <Setter Property="Foreground" Value="{DynamicResource YuraWarning}" />
+  </Style>
+
+  <Style Selector="Border.Badge.Danger">
+    <Setter Property="Background" Value="{DynamicResource YuraDangerSubtle}" />
+  </Style>
+  <Style Selector="Border.Badge.Danger > TextBlock">
+    <Setter Property="Foreground" Value="{DynamicResource YuraDanger}" />
+  </Style>
+
+  <Style Selector="Border.Badge.Accent">
+    <Setter Property="Background" Value="{DynamicResource YuraAccentSubtle}" />
+  </Style>
+  <Style Selector="Border.Badge.Accent > TextBlock">
+    <Setter Property="Foreground" Value="{DynamicResource YuraAccentText}" />
+  </Style>
+
+  <!-- ============================== Inputs ============================== -->
+
+  <Style Selector="TextBox">
+    <Setter Property="FontFamily" Value="{DynamicResource YuraFontUi}" />
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeBody}" />
+    <Setter Property="MinHeight" Value="{DynamicResource YuraControlHeightMd}" />
+    <Setter Property="CornerRadius" Value="{DynamicResource YuraRadiusSm}" />
+  </Style>
+
+  <Style Selector="TextBox.Invalid">
+    <Setter Property="BorderBrush" Value="{DynamicResource YuraDanger}" />
+    <Setter Property="BorderThickness" Value="1.5" />
+  </Style>
+
+  <Style Selector="ComboBox">
+    <Setter Property="FontFamily" Value="{DynamicResource YuraFontUi}" />
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeBody}" />
+    <Setter Property="MinHeight" Value="{DynamicResource YuraControlHeightMd}" />
+    <Setter Property="CornerRadius" Value="{DynamicResource YuraRadiusSm}" />
+  </Style>
+
+  <Style Selector="Button">
+    <Setter Property="FontFamily" Value="{DynamicResource YuraFontUi}" />
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeBody}" />
+    <Setter Property="MinHeight" Value="{DynamicResource YuraControlHeightMd}" />
+    <Setter Property="CornerRadius" Value="{DynamicResource YuraRadiusSm}" />
+    <Setter Property="Padding" Value="14,0" />
+  </Style>
+
+  <Style Selector="CheckBox">
+    <Setter Property="FontFamily" Value="{DynamicResource YuraFontUi}" />
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeBody}" />
+  </Style>
+
+  <Style Selector="RadioButton">
+    <Setter Property="FontFamily" Value="{DynamicResource YuraFontUi}" />
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeBody}" />
+  </Style>
+
+  <!-- Field label: every input has one, visible, above the control. -->
+  <Style Selector="TextBlock.FieldLabel">
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeSmall}" />
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextSecondary}" />
+    <Setter Property="Margin" Value="0,0,0,4" />
+  </Style>
+
+  <Style Selector="TextBlock.FieldError">
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeCaption}" />
+    <Setter Property="Foreground" Value="{DynamicResource YuraDanger}" />
+    <Setter Property="TextWrapping" Value="Wrap" />
+    <Setter Property="Margin" Value="0,4,0,0" />
+  </Style>
+
+  <Style Selector="TextBlock.FieldHint">
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeCaption}" />
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextTertiary}" />
+    <Setter Property="TextWrapping" Value="Wrap" />
+    <Setter Property="Margin" Value="0,4,0,0" />
+  </Style>
+
+  <!-- A panel that floats above other content earns a shadow; a docked one does not.
+       This is the only shadow in the application. -->
+  <Style Selector="views|ProcessInspector.Floating > Border">
+    <Setter Property="BoxShadow" Value="-10 0 28 0 #55000000" />
+  </Style>
+
+  <!-- ========================== Navigation rail ========================== -->
+
+  <Style Selector="ListBox.Nav > ListBoxItem">
+    <Setter Property="Padding" Value="10,0" />
+    <Setter Property="MinHeight" Value="36" />
+    <Setter Property="CornerRadius" Value="{DynamicResource YuraRadiusSm}" />
+    <Setter Property="Margin" Value="0,1" />
+  </Style>
+
+  <Style Selector="ListBox.Nav > ListBoxItem:selected /template/ ContentPresenter">
+    <Setter Property="Background" Value="{DynamicResource YuraAccentSubtle}" />
+  </Style>
+
+  <Style Selector="ListBox.Nav > ListBoxItem:selected TextBlock">
+    <Setter Property="Foreground" Value="{DynamicResource YuraAccentText}" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+  </Style>
+
+  <!-- ============================ Table rows ============================ -->
+
+  <Style Selector="ListBox.Table">
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderThickness" Value="0" />
+    <Setter Property="Padding" Value="0" />
+  </Style>
+
+  <Style Selector="ListBox.Table > ListBoxItem">
+    <Setter Property="Padding" Value="0" />
+    <Setter Property="MinHeight" Value="{DynamicResource YuraRowHeight}" />
+    <Setter Property="CornerRadius" Value="0" />
+    <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+  </Style>
+
+  <Style Selector="Border.ColumnHeader">
+    <Setter Property="Background" Value="{DynamicResource YuraSurfaceRaised}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource YuraBorderSubtle}" />
+    <Setter Property="BorderThickness" Value="0,0,0,1" />
+    <Setter Property="Height" Value="30" />
+  </Style>
+
+  <Style Selector="Border.ColumnHeader TextBlock">
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeCaption}" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextTertiary}" />
+    <Setter Property="VerticalAlignment" Value="Center" />
+  </Style>
+
+</Styles>

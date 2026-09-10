@@ -1,0 +1,195 @@
+<!--
+  Yura design tokens.
+
+  Every colour, size, radius and duration used anywhere in the application is named here.
+  Views reference tokens, never literals, so density and contrast can be tuned in one place
+  and so light and dark stay in step.
+
+  Direction: graphite/slate neutrals, one restrained teal accent, semantic colour reserved
+  strictly for success / warning / failure. Surfaces are fully opaque — acrylic and mica
+  are unreliable across Linux compositors and would make operational text harder to read.
+-->
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="using:System">
+
+  <ResourceDictionary.ThemeDictionaries>
+
+    <!-- ============================ DARK ============================ -->
+    <ResourceDictionary x:Key="Dark">
+      <!-- Surfaces, from furthest back to closest to the user. -->
+      <Color x:Key="YuraSurfaceSunkenColor">#101215</Color>
+      <Color x:Key="YuraSurfaceBaseColor">#16181C</Color>
+      <Color x:Key="YuraSurfaceRaisedColor">#1C1F24</Color>
+      <Color x:Key="YuraSurfaceOverlayColor">#23272E</Color>
+      <Color x:Key="YuraSurfaceHoverColor">#242830</Color>
+      <Color x:Key="YuraSurfaceSelectedColor">#1E3A3A</Color>
+
+      <Color x:Key="YuraBorderSubtleColor">#2A2F37</Color>
+      <Color x:Key="YuraBorderStrongColor">#3B434E</Color>
+      <!-- Distinct from BorderStrong: this one outlines interactive controls, where the
+           boundary is what identifies the control, so it must clear 3:1. Dividers and
+           panel edges stay deliberately subtle. -->
+      <Color x:Key="YuraBorderControlColor">#6B7480</Color>
+
+      <!-- Text. Primary/secondary/tertiary are all >= 4.5:1 on SurfaceBase. -->
+      <Color x:Key="YuraTextPrimaryColor">#E7EAEE</Color>
+      <Color x:Key="YuraTextSecondaryColor">#AEB8C4</Color>
+      <Color x:Key="YuraTextTertiaryColor">#8B95A1</Color>
+      <Color x:Key="YuraTextDisabledColor">#5C6675</Color>
+      <Color x:Key="YuraTextOnAccentColor">#08201F</Color>
+
+      <!-- Accent. 'Accent' fills; 'AccentText' is the readable-on-dark variant. -->
+      <Color x:Key="YuraAccentColor">#2FA79F</Color>
+      <Color x:Key="YuraAccentHoverColor">#39BDB4</Color>
+      <Color x:Key="YuraAccentPressedColor">#268B85</Color>
+      <Color x:Key="YuraAccentTextColor">#5CD0C7</Color>
+      <Color x:Key="YuraAccentSubtleColor">#17322F</Color>
+
+      <!-- Semantic. Reserved for state, never decoration. -->
+      <Color x:Key="YuraSuccessColor">#4CC168</Color>
+      <Color x:Key="YuraSuccessSubtleColor">#14301C</Color>
+      <Color x:Key="YuraWarningColor">#E0A62F</Color>
+      <Color x:Key="YuraWarningSubtleColor">#332711</Color>
+      <Color x:Key="YuraDangerColor">#F0625A</Color>
+      <Color x:Key="YuraDangerSubtleColor">#3A1A18</Color>
+      <Color x:Key="YuraNeutralStateColor">#98A3B0</Color>
+
+      <Color x:Key="YuraFocusColor">#6FDCD3</Color>
+      <Color x:Key="YuraShadowColor">#00000099</Color>
+    </ResourceDictionary>
+
+    <!-- ============================ LIGHT =========================== -->
+    <ResourceDictionary x:Key="Light">
+      <Color x:Key="YuraSurfaceSunkenColor">#EAEDF1</Color>
+      <Color x:Key="YuraSurfaceBaseColor">#F3F5F8</Color>
+      <Color x:Key="YuraSurfaceRaisedColor">#FFFFFF</Color>
+      <Color x:Key="YuraSurfaceOverlayColor">#FFFFFF</Color>
+      <Color x:Key="YuraSurfaceHoverColor">#E8ECF1</Color>
+      <Color x:Key="YuraSurfaceSelectedColor">#DDEFED</Color>
+
+      <Color x:Key="YuraBorderSubtleColor">#DCE1E7</Color>
+      <Color x:Key="YuraBorderStrongColor">#B9C2CC</Color>
+      <Color x:Key="YuraBorderControlColor">#7C8590</Color>
+
+      <Color x:Key="YuraTextPrimaryColor">#15181D</Color>
+      <Color x:Key="YuraTextSecondaryColor">#4C5663</Color>
+      <Color x:Key="YuraTextTertiaryColor">#5F6975</Color>
+      <Color x:Key="YuraTextDisabledColor">#98A1AC</Color>
+      <Color x:Key="YuraTextOnAccentColor">#FFFFFF</Color>
+
+      <Color x:Key="YuraAccentColor">#0F7D75</Color>
+      <Color x:Key="YuraAccentHoverColor">#0C6A63</Color>
+      <Color x:Key="YuraAccentPressedColor">#095852</Color>
+      <Color x:Key="YuraAccentTextColor">#0B6A63</Color>
+      <Color x:Key="YuraAccentSubtleColor">#DFF1EF</Color>
+
+      <Color x:Key="YuraSuccessColor">#127031</Color>
+      <Color x:Key="YuraSuccessSubtleColor">#DEF3E3</Color>
+      <Color x:Key="YuraWarningColor">#7A5300</Color>
+      <Color x:Key="YuraWarningSubtleColor">#FAEFD5</Color>
+      <Color x:Key="YuraDangerColor">#B3251C</Color>
+      <Color x:Key="YuraDangerSubtleColor">#FBE3E1</Color>
+      <Color x:Key="YuraNeutralStateColor">#5A6472</Color>
+
+      <Color x:Key="YuraFocusColor">#0B6A63</Color>
+      <Color x:Key="YuraShadowColor">#1A0B121C</Color>
+    </ResourceDictionary>
+  </ResourceDictionary.ThemeDictionaries>
+
+  <!-- ================= Brushes (theme-resolved at runtime) ================= -->
+  <SolidColorBrush x:Key="YuraSurfaceSunken" Color="{DynamicResource YuraSurfaceSunkenColor}" />
+  <SolidColorBrush x:Key="YuraSurfaceBase" Color="{DynamicResource YuraSurfaceBaseColor}" />
+  <SolidColorBrush x:Key="YuraSurfaceRaised" Color="{DynamicResource YuraSurfaceRaisedColor}" />
+  <SolidColorBrush x:Key="YuraSurfaceOverlay" Color="{DynamicResource YuraSurfaceOverlayColor}" />
+  <SolidColorBrush x:Key="YuraSurfaceHover" Color="{DynamicResource YuraSurfaceHoverColor}" />
+  <SolidColorBrush x:Key="YuraSurfaceSelected" Color="{DynamicResource YuraSurfaceSelectedColor}" />
+
+  <SolidColorBrush x:Key="YuraBorderSubtle" Color="{DynamicResource YuraBorderSubtleColor}" />
+  <SolidColorBrush x:Key="YuraBorderStrong" Color="{DynamicResource YuraBorderStrongColor}" />
+  <SolidColorBrush x:Key="YuraBorderControl" Color="{DynamicResource YuraBorderControlColor}" />
+
+  <SolidColorBrush x:Key="YuraTextPrimary" Color="{DynamicResource YuraTextPrimaryColor}" />
+  <SolidColorBrush x:Key="YuraTextSecondary" Color="{DynamicResource YuraTextSecondaryColor}" />
+  <SolidColorBrush x:Key="YuraTextTertiary" Color="{DynamicResource YuraTextTertiaryColor}" />
+  <SolidColorBrush x:Key="YuraTextDisabled" Color="{DynamicResource YuraTextDisabledColor}" />
+  <SolidColorBrush x:Key="YuraTextOnAccent" Color="{DynamicResource YuraTextOnAccentColor}" />
+
+  <SolidColorBrush x:Key="YuraAccent" Color="{DynamicResource YuraAccentColor}" />
+  <SolidColorBrush x:Key="YuraAccentHover" Color="{DynamicResource YuraAccentHoverColor}" />
+  <SolidColorBrush x:Key="YuraAccentPressed" Color="{DynamicResource YuraAccentPressedColor}" />
+  <SolidColorBrush x:Key="YuraAccentText" Color="{DynamicResource YuraAccentTextColor}" />
+  <SolidColorBrush x:Key="YuraAccentSubtle" Color="{DynamicResource YuraAccentSubtleColor}" />
+
+  <SolidColorBrush x:Key="YuraSuccess" Color="{DynamicResource YuraSuccessColor}" />
+  <SolidColorBrush x:Key="YuraSuccessSubtle" Color="{DynamicResource YuraSuccessSubtleColor}" />
+  <SolidColorBrush x:Key="YuraWarning" Color="{DynamicResource YuraWarningColor}" />
+  <SolidColorBrush x:Key="YuraWarningSubtle" Color="{DynamicResource YuraWarningSubtleColor}" />
+  <SolidColorBrush x:Key="YuraDanger" Color="{DynamicResource YuraDangerColor}" />
+  <SolidColorBrush x:Key="YuraDangerSubtle" Color="{DynamicResource YuraDangerSubtleColor}" />
+  <SolidColorBrush x:Key="YuraNeutralState" Color="{DynamicResource YuraNeutralStateColor}" />
+
+  <SolidColorBrush x:Key="YuraFocus" Color="{DynamicResource YuraFocusColor}" />
+
+  <!-- ============================ Spacing ============================
+       4-DIP base. Only these seven values are used anywhere. -->
+  <x:Double x:Key="YuraSpace1">4</x:Double>
+  <x:Double x:Key="YuraSpace2">8</x:Double>
+  <x:Double x:Key="YuraSpace3">12</x:Double>
+  <x:Double x:Key="YuraSpace4">16</x:Double>
+  <x:Double x:Key="YuraSpace5">20</x:Double>
+  <x:Double x:Key="YuraSpace6">24</x:Double>
+  <x:Double x:Key="YuraSpace8">32</x:Double>
+
+  <Thickness x:Key="YuraPagePadding">24,20,24,20</Thickness>
+  <Thickness x:Key="YuraPanelPadding">16</Thickness>
+  <Thickness x:Key="YuraCellPadding">12,0</Thickness>
+
+  <!-- ========================== Corner radii ========================== -->
+  <CornerRadius x:Key="YuraRadiusSm">3</CornerRadius>
+  <CornerRadius x:Key="YuraRadiusMd">5</CornerRadius>
+  <CornerRadius x:Key="YuraRadiusLg">8</CornerRadius>
+  <CornerRadius x:Key="YuraRadiusPill">999</CornerRadius>
+
+  <!-- ========================= Control heights ========================= -->
+  <x:Double x:Key="YuraControlHeightSm">26</x:Double>
+  <x:Double x:Key="YuraControlHeightMd">32</x:Double>
+  <x:Double x:Key="YuraControlHeightLg">38</x:Double>
+  <x:Double x:Key="YuraRowHeight">34</x:Double>
+  <x:Double x:Key="YuraHeaderHeight">56</x:Double>
+
+  <!-- ============================ Typography ============================
+       Inter is embedded for Latin. Noto Sans CJK SC covers Simplified Chinese and is
+       listed explicitly so the fallback is deterministic rather than whatever fontconfig
+       happens to rank first. -->
+  <!-- Inter must be referenced by its avares:// asset URI. The bare name "Inter" is NOT
+       resolvable even after WithInterFont(): it is an embedded asset, not a system family,
+       so a bare name silently falls back to whatever the system default happens to be —
+       which defeats the point of embedding it. Verified with the font-report startup flag. -->
+  <FontFamily x:Key="YuraFontUi">avares://Avalonia.Fonts.Inter/Assets#Inter, Noto Sans CJK SC, Noto Sans</FontFamily>
+  <!-- DejaVu first, deliberately. Avalonia 12 selects an oblique face for "Noto Sans Mono"
+       on this font stack, which makes every path and address in the UI render italic;
+       DejaVu Sans Mono renders upright and has the coverage we need. No 'monospace' generic
+       in the chain either — that is a fontconfig alias, not a family Avalonia can resolve. -->
+  <FontFamily x:Key="YuraFontMono">DejaVu Sans Mono, Liberation Mono, Noto Sans Mono</FontFamily>
+
+  <x:Double x:Key="YuraFontSizeCaption">11.5</x:Double>
+  <x:Double x:Key="YuraFontSizeSmall">12.5</x:Double>
+  <x:Double x:Key="YuraFontSizeBody">14</x:Double>
+  <x:Double x:Key="YuraFontSizeSubtitle">16</x:Double>
+  <x:Double x:Key="YuraFontSizeTitle">21</x:Double>
+  <x:Double x:Key="YuraFontSizeDisplay">30</x:Double>
+
+  <!-- ======================== Focus indicator ========================= -->
+  <x:Double x:Key="YuraFocusThickness">2</x:Double>
+  <Thickness x:Key="YuraFocusBorderThickness">2</Thickness>
+
+  <!-- ========================= Animation timings =========================
+       Short enough never to sit between the user and an action. The reduced-motion
+       setting replaces these with zero at runtime; see MotionSettings. -->
+  <sys:TimeSpan x:Key="YuraDurationInstant">0:0:0</sys:TimeSpan>
+  <sys:TimeSpan x:Key="YuraDurationFast">0:0:0.12</sys:TimeSpan>
+  <sys:TimeSpan x:Key="YuraDurationNormal">0:0:0.18</sys:TimeSpan>
+  <sys:TimeSpan x:Key="YuraDurationSlow">0:0:0.28</sys:TimeSpan>
+
+</ResourceDictionary>

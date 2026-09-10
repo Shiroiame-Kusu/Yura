@@ -1,0 +1,179 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:Yura.App.ViewModels"
+             xmlns:loc="using:Yura.App.Localization"
+             xmlns:icons="using:FluentIcons.Avalonia"
+             mc:Ignorable="d"
+             x:Class="Yura.App.Views.GamesPage"
+             x:DataType="vm:GamesPageViewModel">
+
+  <Grid RowDefinitions="Auto,*">
+
+    <StackPanel Grid.Row="0" Margin="24,20,24,12" Spacing="2">
+      <TextBlock Classes="PageTitle" Text="{loc:Tr Games.Title}" />
+      <TextBlock Classes="Subtitle" Text="{loc:Tr Games.Subtitle}" />
+    </StackPanel>
+
+    <ScrollViewer Grid.Row="1" Margin="24,0,24,20">
+      <StackPanel Spacing="16" MaxWidth="920" HorizontalAlignment="Stretch">
+
+        <!-- ================= Step 1-3: game, route, start =================
+             The whole primary workflow sits in one row so it reads as a single
+             three-step action rather than a form to fill in. -->
+        <Border Classes="Panel" Padding="16">
+          <Grid ColumnDefinitions="*,16,*,16,Auto" VerticalAlignment="Bottom">
+
+            <StackPanel Grid.Column="0" Spacing="2">
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Games.SelectGame}" />
+              <ComboBox ItemsSource="{Binding Games}" SelectedItem="{Binding SelectedGame}"
+                        HorizontalAlignment="Stretch"
+                        PlaceholderText="{loc:Tr Games.SelectGame}"
+                        AutomationProperties.Name="{loc:Tr Games.SelectGame}">
+                <ComboBox.ItemTemplate>
+                  <DataTemplate x:DataType="vm:GameEntry">
+                    <TextBlock Text="{Binding Name}" />
+                  </DataTemplate>
+                </ComboBox.ItemTemplate>
+              </ComboBox>
+            </StackPanel>
+
+            <StackPanel Grid.Column="2" Spacing="2">
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Games.SelectRoute}" />
+              <ComboBox ItemsSource="{Binding Routes}" SelectedItem="{Binding SelectedRoute}"
+                        HorizontalAlignment="Stretch"
+                        PlaceholderText="{loc:Tr Games.SelectRoute}"
+                        AutomationProperties.Name="{loc:Tr Games.SelectRoute}">
+                <ComboBox.ItemTemplate>
+                  <DataTemplate>
+                    <TextBlock Text="{Binding Name}" />
+                  </DataTemplate>
+                </ComboBox.ItemTemplate>
+              </ComboBox>
+            </StackPanel>
+
+            <StackPanel Grid.Column="4" Orientation="Horizontal" Spacing="8">
+              <Button Classes="accent" MinWidth="132"
+                      Command="{Binding StartBoostCommand}"
+                      IsEnabled="{Binding CanStart}"
+                      IsVisible="{Binding !IsRunning}"
+                      Content="{loc:Tr Games.StartBoost}" />
+              <Button MinWidth="132"
+                      Command="{Binding StopBoostCommand}"
+                      IsVisible="{Binding IsRunning}"
+                      Content="{loc:Tr Games.StopBoost}" />
+            </StackPanel>
+          </Grid>
+        </Border>
+
+        <!-- Why Start is unavailable, stated beside the control. -->
+        <TextBlock Classes="FieldHint" Text="{Binding StartBlockedReason}"
+                   IsVisible="{Binding StartBlockedReason, Converter={x:Static ObjectConverters.IsNotNull}}" />
+
+        <!-- A route that cannot carry UDP is a functional limitation for a game, so it is
+             a banner and not a footnote. -->
+        <Border Classes="Panel" Padding="12"
+                Background="{DynamicResource YuraWarningSubtle}"
+                BorderBrush="{DynamicResource YuraWarning}"
+                IsVisible="{Binding ShowUdpWarning}">
+          <StackPanel Orientation="Horizontal" Spacing="10">
+            <icons:SymbolIcon Symbol="Warning" FontSize="18"
+                              Foreground="{DynamicResource YuraWarning}" VerticalAlignment="Center" />
+            <TextBlock Text="{loc:Tr Games.UdpWarning}" TextWrapping="Wrap" VerticalAlignment="Center" />
+          </StackPanel>
+        </Border>
+
+        <!-- ==================== Session state ==================== -->
+        <Border Classes="Panel" Padding="16">
+          <Grid ColumnDefinitions="*,*,*,*" ColumnSpacing="20">
+            <StackPanel Grid.Column="0" Spacing="4">
+              <TextBlock Classes="FieldLabel" Text="Session state" />
+              <Border Classes="Badge"
+                      Classes.Success="{Binding IsRouting}"
+                      Classes.Warning="{Binding IsDegraded}"
+                      Classes.Danger="{Binding IsFailed}"
+                      Classes.Accent="{Binding IsTransitioning}"
+                      HorizontalAlignment="Left">
+                <TextBlock Text="{Binding StateLabel}" />
+              </Border>
+            </StackPanel>
+
+            <StackPanel Grid.Column="1" Spacing="4">
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Games.SessionDuration}" />
+              <TextBlock Classes="Metric" Text="{Binding SessionDurationDisplay}" />
+            </StackPanel>
+
+            <StackPanel Grid.Column="2" Spacing="4">
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Games.Compatibility}" />
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <Border Classes="Badge Success">
+                  <TextBlock Text="{loc:Tr Games.TcpSupported}" />
+                </Border>
+                <Border Classes="Badge">
+                  <TextBlock Text="{Binding UdpSupportLabel}" />
+                </Border>
+              </StackPanel>
+            </StackPanel>
+
+            <StackPanel Grid.Column="3" Spacing="4">
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Games.LastUpdate}" />
+              <TextBlock Classes="Metric" Text="{Binding LastMeasurementDisplay}" />
+            </StackPanel>
+          </Grid>
+        </Border>
+
+        <!-- ============== Direct vs routed, same units, same target ==============
+             Presented side by side because the comparison is the entire point, and with
+             the shared measurement target stated so the two columns are comparable. -->
+        <Border Classes="Panel" Padding="16">
+          <StackPanel Spacing="12">
+            <Grid ColumnDefinitions="*,Auto">
+              <TextBlock Grid.Column="0" Classes="SectionTitle" Text="{loc:Tr Games.Comparison}" />
+              <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                <TextBlock Classes="Caption" Text="{loc:Tr Games.MeasurementTarget}" VerticalAlignment="Center" />
+                <TextBlock Classes="Mono Tertiary" Text="{Binding MeasurementTargetDisplay}"
+                           VerticalAlignment="Center" />
+              </StackPanel>
+            </Grid>
+
+            <Grid ColumnDefinitions="150,*,*" RowDefinitions="Auto,Auto,Auto,Auto" ColumnSpacing="16">
+              <!-- header -->
+              <TextBlock Grid.Row="0" Grid.Column="1" Classes="FieldLabel" Text="{loc:Tr Games.Direct}" />
+              <TextBlock Grid.Row="0" Grid.Column="2" Classes="FieldLabel" Text="{loc:Tr Games.Routed}" />
+
+              <TextBlock Grid.Row="1" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Games.Latency}" Margin="0,0,0,6" />
+              <TextBlock Grid.Row="1" Grid.Column="1" Classes="Metric" Text="{Binding DirectLatency.Display}" Margin="0,0,0,6" />
+              <TextBlock Grid.Row="1" Grid.Column="2" Classes="Metric" Text="{Binding RoutedLatency.Display}" Margin="0,0,0,6" />
+
+              <TextBlock Grid.Row="2" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Games.Jitter}" Margin="0,0,0,6" />
+              <TextBlock Grid.Row="2" Grid.Column="1" Classes="Metric" Text="{Binding DirectJitter.Display}" Margin="0,0,0,6" />
+              <TextBlock Grid.Row="2" Grid.Column="2" Classes="Metric" Text="{Binding RoutedJitter.Display}" Margin="0,0,0,6" />
+
+              <TextBlock Grid.Row="3" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Games.Loss}" />
+              <TextBlock Grid.Row="3" Grid.Column="1" Classes="Metric" Text="{Binding DirectLoss.Display}" />
+              <TextBlock Grid.Row="3" Grid.Column="2" Classes="Metric" Text="{Binding RoutedLoss.Display}" />
+            </Grid>
+          </StackPanel>
+        </Border>
+
+        <!-- Empty state -->
+        <Border Classes="Panel" Padding="32" IsVisible="{Binding !HasGames}">
+          <StackPanel Spacing="6" HorizontalAlignment="Center">
+            <TextBlock Text="{loc:Tr Games.NoGames}" HorizontalAlignment="Center" />
+            <TextBlock Classes="Caption" Text="{loc:Tr Games.NoGamesHint}" HorizontalAlignment="Center" />
+          </StackPanel>
+        </Border>
+
+        <!-- Failure -->
+        <Border Classes="Panel" Padding="12"
+                Background="{DynamicResource YuraDangerSubtle}"
+                BorderBrush="{DynamicResource YuraDanger}"
+                IsVisible="{Binding FailureReason, Converter={x:Static ObjectConverters.IsNotNull}}">
+          <TextBlock Text="{Binding FailureReason}" TextWrapping="Wrap" />
+        </Border>
+
+      </StackPanel>
+    </ScrollViewer>
+  </Grid>
+</UserControl>

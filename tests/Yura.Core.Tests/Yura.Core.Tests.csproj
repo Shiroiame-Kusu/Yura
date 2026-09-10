@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Yura.Core.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <!-- xunit.v3 runs on Microsoft.Testing.Platform, which is the only supported
+         'dotnet test' path on the .NET 10 SDK. -->
+    <OutputType>Exe</OutputType>
+    <TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="4.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Yura.Core/Yura.Core.csproj" />
+  </ItemGroup>
+
+</Project>

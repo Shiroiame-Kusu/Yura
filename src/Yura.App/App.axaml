@@ -1,0 +1,32 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:sty="using:FluentAvalonia.Styling"
+             x:Class="Yura.App.YuraApplication"
+             RequestedThemeVariant="Dark">
+
+  <Application.Styles>
+    <!-- FluentAvalonia supplies the control set: NavigationView, InfoBar, TeachingTip,
+         ContentDialog, Frame and the Fluent icon family. Yura's own styles sit on top and
+         only ever adjust density, colour and typography. -->
+    <!-- CustomAccentColor is what makes FluentAvalonia's own controls (checkboxes, toggles,
+         accent buttons, selection) use Yura's teal instead of the framework default. Without
+         it the design system stops at the edge of our own styles and the app reads as two
+         different products. FluentAvalonia derives its light/dark shades from this one value.
+         PreferSystemTheme/PreferUserAccentColor are off so the app looks identical across
+         desktop environments, which is what makes the screenshots reviewable. -->
+    <sty:FluentAvaloniaTheme PreferSystemTheme="False"
+                             PreferUserAccentColor="False"
+                             CustomAccentColor="#2FA79F" />
+    <StyleInclude Source="avares://Yura.App/Themes/Controls.axaml" />
+  </Application.Styles>
+
+  <Application.Resources>
+    <ResourceDictionary>
+      <ResourceDictionary.MergedDictionaries>
+        <ResourceInclude Source="avares://Yura.App/Themes/Tokens.axaml" />
+        <ResourceInclude Source="avares://Yura.App/Themes/Templates.axaml" />
+      </ResourceDictionary.MergedDictionaries>
+    </ResourceDictionary>
+  </Application.Resources>
+
+</Application>

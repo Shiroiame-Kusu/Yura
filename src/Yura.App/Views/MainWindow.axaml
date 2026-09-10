@@ -1,0 +1,119 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:vm="using:Yura.App.ViewModels"
+        xmlns:views="using:Yura.App.Views"
+        xmlns:loc="using:Yura.App.Localization"
+        xmlns:icons="using:FluentIcons.Avalonia"
+        mc:Ignorable="d"
+        x:Class="Yura.App.Views.MainWindow"
+        x:DataType="vm:ShellViewModel"
+        Title="Yura"
+        Width="1280" Height="800"
+        MinWidth="960" MinHeight="640"
+        Background="{DynamicResource YuraSurfaceBase}"
+        FontFamily="{DynamicResource YuraFontUi}">
+
+  <Grid ColumnDefinitions="216,*">
+
+    <!-- ====================== Left navigation sidebar ======================
+         Fixed width and always visible: navigation must not move or collapse as the
+         window resizes, so the user's spatial memory of it stays valid. -->
+    <Border Grid.Column="0"
+            Background="{DynamicResource YuraSurfaceRaised}"
+            BorderBrush="{DynamicResource YuraBorderSubtle}"
+            BorderThickness="0,0,1,0">
+      <Grid RowDefinitions="Auto,*,Auto">
+
+        <StackPanel Grid.Row="0" Margin="16,18,16,14" Spacing="2">
+          <TextBlock Text="Yura" FontSize="18" FontWeight="SemiBold" />
+          <TextBlock Classes="Caption" Text="Linux traffic routing" />
+        </StackPanel>
+
+        <ListBox Grid.Row="1"
+                 Classes="Nav"
+                 ItemsSource="{Binding Pages}"
+                 SelectedItem="{Binding SelectedPage}"
+                 Background="Transparent"
+                 BorderThickness="0"
+                 Padding="8,0"
+                 AutomationProperties.Name="Main navigation">
+          <ListBox.ItemTemplate>
+            <DataTemplate x:DataType="vm:NavigationItem">
+              <StackPanel Orientation="Horizontal" Spacing="10" Height="32">
+                <icons:SymbolIcon Symbol="{Binding Icon}" FontSize="18" VerticalAlignment="Center" />
+                <TextBlock Text="{Binding Label}" VerticalAlignment="Center" />
+              </StackPanel>
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+
+        <!-- Daemon status. Always visible: whether routing can take effect at all is the
+             single most important piece of ambient state in the application. -->
+        <StackPanel Grid.Row="2" Margin="16,12,16,16" Spacing="8">
+          <StackPanel Orientation="Horizontal" Spacing="8">
+            <Ellipse Width="8" Height="8" VerticalAlignment="Center"
+                     Classes="StatusDot"
+                     Classes.Connected="{Binding IsDaemonConnected}" />
+            <TextBlock Classes="Caption" Text="{Binding DaemonStatusText}" />
+          </StackPanel>
+
+          <!-- Verification affordances. These belong in Settings for the real product;
+               they sit here so a reviewer can flip theme and language in one click while
+               comparing screenshots. -->
+          <StackPanel Spacing="4">
+            <CheckBox IsChecked="{Binding IsDarkTheme}" Content="Dark theme" FontSize="12" />
+            <CheckBox IsChecked="{Binding IsChinese}" Content="简体中文" FontSize="12" />
+            <CheckBox IsChecked="{Binding ReducedMotion}" Content="Reduced motion" FontSize="12" />
+          </StackPanel>
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- ============================== Workspace ============================== -->
+    <Grid Grid.Column="1" RowDefinitions="Auto,*">
+
+      <!-- Persistent problem banner. Not a toast: it stays true until acted on. -->
+      <Border Grid.Row="0"
+              Background="{DynamicResource YuraWarningSubtle}"
+              BorderBrush="{DynamicResource YuraWarning}"
+              BorderThickness="0,0,0,1"
+              Padding="24,10"
+              IsVisible="{Binding !IsDaemonConnected}">
+        <Grid ColumnDefinitions="Auto,*,Auto">
+          <icons:SymbolIcon Grid.Column="0" Symbol="Warning" FontSize="18"
+                            Foreground="{DynamicResource YuraWarning}"
+                            VerticalAlignment="Center" Margin="0,0,10,0" />
+          <StackPanel Grid.Column="1" Spacing="1" VerticalAlignment="Center">
+            <TextBlock Text="{Binding DaemonStatusText}" FontWeight="SemiBold"
+                       Foreground="{DynamicResource YuraWarning}" />
+            <TextBlock Classes="Caption" Text="{Binding DaemonBannerDetail}" TextWrapping="Wrap" />
+          </StackPanel>
+          <Button Grid.Column="2" Content="{loc:Tr Shell.Reconnect}"
+                  Command="{Binding ReconnectCommand}" VerticalAlignment="Center" />
+        </Grid>
+      </Border>
+
+      <Panel Grid.Row="1">
+        <views:ProcessesPage DataContext="{Binding Processes}"
+                             IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsProcessesSelected}" />
+
+        <views:GamesPage DataContext="{Binding Games}"
+                         IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsGamesSelected}" />
+
+        <views:ProxiesPage DataContext="{Binding Proxies}"
+                           IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsProxiesSelected}" />
+
+        <!-- Pages that are navigable but not part of this milestone. Saying so is better
+             than a blank page that looks broken. -->
+        <StackPanel IsVisible="{Binding IsPlaceholderSelected}"
+                    HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8" MaxWidth="380">
+          <TextBlock Classes="PageTitle" Text="{Binding PlaceholderTitle}" HorizontalAlignment="Center" />
+          <TextBlock Classes="Subtitle" TextAlignment="Center"
+                     Text="This page is not part of the current milestone. The design system, Processes, Games and the proxy editor are built first, as the specification requires." />
+        </StackPanel>
+      </Panel>
+    </Grid>
+  </Grid>
+</Window>

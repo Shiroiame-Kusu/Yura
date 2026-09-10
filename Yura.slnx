@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Yura.App/Yura.App.csproj" />
+    <Project Path="src/Yura.Core/Yura.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Yura.Core.Tests/Yura.Core.Tests.csproj" />
+  </Folder>
+</Solution>

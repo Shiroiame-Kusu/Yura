@@ -1,0 +1,157 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:Yura.App.ViewModels"
+             xmlns:loc="using:Yura.App.Localization"
+             mc:Ignorable="d"
+             x:Class="Yura.App.Views.ProcessInspector"
+             x:DataType="vm:ProcessesPageViewModel">
+
+  <!--
+    The contextual inspector for the selected process: identity, rule scope, route and
+    actions in one place.
+
+    It lives in its own control because the page shows it in two different positions - docked
+    beside the table on a wide window, and as an overlay on a narrow one - and duplicating
+    the markup would guarantee the two drift apart.
+  -->
+  <Border Classes="Panel">
+        <ScrollViewer>
+          <StackPanel Margin="16" Spacing="16">
+
+            <!-- Nothing selected -->
+            <TextBlock Classes="Subtitle" Text="{loc:Tr Processes.Inspector.NoSelection}"
+                       IsVisible="{Binding !HasSelection}" />
+
+            <StackPanel Spacing="16" IsVisible="{Binding HasSelection}">
+
+              <!-- Identity -->
+              <StackPanel Spacing="6">
+                <TextBlock Classes="SectionTitle" Text="{Binding SelectedProcess.DisplayName}"
+                           TextTrimming="CharacterEllipsis" />
+                <TextBlock Classes="Mono Tertiary" Text="{Binding SelectedProcess.PathDisplay}"
+                           TextWrapping="Wrap" />
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                  <Border Classes="Badge">
+                    <TextBlock Text="{Binding SelectedProcess.Pid, StringFormat='PID {0}'}" />
+                  </Border>
+                  <Border Classes="Badge">
+                    <TextBlock Text="{Binding SelectedProcess.UserName}" />
+                  </Border>
+                  <Border Classes="Badge Warning" IsVisible="{Binding SelectedProcess.ExecutableWasReplaced}">
+                    <TextBlock Text="{loc:Tr Processes.PathDeleted}" />
+                  </Border>
+                </StackPanel>
+              </StackPanel>
+
+              <Border Classes="Divider" />
+
+              <!-- Rule scope: the three scopes, each with the consequence spelled out. -->
+              <StackPanel Spacing="8">
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Processes.Scope.Title}" />
+
+                <RadioButton GroupName="scope" IsChecked="{Binding ScopeChoice,
+                               Converter={StaticResource EnumToBool}, ConverterParameter=Instance}">
+                  <StackPanel Spacing="1">
+                    <TextBlock Text="{loc:Tr Processes.Scope.Instance}" />
+                    <TextBlock Classes="Caption" Text="{loc:Tr Processes.Scope.InstanceHint}" TextWrapping="Wrap" />
+                  </StackPanel>
+                </RadioButton>
+
+                <RadioButton GroupName="scope" IsChecked="{Binding ScopeChoice,
+                               Converter={StaticResource EnumToBool}, ConverterParameter=Executable}">
+                  <StackPanel Spacing="1">
+                    <TextBlock Text="{loc:Tr Processes.Scope.Executable}" />
+                    <TextBlock Classes="Caption" Text="{loc:Tr Processes.Scope.ExecutableHint}" TextWrapping="Wrap" />
+                  </StackPanel>
+                </RadioButton>
+
+                <RadioButton GroupName="scope" IsChecked="{Binding ScopeChoice,
+                               Converter={StaticResource EnumToBool}, ConverterParameter=Tree}">
+                  <StackPanel Spacing="1">
+                    <TextBlock Text="{loc:Tr Processes.Scope.Tree}" />
+                    <TextBlock Classes="Caption" Text="{loc:Tr Processes.Scope.TreeHint}" TextWrapping="Wrap" />
+                  </StackPanel>
+                </RadioButton>
+              </StackPanel>
+
+              <!-- Route -->
+              <StackPanel Spacing="2">
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Processes.Inspector.Route}" />
+                <ComboBox ItemsSource="{Binding AvailableProxies}"
+                          SelectedItem="{Binding SelectedProxy}"
+                          HorizontalAlignment="Stretch"
+                          PlaceholderText="{loc:Tr Games.SelectRoute}"
+                          AutomationProperties.Name="{loc:Tr Processes.Inspector.Route}">
+                  <ComboBox.ItemTemplate>
+                    <DataTemplate>
+                      <TextBlock Text="{Binding Name}" />
+                    </DataTemplate>
+                  </ComboBox.ItemTemplate>
+                </ComboBox>
+              </StackPanel>
+
+              <!-- Actions -->
+              <StackPanel Spacing="8">
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Processes.Inspector.Actions}" />
+
+                <Button Classes="accent" HorizontalAlignment="Stretch"
+                        Command="{Binding ProxyThisInstanceCommand}"
+                        IsEnabled="{Binding CanApply}"
+                        Content="{loc:Tr Processes.Action.ProxyInstance}" />
+
+                <Button HorizontalAlignment="Stretch"
+                        Command="{Binding AlwaysProxyExecutableCommand}"
+                        IsEnabled="{Binding CanApply}"
+                        Content="{loc:Tr Processes.Action.AlwaysProxy}" />
+
+                <Grid ColumnDefinitions="*,8,*">
+                  <Button Grid.Column="0" HorizontalAlignment="Stretch"
+                          Command="{Binding RouteDirectCommand}" IsEnabled="{Binding CanApply}"
+                          Content="{loc:Tr Processes.Action.Direct}" />
+                  <Button Grid.Column="2" HorizontalAlignment="Stretch"
+                          Command="{Binding BlockCommand}" IsEnabled="{Binding CanApply}"
+                          Content="{loc:Tr Processes.Action.Block}" />
+                </Grid>
+
+                <CheckBox IsChecked="{Binding IncludeChildren}"
+                          Content="{loc:Tr Processes.Action.IncludeChildren}" />
+
+                <Button HorizontalAlignment="Stretch"
+                        Command="{Binding RemoveOverrideCommand}"
+                        Content="{loc:Tr Processes.Action.RemoveOverride}" />
+
+                <!-- Why an action is unavailable, beside the control rather than in a tooltip. -->
+                <TextBlock Classes="FieldHint" Text="{Binding ApplyBlockedReason}"
+                           IsVisible="{Binding ApplyBlockedReason, Converter={x:Static ObjectConverters.IsNotNull}}" />
+              </StackPanel>
+
+              <!-- Result of the last apply: separates "new connections" from "existing". -->
+              <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraAccentSubtle}"
+                      BorderBrush="{DynamicResource YuraAccent}"
+                      IsVisible="{Binding LastApplied, Converter={x:Static ObjectConverters.IsNotNull}}">
+                <StackPanel Spacing="4">
+                  <TextBlock FontWeight="SemiBold" Text="{Binding LastApplied.Headline}" TextWrapping="Wrap" />
+                  <TextBlock Classes="Caption" Text="{Binding LastApplied.Body}" TextWrapping="Wrap" />
+                </StackPanel>
+              </Border>
+
+              <!-- Failure: what failed, plus expandable technical detail. -->
+              <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraDangerSubtle}"
+                      BorderBrush="{DynamicResource YuraDanger}"
+                      IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+                <StackPanel Spacing="6">
+                  <TextBlock FontWeight="SemiBold" Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
+                  <Expander Header="{loc:Tr Common.Details}"
+                            IsVisible="{Binding ErrorDiagnostics, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <SelectableTextBlock Classes="Mono" Text="{Binding ErrorDiagnostics}" TextWrapping="Wrap" />
+                  </Expander>
+                </StackPanel>
+              </Border>
+
+            </StackPanel>
+          </StackPanel>
+        </ScrollViewer>
+  </Border>
+</UserControl>

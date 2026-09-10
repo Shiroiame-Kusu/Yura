@@ -1,0 +1,33 @@
+<Project>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <EnableDefaultNoneItems>false</EnableDefaultNoneItems>
+    <AccelerateBuildsInVisualStudio>true</AccelerateBuildsInVisualStudio>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- Yura is Linux-first. The daemon is Linux-only by construction; the app is
+         portable but only ships a Linux RID for the first release. -->
+    <RuntimeIdentifiers>linux-x64;linux-arm64</RuntimeIdentifiers>
+    <Product>Yura</Product>
+    <Company>Yura</Company>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <WarningsAsErrors>nullable</WarningsAsErrors>
+    <AnalysisLevel>latest</AnalysisLevel>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>portable</DebugType>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+</Project>

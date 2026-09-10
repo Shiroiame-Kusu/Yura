@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <RootNamespace>Yura.App</RootNamespace>
+    <!-- The assembly name is deliberately left as the project name: every avares:// URI in
+         this project is keyed on it, so renaming the assembly silently breaks resource
+         resolution at build time. -->
+    <ApplicationIcon></ApplicationIcon>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <BuiltInComInteropSupport>false</BuiltInComInteropSupport>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.2" />
+    <!-- Inter is embedded so the Latin UI renders identically on a machine with no
+         fonts installed. Chinese falls back to system Noto Sans CJK SC; see Tokens.axaml. -->
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.2" />
+    <PackageReference Include="FluentAvaloniaUI" Version="3.1.0" />
+    <!-- The Fluent System Icons family, embedded. One icon set, offline, no Segoe
+         dependency (which does not exist on most Linux systems). -->
+    <PackageReference Include="FluentIcons.Avalonia" Version="2.1.339.1" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Yura.Core/Yura.Core.csproj" />
+  </ItemGroup>
+
+</Project>
