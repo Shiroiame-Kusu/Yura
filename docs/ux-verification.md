@@ -118,12 +118,12 @@ Every status carries a word as well as a colour: routing policy badges read
 
 Stated plainly, because these are acceptance criteria that remain open.
 
-**All 11 mandatory routing acceptance tests.** They require the privileged daemon, which is
-not implemented, and root, which was not available in this environment. The routing spike
-(`spikes/routing-spike.sh`) is written and its unprivileged components are verified working
-end to end — SOCKS5 CONNECT, UDP ASSOCIATE relay, destination rewrite and both audit logs.
-Its kernel plumbing (cgroup migration, nftables classification, policy routing, TPROXY) has
-**not been executed even once**.
+**Seven of the eleven routing acceptance tests.** Tests 1, 2, 7 and 11 are now verified by
+`spikes/routing-spike.sh` (12 passed, 0 failed, reproduced three times — see
+[spike-results.md](spike-results.md)). Tests 3, 4, 5, 6, 8, 9 and 10 require the privileged
+daemon, which is not implemented. Their underlying mechanisms — cgroup membership, instance
+identity re-verification, classifier withdrawal — are exercised by the spike, but that is
+not the same as testing them.
 
 **Keyboard-only walkthroughs of the five workflows.** The screenshot harness drives a bare
 Xvfb with no window manager, so it cannot meaningfully exercise focus traversal, focus

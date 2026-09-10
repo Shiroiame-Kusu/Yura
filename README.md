@@ -7,10 +7,11 @@ Yura routes the traffic of **specific running processes** through proxies you al
 It does not ship or manage a routing engine: you point it at your own SOCKS5 or HTTP(S)
 endpoint, and Yura decides which process's traffic goes there.
 
-> **Status: early milestone.** The domain model, the design system and the Processes,
-> Games and Proxy Editor screens are built and verified. The privileged daemon is
-> specified and de-risked by a working spike, but is **not yet implemented**, so no
-> routing takes effect yet. See [Current state](#current-state).
+> **Status: early milestone.** The routing approach is **proven working** — see
+> [docs/spike-results.md](docs/spike-results.md). The domain model, design system and the
+> Processes, Games and Proxy Editor screens are built and verified. The privileged daemon
+> that would drive it in the product is **not yet implemented**, so the application applies
+> nothing yet and says so. See [Current state](#current-state).
 
 ## Why per-process routing is hard on Linux
 
@@ -98,6 +99,13 @@ of the same executable stays direct, that pre-existing connections keep their pr
 route, and that removing the override restores direct routing. Everything it creates is
 namespaced `yura-spike` and removed by its cleanup trap, including on failure.
 
+**Result: 12 passed, 0 failed**, reproduced across three consecutive runs. Acceptance tests
+1, 2, 7 and 11 are verified with evidence from three independent logs. Full write-up in
+[docs/spike-results.md](docs/spike-results.md).
+
+When something breaks, `sudo ./spikes/debug-classify.sh` puts an nftables counter on every
+rule and reports which links a packet actually reached.
+
 ## Design system
 
 Tokens live in [`Themes/Tokens.axaml`](src/Yura.App/Themes/Tokens.axaml): graphite/slate
@@ -122,13 +130,16 @@ All 52 required foreground/background pairs meet their target in both themes.
 - Design system, and the Processes, Games and Proxy Editor screens
 - Screenshot harness covering both themes, both languages, 960×640 and 1280×800, and
   100–200% scaling
-- Routing spike: all unprivileged components verified end to end
+- **Routing spike passing 12/12**: a running process migrated into a cgroup live, classified
+  by nftables, captured by TPROXY and forwarded to a SOCKS5 proxy — for TCP and UDP, per
+  instance, with the process still running as its original user
 
 **Not yet built**
 
 - The privileged daemon. Without it the app runs fully but applies nothing, and says so.
 - Connections, Rules, Diagnostics and Settings pages
-- The 11 mandatory routing acceptance tests — these need the daemon and root
+- Acceptance tests 3, 4, 5, 6, 8, 9 and 10 — the mechanisms they rest on are exercised by
+  the spike, but the daemon that drives them does not exist yet
 
 See [docs/ux-verification.md](docs/ux-verification.md) for what was checked and what could
 not be.

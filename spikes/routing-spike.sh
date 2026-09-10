@@ -114,6 +114,33 @@ as_user() {
 
 py() { python3 "$@"; }
 
+# Waits for a client to report its own pid, then echoes it.
+await_client_pid() {
+  local file="$1"
+  for _ in $(seq 1 60); do
+    if [[ -s "$file" ]]; then
+      local pid
+      pid="$(python3 -c "
+import json, sys
+for line in open(sys.argv[1]):
+    try:
+        record = json.loads(line)
+    except ValueError:
+        continue
+    if record.get('event') == 'start':
+        print(record['pid'])
+        break
+" "$file" 2>/dev/null)"
+      if [[ -n "$pid" ]] && [[ -d "/proc/$pid" ]]; then
+        echo "$pid"
+        return 0
+      fi
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
@@ -303,13 +330,23 @@ start_clients() {
       --udp-target "${UNREACHABLE_HOST}:9090" \
       --preexisting-target "${LOCAL_ADDR}:${MARKER_HOLD_PORT}" \
       --out "${RUN_DIR}/client-${lower}.jsonl" \
-      --interval 1 \
+      --interval 0.4 --timeout 1.5 \
       > "${RUN_DIR}/client-${lower}.out" 2>&1 &
-    declare -g "PID_${label}=$!"
     BG_PIDS+=($!)
   done
 
-  sleep 0.5
+  # $! is the pid of the backgrounded subshell, not of the client that setpriv execs
+  # inside it. Using it would migrate the wrong process into the cgroup and silently
+  # classify nothing. The client reports its own pid on its first line; that is the only
+  # trustworthy source.
+  PID_A="$(await_client_pid "${RUN_DIR}/client-a.jsonl")" || {
+    echo "instance A never reported its pid" >&2; exit 1; }
+  PID_B="$(await_client_pid "${RUN_DIR}/client-b.jsonl")" || {
+    echo "instance B never reported its pid" >&2; exit 1; }
+
+  # Track the real clients too: killing the subshell would leave setpriv's child running.
+  BG_PIDS+=("$PID_A" "$PID_B")
+
   PID_A_START="$(awk '{print $22}' "/proc/${PID_A}/stat")"
   PID_B_START="$(awk '{print $22}' "/proc/${PID_B}/stat")"
   info "instance A: pid ${PID_A} (start ticks ${PID_A_START}), user $(id -un "$(stat -c %u "/proc/${PID_A}")")"
@@ -420,11 +457,13 @@ main() {
     py "${LIB_DIR}/logquery.py" assert "${RUN_DIR}/client-b.jsonl" \
        --event tcp --window 2 --min-count 1 --expect-ok false
   check "baseline: the proxy has seen no traffic at all" \
-    bash -c "[[ \$(py '${LIB_DIR}/logquery.py' count '${RUN_DIR}/socks.jsonl' --event connect) -eq 0 ]] && echo 'proxy log empty'"
+    bash -c "[[ \$(python3 '${LIB_DIR}/logquery.py' count '${RUN_DIR}/socks.jsonl' --event connect) -eq 0 ]] && echo 'proxy log empty'"
 
   # ---- The routing change -------------------------------------------------
   apply_instance_rule
-  settle 5
+  # Sized for the direct instance, not the proxied one: instance B spends a full timeout on
+  # every TCP and UDP attempt, so it produces records far more slowly than instance A.
+  settle 10
 
   # Acceptance test 1: an ordinary running application, selected after the fact, has its
   # NEW connections routed through the selected proxy.
@@ -450,8 +489,8 @@ main() {
   # Independent confirmation from the proxy's own side, not from the client's belief.
   check "proxy-side log confirms A's flows and only A's" \
     bash -c "
-      n=\$(py '${LIB_DIR}/logquery.py' count '${RUN_DIR}/socks.jsonl' --event connect --since ${RULE_APPLIED_AT})
-      u=\$(py '${LIB_DIR}/logquery.py' count '${RUN_DIR}/socks.jsonl' --event udp_send --since ${RULE_APPLIED_AT})
+      n=\$(python3 '${LIB_DIR}/logquery.py' count '${RUN_DIR}/socks.jsonl' --event connect --since ${RULE_APPLIED_AT})
+      u=\$(python3 '${LIB_DIR}/logquery.py' count '${RUN_DIR}/socks.jsonl' --event udp_send --since ${RULE_APPLIED_AT})
       [[ \$n -ge 2 && \$u -ge 2 ]] && echo \"proxy observed \$n CONNECT and \$u UDP relays\"
     "
 
@@ -459,10 +498,10 @@ main() {
   check "A's pre-rule connection is still open on its previous route (acceptance test 11)" \
     py "${LIB_DIR}/logquery.py" assert "${RUN_DIR}/client-a.jsonl" \
        --event preexisting_state --since "${RULE_APPLIED_AT}" --window 3 --min-count 2 \
-       --expect-ok false
+       --expect-ok true
   check "the proxy never saw the pre-rule connection's destination" \
     bash -c "
-      n=\$(py '${LIB_DIR}/logquery.py' count '${RUN_DIR}/socks.jsonl' --where-contains 'requested=${MARKER_HOLD_PORT}')
+      n=\$(python3 '${LIB_DIR}/logquery.py' count '${RUN_DIR}/socks.jsonl' --where-contains 'requested=${MARKER_HOLD_PORT}')
       [[ \$n -eq 0 ]] && echo 'no proxy record for the held connection: it stayed on its original route'
     "
 

@@ -126,7 +126,9 @@ def main() -> int:
                 alive = True
             except OSError:
                 alive = False
-            rec.record(event="preexisting_state", alive=alive)
+            # Reported as "ok" because that is the field assertions read, and a
+            # still-open pre-rule connection is precisely the success condition.
+            rec.record(event="preexisting_state", ok=alive, alive=alive)
 
         time.sleep(args.interval)
 
