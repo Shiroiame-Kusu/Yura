@@ -22,6 +22,11 @@ internal static class Program
             return ConfigReport.Run();
         }
 
+        if (args.Contains("--service-report"))
+        {
+            return ServiceReport.Run();
+        }
+
         return BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
     }
 

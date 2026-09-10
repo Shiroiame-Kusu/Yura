@@ -27,6 +27,9 @@ public sealed class PersistedProxy
 
     public bool AllowInvalidCertificate { get; init; }
 
+    /// <summary>Only for WireGuard exits. Holds no key: those are referenced, like the password.</summary>
+    public PersistedWireGuard? WireGuard { get; init; }
+
     public static PersistedProxy From(ProxyEndpoint endpoint) => new()
     {
         Id = endpoint.Id,
@@ -37,6 +40,7 @@ public sealed class PersistedProxy
         Username = endpoint.Username,
         PasswordRef = endpoint.PasswordRef,
         AllowInvalidCertificate = endpoint.AllowInvalidCertificate,
+        WireGuard = endpoint.WireGuard is { } wg ? PersistedWireGuard.From(wg) : null,
     };
 
     public ProxyEndpoint ToEndpoint() => new()
@@ -49,6 +53,47 @@ public sealed class PersistedProxy
         Username = Username,
         PasswordRef = PasswordRef,
         AllowInvalidCertificate = AllowInvalidCertificate,
+        WireGuard = WireGuard?.ToSettings(),
+    };
+}
+
+/// <summary>The non-secret WireGuard settings as written to disk.</summary>
+public sealed class PersistedWireGuard
+{
+    public required string PeerPublicKey { get; init; }
+
+    public List<string> Addresses { get; init; } = [];
+
+    public List<string> DnsServers { get; init; } = [];
+
+    public List<string> AllowedIps { get; init; } = [];
+
+    public int? Mtu { get; init; }
+
+    public int PersistentKeepalive { get; init; }
+
+    public string? PresharedKeyRef { get; init; }
+
+    public static PersistedWireGuard From(WireGuardSettings settings) => new()
+    {
+        PeerPublicKey = settings.PeerPublicKey,
+        Addresses = settings.Addresses.ToList(),
+        DnsServers = settings.DnsServers.ToList(),
+        AllowedIps = settings.AllowedIps.ToList(),
+        Mtu = settings.Mtu,
+        PersistentKeepalive = settings.PersistentKeepalive,
+        PresharedKeyRef = settings.PresharedKeyRef,
+    };
+
+    public WireGuardSettings ToSettings() => new()
+    {
+        PeerPublicKey = PeerPublicKey,
+        Addresses = Addresses.ToArray(),
+        DnsServers = DnsServers.ToArray(),
+        AllowedIps = AllowedIps.Count == 0 ? ["0.0.0.0/0", "::/0"] : AllowedIps.ToArray(),
+        Mtu = Mtu,
+        PersistentKeepalive = PersistentKeepalive,
+        PresharedKeyRef = PresharedKeyRef,
     };
 }
 

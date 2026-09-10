@@ -62,7 +62,11 @@ public sealed class NftablesManager
 
         sb.Append("    # Loop prevention. The daemon's own upstream sockets carry the bypass\n");
         sb.Append("    # mark; without this line the forwarder would capture itself.\n");
-        sb.Append(CultureInfo.InvariantCulture, $"    meta mark 0x{PolicyRouting.BypassMark:x} return\n\n");
+        sb.Append(CultureInfo.InvariantCulture, $"    meta mark 0x{PolicyRouting.BypassMark:x} return\n");
+        sb.Append("    # The same for the daemon's sockets inside a WireGuard exit, which carry\n");
+        sb.Append("    # the tunnel's mark instead.\n");
+        sb.Append(CultureInfo.InvariantCulture,
+            $"    meta mark & 0x{PolicyRouting.TunnelMarkMask:x} == 0x{PolicyRouting.TunnelMarkBase:x} return\n\n");
 
         sb.Append("    # Loopback is never proxied: it is not reachable from a proxy anyway, and\n");
         sb.Append("    # capturing it breaks local services that applications talk to.\n");
@@ -70,7 +74,8 @@ public sealed class NftablesManager
 
         if (proxies.Count > 0)
         {
-            sb.Append("    # Traffic addressed to a configured proxy is the proxy's, never a rule's.\n");
+            sb.Append("    # Traffic addressed to a configured proxy, or to a WireGuard peer, is the\n");
+            sb.Append("    # proxy's, never a rule's.\n");
             foreach (var proxy in proxies)
             {
                 if (!IPAddress.TryParse(proxy.Host, out var address))

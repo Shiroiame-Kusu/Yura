@@ -57,6 +57,9 @@ public sealed class Flow
     /// <summary>Destination name from SNI, an HTTP Host header or a DNS answer.</summary>
     public string? Host { get; private set; }
 
+    /// <summary>True when the route is a single WireGuard exit, which changes what a failure means.</summary>
+    public bool ViaTunnel { get; private set; }
+
     public RouteObservation Route { get; private set; }
 
     public DateTimeOffset CreatedAtUtc { get; }
@@ -84,6 +87,7 @@ public sealed class Flow
         ProcessName = plan.ProcessName;
         Host = plan.Host;
         ProxyName = plan.Kind == FlowPlanKind.Proxy ? plan.RouteName : null;
+        ViaTunnel = plan.Kind == FlowPlanKind.Proxy && plan.Hops.Count == 1 && plan.Hops[0].IsTunnel;
     }
 
     public void MarkEstablished(RouteObservation route)

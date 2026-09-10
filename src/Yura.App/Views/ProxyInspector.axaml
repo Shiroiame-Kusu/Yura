@@ -1,0 +1,337 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:Yura.App.ViewModels"
+             xmlns:loc="using:Yura.App.Localization"
+             xmlns:proxies="using:Yura.Core.Proxies"
+             mc:Ignorable="d"
+             x:Class="Yura.App.Views.ProxyInspector"
+             x:DataType="vm:ProxiesPageViewModel">
+
+  <!--
+    The proxy and chain editors, and what the panel says when neither is open.
+
+    In its own control because the page shows it in two positions — docked beside the lists on
+    a wide window, floating over them on a narrow one, where a docked 440-DIP panel would
+    squeeze the list into illegibility. Duplicated markup would drift, which is why the rule
+    inspector was extracted for the same reason.
+  -->
+  <Panel>
+
+    <!-- Proxy editor. Protocol-specific fields appear only for their protocol, so the
+         common path stays four fields and a WireGuard exit shows what a .conf holds. -->
+    <Border Classes="Panel" IsVisible="{Binding Editor.IsOpen}">
+      <ScrollViewer>
+        <StackPanel Margin="16" Spacing="14" DataContext="{Binding Editor}"
+                    x:DataType="vm:ProxyEditorViewModel">
+
+          <TextBlock Classes="SectionTitle" Text="{Binding Title}" />
+
+          <TextBlock Classes="FieldHint" Text="{loc:Tr Proxy.WireGuard.Hint}" Margin="0"
+                     IsVisible="{Binding IsWireGuard}" />
+
+          <!-- Import: the way almost every WireGuard exit will be entered. -->
+          <Expander Header="{loc:Tr Proxy.WireGuard.Import}" IsExpanded="{Binding ShowImport}"
+                    IsVisible="{Binding IsWireGuard}">
+            <StackPanel Spacing="8" Margin="0,6,0,0">
+              <TextBlock Classes="FieldHint" Margin="0" Text="{loc:Tr Proxy.WireGuard.ImportHint}" />
+              <TextBox Text="{Binding ImportText}" AcceptsReturn="True" TextWrapping="NoWrap" Height="120"
+                       Classes="Mono" FontSize="12"
+                       PlaceholderText="[Interface]&#x0a;PrivateKey = …&#x0a;Address = …&#x0a;[Peer]&#x0a;PublicKey = …&#x0a;Endpoint = …"
+                       AutomationProperties.Name="{loc:Tr Proxy.WireGuard.Import}" />
+              <Grid ColumnDefinitions="*,8,*">
+                <Button Grid.Column="0" HorizontalAlignment="Stretch" Command="{Binding ImportFromTextCommand}"
+                        Content="{loc:Tr Proxy.WireGuard.ImportApply}" />
+                <Button Grid.Column="2" HorizontalAlignment="Stretch" Command="{Binding ImportFromFileCommand}"
+                        Content="{loc:Tr Proxy.WireGuard.ImportFile}" />
+              </Grid>
+              <TextBlock Classes="FieldHint" Margin="0" Text="{Binding ImportMessage}" TextWrapping="Wrap"
+                         IsVisible="{Binding ImportMessage, Converter={x:Static ObjectConverters.IsNotNull}}" />
+            </StackPanel>
+          </Expander>
+
+          <!-- Name -->
+          <StackPanel>
+            <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Name}" />
+            <TextBox Text="{Binding Name}"
+                     PlaceholderText="{loc:Tr Proxy.NamePlaceholder}"
+                     Classes.Invalid="{Binding HasNameError}"
+                     AutomationProperties.Name="{loc:Tr Proxy.Name}" />
+            <TextBlock Classes="FieldError" Text="{Binding NameError}" IsVisible="{Binding HasNameError}" />
+          </StackPanel>
+
+          <!-- Protocol -->
+          <StackPanel>
+            <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Protocol}" />
+            <ComboBox ItemsSource="{Binding Protocols}" SelectedItem="{Binding Protocol}"
+                      HorizontalAlignment="Stretch"
+                      AutomationProperties.Name="{loc:Tr Proxy.Protocol}">
+              <ComboBox.ItemTemplate>
+                <DataTemplate x:DataType="proxies:ProxyProtocol">
+                  <TextBlock Text="{Binding Converter={StaticResource ProtocolDisplay}}" />
+                </DataTemplate>
+              </ComboBox.ItemTemplate>
+            </ComboBox>
+          </StackPanel>
+
+          <!-- Host / endpoint + port -->
+          <Grid ColumnDefinitions="*,12,96">
+            <StackPanel Grid.Column="0">
+              <TextBlock Classes="FieldLabel" Text="{Binding HostLabel}" />
+              <TextBox Text="{Binding Host}"
+                       PlaceholderText="{Binding HostPlaceholder}"
+                       Classes.Invalid="{Binding HasHostError}"
+                       AutomationProperties.Name="{Binding HostLabel}" />
+            </StackPanel>
+            <StackPanel Grid.Column="2">
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Port}" />
+              <TextBox Text="{Binding Port}" Classes="Metric"
+                       Classes.Invalid="{Binding HasPortError}"
+                       AutomationProperties.Name="{loc:Tr Proxy.Port}" />
+            </StackPanel>
+          </Grid>
+          <TextBlock Classes="FieldError" Text="{Binding HostError}" IsVisible="{Binding HasHostError}" />
+          <TextBlock Classes="FieldError" Text="{Binding PortError}" IsVisible="{Binding HasPortError}" />
+
+          <!-- Credentials, for proxies -->
+          <Grid ColumnDefinitions="*,12,*" IsVisible="{Binding UsesCredentials}">
+            <StackPanel Grid.Column="0">
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Username}" />
+              <TextBox Text="{Binding Username}" PlaceholderText="{loc:Tr Proxy.Optional}"
+                       AutomationProperties.Name="{loc:Tr Proxy.Username}" />
+            </StackPanel>
+            <StackPanel Grid.Column="2">
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Password}" />
+              <TextBox Text="{Binding Password}" PasswordChar="•"
+                       PlaceholderText="{Binding PasswordPlaceholder}"
+                       AutomationProperties.Name="{loc:Tr Proxy.Password}" />
+            </StackPanel>
+          </Grid>
+
+          <!-- HTTPS: the one option that changes what "reachable" means. -->
+          <StackPanel Spacing="2" IsVisible="{Binding IsHttps}">
+            <CheckBox IsChecked="{Binding AllowInvalidCertificate}" Content="{loc:Tr Proxy.AllowInvalidCertificate}" />
+            <TextBlock Classes="FieldHint" Margin="28,0,0,0" Text="{loc:Tr Proxy.AllowInvalidCertificateHint}" />
+          </StackPanel>
+
+          <!-- WireGuard -->
+          <StackPanel Spacing="14" IsVisible="{Binding IsWireGuard}">
+            <StackPanel>
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.PrivateKey}" />
+              <TextBox Text="{Binding PrivateKey}" PasswordChar="•" Classes="Mono"
+                       PlaceholderText="{Binding PrivateKeyPlaceholder}"
+                       Classes.Invalid="{Binding HasPrivateKeyError}"
+                       AutomationProperties.Name="{loc:Tr Proxy.PrivateKey}" />
+              <TextBlock Classes="FieldError" Text="{Binding PrivateKeyError}" IsVisible="{Binding HasPrivateKeyError}" />
+            </StackPanel>
+            <StackPanel>
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.PeerPublicKey}" />
+              <TextBox Text="{Binding PeerPublicKey}" Classes="Mono"
+                       Classes.Invalid="{Binding HasPeerPublicKeyError}"
+                       AutomationProperties.Name="{loc:Tr Proxy.PeerPublicKey}" />
+              <TextBlock Classes="FieldError" Text="{Binding PeerPublicKeyError}" IsVisible="{Binding HasPeerPublicKeyError}" />
+            </StackPanel>
+            <StackPanel>
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.PresharedKey}" />
+              <TextBox Text="{Binding PresharedKey}" PasswordChar="•" Classes="Mono"
+                       PlaceholderText="{Binding PresharedKeyPlaceholder}"
+                       Classes.Invalid="{Binding HasPresharedKeyError}"
+                       AutomationProperties.Name="{loc:Tr Proxy.PresharedKey}" />
+              <TextBlock Classes="FieldError" Text="{Binding PresharedKeyError}" IsVisible="{Binding HasPresharedKeyError}" />
+            </StackPanel>
+            <StackPanel>
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Addresses}" />
+              <TextBox Text="{Binding Addresses}" Classes="Mono" PlaceholderText="{loc:Tr Proxy.AddressesPlaceholder}"
+                       Classes.Invalid="{Binding HasAddressesError}"
+                       AutomationProperties.Name="{loc:Tr Proxy.Addresses}" />
+              <TextBlock Classes="FieldError" Text="{Binding AddressesError}" IsVisible="{Binding HasAddressesError}" />
+            </StackPanel>
+            <StackPanel>
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Dns}" />
+              <TextBox Text="{Binding DnsServers}" Classes="Mono" PlaceholderText="{loc:Tr Proxy.DnsPlaceholder}"
+                       Classes.Invalid="{Binding HasDnsError}"
+                       AutomationProperties.Name="{loc:Tr Proxy.Dns}" />
+              <TextBlock Classes="FieldError" Text="{Binding DnsError}" IsVisible="{Binding HasDnsError}" />
+              <TextBlock Classes="FieldHint" Text="{loc:Tr Proxy.DnsHint}" />
+            </StackPanel>
+            <StackPanel>
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.AllowedIps}" />
+              <TextBox Text="{Binding AllowedIps}" Classes="Mono"
+                       Classes.Invalid="{Binding HasAllowedIpsError}"
+                       AutomationProperties.Name="{loc:Tr Proxy.AllowedIps}" />
+              <TextBlock Classes="FieldError" Text="{Binding AllowedIpsError}" IsVisible="{Binding HasAllowedIpsError}" />
+              <TextBlock Classes="FieldHint" Text="{loc:Tr Proxy.AllowedIpsHint}" />
+            </StackPanel>
+            <Grid ColumnDefinitions="*,12,*">
+              <StackPanel Grid.Column="0">
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Mtu}" />
+                <TextBox Text="{Binding Mtu}" Classes="Metric" PlaceholderText="1420"
+                         Classes.Invalid="{Binding HasMtuError}"
+                         AutomationProperties.Name="{loc:Tr Proxy.Mtu}" />
+                <TextBlock Classes="FieldError" Text="{Binding MtuError}" IsVisible="{Binding HasMtuError}" />
+              </StackPanel>
+              <StackPanel Grid.Column="2">
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Keepalive}" />
+                <TextBox Text="{Binding Keepalive}" Classes="Metric"
+                         Classes.Invalid="{Binding HasKeepaliveError}"
+                         AutomationProperties.Name="{loc:Tr Proxy.Keepalive}" />
+                <TextBlock Classes="FieldError" Text="{Binding KeepaliveError}" IsVisible="{Binding HasKeepaliveError}" />
+              </StackPanel>
+            </Grid>
+          </StackPanel>
+
+          <!-- Where the secrets actually go, stated rather than assumed. -->
+          <TextBlock Classes="FieldHint" Margin="0" Text="{Binding SecretStoreDescription}" />
+
+          <Border Classes="Divider" />
+
+          <!-- Test result. Reports exactly what the probe found, including "not run". -->
+          <StackPanel Spacing="8">
+            <Button HorizontalAlignment="Stretch"
+                    Command="{Binding TestCommand}"
+                    IsEnabled="{Binding CanTest}"
+                    Content="{loc:Tr Proxy.TestConnection}" />
+
+            <Border Classes="Badge" HorizontalAlignment="Left"
+                    IsVisible="{Binding TestResultText, Converter={x:Static ObjectConverters.IsNotNull}}"
+                    Classes.Success="{Binding TestSucceeded}"
+                    Classes.Danger="{Binding !TestSucceeded}">
+              <TextBlock Text="{Binding TestResultText}" TextWrapping="Wrap" MaxWidth="380" />
+            </Border>
+
+            <Expander Header="{loc:Tr Common.Details}"
+                      IsVisible="{Binding TestDiagnostics, Converter={x:Static ObjectConverters.IsNotNull}}">
+              <SelectableTextBlock Classes="Mono" Text="{Binding TestDiagnostics}" TextWrapping="Wrap" />
+            </Expander>
+          </StackPanel>
+
+          <Grid ColumnDefinitions="*,8,*">
+            <Button Grid.Column="0" Classes="accent" HorizontalAlignment="Stretch"
+                    Command="{Binding SaveCommand}" IsEnabled="{Binding CanSave}"
+                    Content="{loc:Tr Common.Save}" />
+            <Button Grid.Column="2" HorizontalAlignment="Stretch"
+                    Command="{Binding CancelCommand}"
+                    Content="{loc:Tr Common.Cancel}" />
+          </Grid>
+
+          <!-- Removal is a two-step action, with what it will affect stated first. -->
+          <StackPanel Spacing="8" IsVisible="{Binding CanRemove}">
+            <Border Classes="Divider" />
+            <Button HorizontalAlignment="Left" Command="{Binding BeginRemoveCommand}"
+                    Content="{loc:Tr Common.Remove}" IsVisible="{Binding !IsConfirmingRemove}" />
+            <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraDangerSubtle}"
+                    BorderBrush="{DynamicResource YuraDanger}" IsVisible="{Binding IsConfirmingRemove}">
+              <StackPanel Spacing="8">
+                <TextBlock Text="{Binding RemoveConfirmText}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                <TextBlock Classes="Caption" Text="{Binding RemoveUsageText}" TextWrapping="Wrap" />
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                  <Button Command="{Binding ConfirmRemoveCommand}" Content="{loc:Tr Common.Remove}"
+                          Foreground="{DynamicResource YuraDanger}" />
+                  <Button Command="{Binding KeepProxyCommand}" Content="{loc:Tr Proxy.Keep}" />
+                </StackPanel>
+              </StackPanel>
+            </Border>
+          </StackPanel>
+        </StackPanel>
+      </ScrollViewer>
+    </Border>
+
+    <!-- Chain editor -->
+    <Border Classes="Panel" IsVisible="{Binding ChainEditor.IsOpen}">
+      <ScrollViewer>
+        <StackPanel Margin="16" Spacing="14" DataContext="{Binding ChainEditor}"
+                    x:DataType="vm:ChainEditorViewModel">
+
+          <TextBlock Classes="SectionTitle" Text="{Binding Title}" />
+          <TextBlock Classes="FieldHint" Margin="0" Text="{loc:Tr Chain.Hint}" />
+
+          <StackPanel>
+            <TextBlock Classes="FieldLabel" Text="{loc:Tr Chain.Name}" />
+            <TextBox Text="{Binding Name}" PlaceholderText="{loc:Tr Chain.NamePlaceholder}"
+                     Classes.Invalid="{Binding HasNameError}"
+                     AutomationProperties.Name="{loc:Tr Chain.Name}" />
+            <TextBlock Classes="FieldError" Text="{Binding NameError}" IsVisible="{Binding HasNameError}" />
+          </StackPanel>
+
+          <StackPanel Spacing="6">
+            <TextBlock Classes="FieldLabel" Text="{loc:Tr Chain.Hops}" />
+            <Border Classes="Sunken" MinHeight="72">
+              <ListBox Classes="Table" ItemsSource="{Binding Hops}" SelectedItem="{Binding SelectedHop}"
+                       Background="Transparent" BorderThickness="0"
+                       AutomationProperties.Name="{loc:Tr Chain.Hops}">
+                <ListBox.ItemTemplate>
+                  <DataTemplate x:DataType="vm:ChainHopViewModel">
+                    <StackPanel Margin="10,6" Spacing="1">
+                      <TextBlock Text="{Binding Name}" />
+                      <TextBlock Classes="Mono Tertiary" Text="{Binding Detail}" TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+            </Border>
+            <TextBlock Classes="FieldError" Text="{Binding HopsError}" IsVisible="{Binding HasHopsError}" Margin="0" />
+            <Grid ColumnDefinitions="Auto,Auto,Auto" ColumnSpacing="6">
+              <Button Grid.Column="0" Command="{Binding MoveHopUpCommand}" IsEnabled="{Binding CanMoveUp}"
+                      Content="{loc:Tr Chain.MoveUp}" />
+              <Button Grid.Column="1" Command="{Binding MoveHopDownCommand}" IsEnabled="{Binding CanMoveDown}"
+                      Content="{loc:Tr Chain.MoveDown}" />
+              <Button Grid.Column="2" Command="{Binding RemoveHopCommand}" IsEnabled="{Binding CanRemoveHop}"
+                      Content="{loc:Tr Chain.RemoveHop}" />
+            </Grid>
+          </StackPanel>
+
+          <Grid ColumnDefinitions="*,8,Auto">
+            <ComboBox Grid.Column="0" ItemsSource="{Binding AvailableProxies}" SelectedItem="{Binding ProxyToAdd}"
+                      HorizontalAlignment="Stretch" AutomationProperties.Name="{loc:Tr Chain.AddHop}">
+              <ComboBox.ItemTemplate>
+                <DataTemplate x:DataType="proxies:ProxyEndpoint">
+                  <TextBlock Text="{Binding Name}" />
+                </DataTemplate>
+              </ComboBox.ItemTemplate>
+            </ComboBox>
+            <Button Grid.Column="2" Command="{Binding AddHopCommand}" IsEnabled="{Binding CanAddHop}"
+                    Content="{loc:Tr Chain.AddHop}" />
+          </Grid>
+
+          <Border Classes="Divider" />
+
+          <Grid ColumnDefinitions="*,8,*">
+            <Button Grid.Column="0" Classes="accent" HorizontalAlignment="Stretch"
+                    Command="{Binding SaveCommand}" IsEnabled="{Binding IsValid}"
+                    Content="{loc:Tr Common.Save}" />
+            <Button Grid.Column="2" HorizontalAlignment="Stretch"
+                    Command="{Binding CancelCommand}"
+                    Content="{loc:Tr Common.Cancel}" />
+          </Grid>
+
+          <StackPanel Spacing="8" IsVisible="{Binding CanRemove}">
+            <Border Classes="Divider" />
+            <Button HorizontalAlignment="Left" Command="{Binding BeginRemoveCommand}"
+                    Content="{loc:Tr Common.Remove}" IsVisible="{Binding !IsConfirmingRemove}" />
+            <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraDangerSubtle}"
+                    BorderBrush="{DynamicResource YuraDanger}" IsVisible="{Binding IsConfirmingRemove}">
+              <StackPanel Spacing="8">
+                <TextBlock Text="{Binding RemoveConfirmText}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                <TextBlock Classes="Caption" Text="{Binding RemoveUsageText}" TextWrapping="Wrap" />
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                  <Button Command="{Binding ConfirmRemoveCommand}" Content="{loc:Tr Common.Remove}"
+                          Foreground="{DynamicResource YuraDanger}" />
+                  <Button Command="{Binding KeepChainCommand}" Content="{loc:Tr Proxy.Keep}" />
+                </StackPanel>
+              </StackPanel>
+            </Border>
+          </StackPanel>
+        </StackPanel>
+      </ScrollViewer>
+    </Border>
+
+    <!-- Nothing open: say what the panel is for rather than leaving a blank box. -->
+    <Border Classes="Panel" IsVisible="{Binding !IsAnyEditorOpen}">
+      <StackPanel Margin="16" Spacing="8" VerticalAlignment="Top">
+        <TextBlock Classes="SectionTitle" Text="{loc:Tr Proxy.Editor.Idle}" />
+        <TextBlock Classes="Subtitle" Text="{loc:Tr Proxy.Editor.IdleHint}" />
+      </StackPanel>
+    </Border>
+  </Panel>
+</UserControl>

@@ -19,13 +19,12 @@ public sealed record RouteOption(Guid Id, string Name, bool IsChain, CapabilityS
     public static RouteOption For(ProxyEndpoint proxy) =>
         new(proxy.Id, proxy.Name, false, proxy.UdpSupport, $"{proxy.ProtocolDisplay} · {proxy.Authority}");
 
-    public static RouteOption For(ProxyChain chain, IEnumerable<ProxyEndpoint> proxies)
-    {
-        var names = chain.Hops
-            .Select(id => proxies.FirstOrDefault(p => p.Id == id)?.Name ?? "?")
-            .ToArray();
-        return new RouteOption(chain.Id, chain.Name, true, chain.SupportsUdp, string.Join(" → ", names));
-    }
+    /// <summary>"Home server → Tokyo relay", with a missing hop shown as "?" rather than hidden.</summary>
+    public static string DescribeHops(ProxyChain chain, IEnumerable<ProxyEndpoint> proxies) =>
+        string.Join(" → ", chain.Hops.Select(id => proxies.FirstOrDefault(p => p.Id == id)?.Name ?? "?"));
+
+    public static RouteOption For(ProxyChain chain, IEnumerable<ProxyEndpoint> proxies) =>
+        new(chain.Id, chain.Name, true, chain.SupportsUdp, DescribeHops(chain, proxies));
 
     public RuleAction ToAction() => IsChain ? new RuleAction.Chain(Id) : new RuleAction.Proxy(Id);
 }
@@ -121,6 +120,73 @@ public sealed class RuleStore
     /// <summary>Display name of a route id, whether it is a proxy or a chain.</summary>
     public string? RouteName(Guid id) =>
         Proxies.FirstOrDefault(p => p.Id == id)?.Name ?? Chains.FirstOrDefault(c => c.Id == id)?.Name;
+
+    /// <summary>Rules whose action names this proxy or chain directly.</summary>
+    public IReadOnlyList<RoutingRule> RulesUsing(Guid routeId) =>
+        _rules.Where(r => r.Action switch
+        {
+            RuleAction.Proxy p => p.EndpointId == routeId,
+            RuleAction.Chain c => c.ChainId == routeId,
+            _ => false,
+        }).ToArray();
+
+    /// <summary>Chains that have this proxy as a hop.</summary>
+    public IReadOnlyList<ProxyChain> ChainsUsing(Guid proxyId) =>
+        Chains.Where(c => c.Hops.Contains(proxyId)).ToArray();
+
+    /// <summary>
+    /// Removes a proxy and takes it out of every chain that used it. Rules that named it are
+    /// left in place: they show an unknown route rather than silently changing meaning.
+    /// </summary>
+    /// <returns>Chains that were left with no hops and were therefore removed too.</returns>
+    public IReadOnlyList<ProxyChain> RemoveProxy(Guid proxyId)
+    {
+        var emptied = new List<ProxyChain>();
+        foreach (var chain in Chains.Where(c => c.Hops.Contains(proxyId)).ToList())
+        {
+            var remaining = chain.Hops.Where(h => h != proxyId).ToArray();
+            if (remaining.Length == 0)
+            {
+                Chains.Remove(chain);
+                emptied.Add(chain);
+            }
+            else
+            {
+                Chains[Chains.IndexOf(chain)] = chain with { Hops = remaining };
+            }
+        }
+
+        var proxy = Proxies.FirstOrDefault(p => p.Id == proxyId);
+        if (proxy is not null)
+        {
+            Proxies.Remove(proxy);
+        }
+
+        return emptied;
+    }
+
+    /// <summary>Adds or replaces a chain, keeping its position when it already exists.</summary>
+    public void PutChain(ProxyChain chain)
+    {
+        var existing = Chains.FirstOrDefault(c => c.Id == chain.Id);
+        if (existing is null)
+        {
+            Chains.Add(chain);
+        }
+        else
+        {
+            Chains[Chains.IndexOf(existing)] = chain;
+        }
+    }
+
+    public void RemoveChain(Guid chainId)
+    {
+        var chain = Chains.FirstOrDefault(c => c.Id == chainId);
+        if (chain is not null)
+        {
+            Chains.Remove(chain);
+        }
+    }
 
     /// <summary>
     /// Replaces the rule list with what was loaded from disk.

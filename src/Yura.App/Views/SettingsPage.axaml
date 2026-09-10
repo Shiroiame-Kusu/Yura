@@ -4,76 +4,275 @@
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
              xmlns:vm="using:Yura.App.ViewModels"
              xmlns:loc="using:Yura.App.Localization"
+             xmlns:icons="using:FluentIcons.Avalonia"
              mc:Ignorable="d"
              x:Class="Yura.App.Views.SettingsPage"
              x:DataType="vm:SettingsPageViewModel">
 
   <Grid RowDefinitions="Auto,*">
 
-    <StackPanel Grid.Row="0" Margin="24,20,24,12" Spacing="2">
-      <TextBlock Classes="PageTitle" Text="{loc:Tr Settings.Title}" />
-      <TextBlock Classes="Subtitle" Text="{loc:Tr Settings.Subtitle}" MaxWidth="620" HorizontalAlignment="Left" />
-    </StackPanel>
+    <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="24,20,24,12">
+      <StackPanel Grid.Column="0" Spacing="2">
+        <TextBlock Classes="PageTitle" Text="{loc:Tr Settings.Title}" />
+        <TextBlock Classes="Subtitle" Text="{loc:Tr Settings.Subtitle}" MaxWidth="640" HorizontalAlignment="Left" />
+      </StackPanel>
+    </Grid>
 
     <ScrollViewer Grid.Row="1" Margin="24,0,24,20">
-      <StackPanel Spacing="16" MaxWidth="720" HorizontalAlignment="Left">
+      <StackPanel Spacing="20" MaxWidth="860" HorizontalAlignment="Left">
 
-        <Border Classes="Panel" Padding="16">
-          <StackPanel Spacing="10">
-            <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Appearance}" />
-            <CheckBox IsChecked="{Binding IsDarkTheme}" Content="{loc:Tr Settings.DarkTheme}" />
-            <CheckBox IsChecked="{Binding IsChinese}" Content="{loc:Tr Settings.Chinese}" />
-            <StackPanel Spacing="2">
-              <CheckBox IsChecked="{Binding ReducedMotion}" Content="{loc:Tr Settings.ReducedMotion}" />
-              <TextBlock Classes="FieldHint" Text="{loc:Tr Settings.ReducedMotionHint}" Margin="28,0,0,0" />
-            </StackPanel>
-          </StackPanel>
-        </Border>
+        <!-- ======================= Daemon service =======================
+             First, because nothing else on any page takes effect without it. -->
+        <StackPanel Spacing="8">
+          <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Service}" />
+          <TextBlock Classes="Caption" Text="{loc:Tr Settings.Service.Hint}" TextWrapping="Wrap" />
+          <Border Classes="SettingGroup">
+            <StackPanel>
 
-        <Border Classes="Panel" Padding="16">
-          <StackPanel Spacing="10">
-            <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Processes}" />
-            <StackPanel Spacing="2">
-              <CheckBox IsChecked="{Binding ShowAllProcesses}" Content="{loc:Tr Settings.ShowAllProcesses}" />
-              <TextBlock Classes="FieldHint" Text="{loc:Tr Settings.ShowAllProcessesHint}" Margin="28,0,0,0" />
-            </StackPanel>
-          </StackPanel>
-        </Border>
+              <!-- State -->
+              <Border Classes="SettingRow">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+                  <StackPanel Grid.Column="0">
+                    <TextBlock Classes="SettingTitle" Text="{loc:Tr Settings.Service.State}" />
+                    <TextBlock Classes="SettingDescription" Text="{Binding ServiceEnabledText}" />
+                    <TextBlock Classes="SettingDescription Mono" Text="{Binding ServiceExecStartText}"
+                               IsVisible="{Binding IsServiceInstalled}" />
+                    <TextBlock Classes="FieldError" Text="{Binding ServiceDetailText}"
+                               IsVisible="{Binding IsServiceFailed}" />
+                  </StackPanel>
+                  <Border Grid.Column="1" Classes="Badge" VerticalAlignment="Center"
+                          Classes.Success="{Binding IsServiceRunning}"
+                          Classes.Danger="{Binding IsServiceFailed}"
+                          Classes.Warning="{Binding IsServiceStopped}">
+                    <TextBlock Text="{Binding ServiceStateText}" />
+                  </Border>
+                </Grid>
+              </Border>
 
-        <Border Classes="Panel" Padding="16">
-          <StackPanel Spacing="10">
-            <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Networking}" />
-            <StackPanel Spacing="2">
-              <TextBlock Classes="FieldLabel" Text="{loc:Tr Settings.Dns}" />
-              <ComboBox ItemsSource="{Binding DnsPolicies}" SelectedItem="{Binding DnsPolicy}"
-                        HorizontalAlignment="Left" MinWidth="280"
-                        AutomationProperties.Name="{loc:Tr Settings.Dns}">
-                <ComboBox.ItemTemplate>
-                  <DataTemplate>
-                    <TextBlock Text="{Binding Converter={StaticResource DnsPolicyDisplay}}" />
-                  </DataTemplate>
-                </ComboBox.ItemTemplate>
-              </ComboBox>
-              <TextBlock Classes="FieldHint" Text="{Binding DnsPolicyHint}" MaxWidth="640" />
-            </StackPanel>
-          </StackPanel>
-        </Border>
+              <!-- Daemon binary -->
+              <Border Classes="SettingRow">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+                  <StackPanel Grid.Column="0">
+                    <TextBlock Classes="SettingTitle" Text="{loc:Tr Settings.Service.Daemon}" />
+                    <TextBlock Classes="SettingDescription" Text="{Binding DaemonText}" />
+                  </StackPanel>
+                  <TextBox Grid.Column="1" Width="300" VerticalAlignment="Center" Classes="Mono"
+                           Text="{Binding DaemonPathOverride}"
+                           PlaceholderText="{loc:Tr Settings.Service.DaemonPathPlaceholder}"
+                           AutomationProperties.Name="{loc:Tr Settings.Service.Daemon}" />
+                </Grid>
+              </Border>
 
-        <Border Classes="Panel" Padding="16">
-          <StackPanel Spacing="10">
-            <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Storage}" />
-            <StackPanel Spacing="2">
-              <TextBlock Classes="FieldLabel" Text="{loc:Tr Diagnostics.Config}" />
-              <SelectableTextBlock Classes="Mono" Text="{Binding ConfigPath}" />
+              <!-- Control socket -->
+              <Border Classes="SettingRow">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+                  <TextBlock Grid.Column="0" Classes="SettingTitle" Text="{loc:Tr Settings.Service.Socket}" VerticalAlignment="Center" />
+                  <SelectableTextBlock Grid.Column="1" Classes="Mono" Text="{Binding SocketPath}" VerticalAlignment="Center" />
+                </Grid>
+              </Border>
+
+              <!-- Actions -->
+              <Border Classes="SettingRow">
+                <StackPanel Spacing="10">
+                  <TextBlock Classes="SettingDescription" Margin="0" Text="{Binding InstallHint}"
+                             IsVisible="{Binding !IsServiceInstalled}" />
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Classes="accent" Command="{Binding InstallServiceCommand}" IsEnabled="{Binding CanInstall}"
+                            Content="{loc:Tr Settings.Service.Install}" IsVisible="{Binding !IsServiceInstalled}" />
+                    <Button Command="{Binding StartServiceCommand}" IsEnabled="{Binding CanControl}"
+                            Content="{loc:Tr Settings.Service.Start}" IsVisible="{Binding CanShowStart}" />
+                    <Button Command="{Binding StopServiceCommand}" IsEnabled="{Binding CanControl}"
+                            Content="{loc:Tr Settings.Service.Stop}" IsVisible="{Binding IsServiceRunning}" />
+                    <Button Command="{Binding RestartServiceCommand}" IsEnabled="{Binding CanControl}"
+                            Content="{loc:Tr Settings.Service.Restart}" IsVisible="{Binding IsServiceRunning}" />
+                    <Button Command="{Binding InstallServiceCommand}" IsEnabled="{Binding CanInstall}"
+                            Content="{loc:Tr Settings.Service.Reinstall}" IsVisible="{Binding IsServiceInstalled}" />
+                    <Button Command="{Binding UninstallServiceCommand}" IsEnabled="{Binding CanControl}"
+                            Content="{loc:Tr Settings.Service.Uninstall}" IsVisible="{Binding IsServiceInstalled}" />
+                    <Button Command="{Binding RefreshServiceCommand}" Content="{loc:Tr Common.Refresh}" />
+                  </StackPanel>
+                  <TextBlock Classes="Caption" Text="{loc:Tr Settings.Service.NoPolkit}" TextWrapping="Wrap"
+                             IsVisible="{Binding !HasPolkit}" />
+                  <TextBlock Classes="Caption" Text="{loc:Tr Settings.Service.Unsupported}" TextWrapping="Wrap"
+                             IsVisible="{Binding !HasSystemd}" />
+                  <Border Classes="Badge Success" HorizontalAlignment="Left"
+                          IsVisible="{Binding ServiceMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <TextBlock Text="{Binding ServiceMessage}" TextWrapping="Wrap" />
+                  </Border>
+                  <Border Classes="Panel" Padding="10" Background="{DynamicResource YuraDangerSubtle}"
+                          BorderBrush="{DynamicResource YuraDanger}"
+                          IsVisible="{Binding ServiceError, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <SelectableTextBlock Classes="Mono" Text="{Binding ServiceError}" TextWrapping="Wrap" />
+                  </Border>
+                </StackPanel>
+              </Border>
+
+              <!-- What will be installed, in full, before anything runs. -->
+              <Border Classes="SettingRow">
+                <StackPanel Spacing="8">
+                  <Expander Header="{loc:Tr Settings.Service.ShowUnit}" IsExpanded="{Binding ShowUnit}">
+                    <StackPanel Spacing="8" Margin="0,6,0,0">
+                      <Border Classes="Sunken" Padding="10" MaxHeight="300">
+                        <ScrollViewer>
+                          <SelectableTextBlock Classes="Mono" Text="{Binding UnitPreview}" />
+                        </ScrollViewer>
+                      </Border>
+                      <Button HorizontalAlignment="Left" Click="OnCopyUnit" Content="{loc:Tr Settings.Service.CopyUnit}" />
+                    </StackPanel>
+                  </Expander>
+                  <Expander Header="{loc:Tr Settings.Service.ShowScript}" IsExpanded="{Binding ShowScript}">
+                    <StackPanel Spacing="8" Margin="0,6,0,0">
+                      <TextBlock Classes="Caption" Text="{loc:Tr Settings.Service.ScriptHint}" TextWrapping="Wrap" />
+                      <Border Classes="Sunken" Padding="10" MaxHeight="300">
+                        <ScrollViewer>
+                          <SelectableTextBlock Classes="Mono" Text="{Binding InstallScriptPreview}" />
+                        </ScrollViewer>
+                      </Border>
+                      <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Click="OnCopyInstallScript" Content="{loc:Tr Settings.Service.CopyScript}" />
+                        <Button Click="OnCopyUninstallScript" Content="{loc:Tr Settings.Service.CopyUninstall}" />
+                      </StackPanel>
+                    </StackPanel>
+                  </Expander>
+                  <Expander Header="{loc:Tr Settings.Service.Journal}" IsExpanded="True" IsVisible="{Binding HasJournal}">
+                    <Border Classes="Sunken" Padding="10" MaxHeight="220" Margin="0,6,0,0">
+                      <ScrollViewer>
+                        <SelectableTextBlock Classes="Mono" Text="{Binding JournalTail}" />
+                      </ScrollViewer>
+                    </Border>
+                  </Expander>
+                </StackPanel>
+              </Border>
             </StackPanel>
-            <StackPanel Spacing="2">
-              <TextBlock Classes="FieldLabel" Text="{loc:Tr Diagnostics.Secrets}" />
-              <TextBlock Text="{Binding SecretStoreDescription}" />
+          </Border>
+        </StackPanel>
+
+        <!-- =========================== Routing =========================== -->
+        <StackPanel Spacing="8">
+          <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Routing}" />
+          <Border Classes="SettingGroup">
+            <StackPanel>
+              <Border Classes="SettingRow">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+                  <StackPanel Grid.Column="0">
+                    <TextBlock Classes="SettingTitle" Text="{loc:Tr Settings.Dns}" />
+                    <TextBlock Classes="SettingDescription" Text="{Binding DnsPolicyHint}" MaxWidth="520" HorizontalAlignment="Left" />
+                  </StackPanel>
+                  <ComboBox Grid.Column="1" ItemsSource="{Binding DnsPolicies}" SelectedItem="{Binding DnsPolicy}"
+                            MinWidth="240" VerticalAlignment="Center"
+                            AutomationProperties.Name="{loc:Tr Settings.Dns}">
+                    <ComboBox.ItemTemplate>
+                      <DataTemplate>
+                        <TextBlock Text="{Binding Converter={StaticResource DnsPolicyDisplay}}" />
+                      </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                  </ComboBox>
+                </Grid>
+              </Border>
             </StackPanel>
-            <Button HorizontalAlignment="Left" Command="{Binding OpenConfigDirectoryCommand}"
-                    Content="{loc:Tr Settings.OpenConfig}" />
-          </StackPanel>
-        </Border>
+          </Border>
+        </StackPanel>
+
+        <!-- ========================== Appearance ========================== -->
+        <StackPanel Spacing="8">
+          <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Appearance}" />
+          <Border Classes="SettingGroup">
+            <StackPanel>
+              <Border Classes="SettingRow">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+                  <StackPanel Grid.Column="0">
+                    <TextBlock Classes="SettingTitle" Text="{loc:Tr Settings.DarkTheme}" />
+                    <TextBlock Classes="SettingDescription" Text="{loc:Tr Settings.DarkThemeHint}" />
+                  </StackPanel>
+                  <ToggleSwitch Grid.Column="1" IsChecked="{Binding IsDarkTheme}" VerticalAlignment="Center"
+                                AutomationProperties.Name="{loc:Tr Settings.DarkTheme}" />
+                </Grid>
+              </Border>
+              <Border Classes="SettingRow">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+                  <StackPanel Grid.Column="0">
+                    <TextBlock Classes="SettingTitle" Text="{loc:Tr Settings.Language}" />
+                    <TextBlock Classes="SettingDescription" Text="{loc:Tr Settings.LanguageHint}" />
+                  </StackPanel>
+                  <ComboBox Grid.Column="1" ItemsSource="{Binding Languages}" SelectedItem="{Binding SelectedLanguage}"
+                            MinWidth="180" VerticalAlignment="Center"
+                            AutomationProperties.Name="{loc:Tr Settings.Language}">
+                    <ComboBox.ItemTemplate>
+                      <DataTemplate x:DataType="vm:LanguageOption">
+                        <TextBlock Text="{Binding Display}" />
+                      </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                  </ComboBox>
+                </Grid>
+              </Border>
+              <Border Classes="SettingRow">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+                  <StackPanel Grid.Column="0">
+                    <TextBlock Classes="SettingTitle" Text="{loc:Tr Settings.ReducedMotion}" />
+                    <TextBlock Classes="SettingDescription" Text="{loc:Tr Settings.ReducedMotionHint}" />
+                  </StackPanel>
+                  <ToggleSwitch Grid.Column="1" IsChecked="{Binding ReducedMotion}" VerticalAlignment="Center"
+                                AutomationProperties.Name="{loc:Tr Settings.ReducedMotion}" />
+                </Grid>
+              </Border>
+            </StackPanel>
+          </Border>
+        </StackPanel>
+
+        <!-- ========================== Processes ========================== -->
+        <StackPanel Spacing="8">
+          <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Processes}" />
+          <Border Classes="SettingGroup">
+            <Border Classes="SettingRow">
+              <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+                <StackPanel Grid.Column="0">
+                  <TextBlock Classes="SettingTitle" Text="{loc:Tr Settings.ShowAllProcesses}" />
+                  <TextBlock Classes="SettingDescription" Text="{loc:Tr Settings.ShowAllProcessesHint}" />
+                </StackPanel>
+                <ToggleSwitch Grid.Column="1" IsChecked="{Binding ShowAllProcesses}" VerticalAlignment="Center"
+                              AutomationProperties.Name="{loc:Tr Settings.ShowAllProcesses}" />
+              </Grid>
+            </Border>
+          </Border>
+        </StackPanel>
+
+        <!-- =========================== Storage =========================== -->
+        <StackPanel Spacing="8">
+          <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.Storage}" />
+          <Border Classes="SettingGroup">
+            <StackPanel>
+              <Border Classes="SettingRow">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+                  <StackPanel Grid.Column="0">
+                    <TextBlock Classes="SettingTitle" Text="{loc:Tr Diagnostics.Config}" />
+                    <SelectableTextBlock Classes="Mono" Text="{Binding ConfigPath}" Margin="0,2,0,0" />
+                  </StackPanel>
+                  <Button Grid.Column="1" VerticalAlignment="Center" Command="{Binding OpenConfigDirectoryCommand}"
+                          Content="{loc:Tr Settings.OpenConfig}" />
+                </Grid>
+              </Border>
+              <Border Classes="SettingRow">
+                <StackPanel>
+                  <TextBlock Classes="SettingTitle" Text="{loc:Tr Diagnostics.Secrets}" />
+                  <TextBlock Classes="SettingDescription" Text="{Binding SecretStoreDescription}" />
+                </StackPanel>
+              </Border>
+            </StackPanel>
+          </Border>
+        </StackPanel>
+
+        <!-- ============================ About ============================ -->
+        <StackPanel Spacing="8">
+          <TextBlock Classes="SectionTitle" Text="{loc:Tr Settings.About}" />
+          <Border Classes="SettingGroup">
+            <Border Classes="SettingRow">
+              <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+                <TextBlock Grid.Column="0" Classes="SettingTitle" Text="{loc:Tr Settings.Version}" VerticalAlignment="Center" />
+                <TextBlock Grid.Column="1" Classes="Mono" Text="{Binding AppVersion}" VerticalAlignment="Center" />
+              </Grid>
+            </Border>
+          </Border>
+        </StackPanel>
 
         <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraAccentSubtle}"
                 BorderBrush="{DynamicResource YuraAccent}"

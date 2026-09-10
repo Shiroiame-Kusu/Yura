@@ -13,7 +13,9 @@ namespace Yura.Daemon;
 
 internal static class Program
 {
-    public const string Version = "0.2.0";
+    /// <summary>Taken from the assembly so the daemon and the app always agree with the build.</summary>
+    public static readonly string Version =
+        typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
 
     public static async Task<int> Main(string[] args)
     {
@@ -118,7 +120,16 @@ internal static class Program
         var flows = new FlowRegistry();
         var ownership = new SocketOwnership();
 
-        await using var runtime = new RuleRuntime(cgroups, nftables, processes, flows, ownership, Log);
+        // WireGuard is optional: a machine without the tool or the module still routes through
+        // proxies, and any WireGuard exit it is given is refused with the reason found here.
+        var wireguard = new WireGuardManager(commands, Log);
+        checks.AddRange(await wireguard.CheckAsync().ConfigureAwait(false));
+        if (wireguard.IsAvailable)
+        {
+            await wireguard.CleanupLeftoversAsync().ConfigureAwait(false);
+        }
+
+        await using var runtime = new RuleRuntime(cgroups, nftables, wireguard, processes, flows, ownership, Log);
 
         var routingOk = await routing.InstallAsync().ConfigureAwait(false);
         checks.Add(new CheckDto { Name = "Policy routing installed", Passed = routingOk, Detail = routingOk ? $"fwmark 0x{PolicyRouting.MarkBase:x}/0x{PolicyRouting.MarkMask:x} -> table {PolicyRouting.RoutingTable}" : "see daemon log" });
@@ -173,7 +184,7 @@ internal static class Program
         };
 
         var connections = new ConnectionLister(runtime, flows, ownership, processes);
-        await using var ipc = new IpcServer(socketPath, allowedUids, runtime, flows, ownership, connections, nftables, commands, logBuffer, environment, Log);
+        await using var ipc = new IpcServer(socketPath, allowedUids, runtime, flows, ownership, connections, nftables, wireguard, commands, logBuffer, environment, Log);
         ipc.Start();
 
         // The registrations must be held. PosixSignalRegistration unregisters the handler
@@ -251,7 +262,7 @@ internal static class Program
         await runtime.TeardownAsync().ConfigureAwait(false);
         await routing.RemoveAsync().ConfigureAwait(false);
         routing.RestoreSysctls();
-        Log("clean shutdown: rules, routing and cgroups removed");
+        Log("clean shutdown: rules, routing, tunnels and cgroups removed");
         return 0;
     }
 

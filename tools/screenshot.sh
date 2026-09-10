@@ -24,6 +24,7 @@ LANG_TAG="en"
 PAGE="processes"
 SETTLE="4"
 DEMO=""
+DEMO_EDITOR=""
 CONFIG_DIR=""
 
 while [[ $# -gt 0 ]]; do
@@ -36,6 +37,7 @@ while [[ $# -gt 0 ]]; do
     --page) PAGE="$2"; shift 2 ;;
     --settle) SETTLE="$2"; shift 2 ;;
     --demo) DEMO="--demo"; shift ;;
+    --demo-editor) DEMO_EDITOR="--demo-editor $2"; shift 2 ;;
     --config-dir) CONFIG_DIR="--config-dir $2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -74,7 +76,7 @@ export AVALONIA_GLOBAL_SCALE_FACTOR="$SCALE"
 dotnet run --project src/Yura.App/Yura.App.csproj -v q -- \
   --screenshot-mode \
   --width "$WIDTH" --height "$HEIGHT" \
-  --theme "$THEME" --lang "$LANG_TAG" --page "$PAGE" $DEMO $CONFIG_DIR \
+  --theme "$THEME" --lang "$LANG_TAG" --page "$PAGE" $DEMO $DEMO_EDITOR $CONFIG_DIR \
   > /tmp/yura-screenshot.log 2>&1 &
 APP_PID=$!
 

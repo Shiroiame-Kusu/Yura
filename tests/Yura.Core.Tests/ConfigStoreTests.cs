@@ -299,4 +299,47 @@ public sealed class ConfigStoreTests : IDisposable
 
         Assert.False(File.Exists(store.FilePath + ".tmp"));
     }
+    [Fact]
+    public async Task A_wireguard_exit_round_trips_its_settings_and_never_its_keys()
+    {
+        var exit = new ProxyEndpoint
+        {
+            Id = Guid.NewGuid(),
+            Name = "Frankfurt exit",
+            Protocol = ProxyProtocol.WireGuard,
+            Host = "wg.example.net",
+            Port = 51820,
+            PasswordRef = "ref-private",
+            WireGuard = new WireGuardSettings
+            {
+                PeerPublicKey = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=",
+                Addresses = ["10.8.0.7/32", "fd42::7/128"],
+                DnsServers = ["10.8.0.1"],
+                AllowedIps = ["0.0.0.0/0"],
+                Mtu = 1380,
+                PersistentKeepalive = 25,
+                PresharedKeyRef = "ref-psk",
+            },
+        };
+
+        var store = NewStore();
+        Assert.Null(await store.SaveAsync(Snapshot(proxies: [exit])));
+
+        var text = await File.ReadAllTextAsync(store.FilePath);
+        Assert.DoesNotContain("PrivateKey", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("presharedKey\"", text, StringComparison.Ordinal);
+        Assert.Contains("\"wireGuard\"", text, StringComparison.Ordinal);
+
+        var restored = store.Load().Document.Proxies.Single().ToEndpoint();
+        Assert.Equal(ProxyProtocol.WireGuard, restored.Protocol);
+        Assert.Equal("ref-private", restored.PasswordRef);
+        Assert.NotNull(restored.WireGuard);
+        Assert.Equal(exit.WireGuard.PeerPublicKey, restored.WireGuard!.PeerPublicKey);
+        Assert.Equal(exit.WireGuard.Addresses, restored.WireGuard.Addresses);
+        Assert.Equal(exit.WireGuard.DnsServers, restored.WireGuard.DnsServers);
+        Assert.Equal(exit.WireGuard.AllowedIps, restored.WireGuard.AllowedIps);
+        Assert.Equal(1380, restored.WireGuard.Mtu);
+        Assert.Equal(25, restored.WireGuard.PersistentKeepalive);
+        Assert.Equal("ref-psk", restored.WireGuard.PresharedKeyRef);
+    }
 }

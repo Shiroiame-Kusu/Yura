@@ -12,8 +12,14 @@ namespace Yura.Daemon.Forwarding;
 /// <summary>Raised when a proxy refuses or garbles a handshake. The message is operator-facing.</summary>
 public sealed class ProxyHandshakeException(string message) : Exception(message);
 
-/// <summary>One hop of a route: an endpoint plus the credential the app handed over.</summary>
-public sealed record ProxyHop(ProxyEndpoint Endpoint, string? Password);
+/// <summary>
+/// One hop of a route: an endpoint plus the credential the app handed over, or the installed
+/// tunnel when the endpoint is a WireGuard exit.
+/// </summary>
+public sealed record ProxyHop(ProxyEndpoint Endpoint, string? Password, WireGuardTunnel? Tunnel = null)
+{
+    public bool IsTunnel => Tunnel is not null;
+}
 
 /// <summary>
 /// The daemon's side of a relayed connection: the socket it dialled and the stream it
@@ -83,8 +89,14 @@ public sealed class UpstreamLeg : IAsyncDisposable
 /// again could send the flow somewhere different. Intermediate hops are sent by whatever
 /// the user typed, since the previous hop is the one that has to reach them.
 ///
-/// Every socket opened here carries the bypass mark, which is what stops the classifier
-/// from capturing the daemon's own upstream traffic and feeding the forwarder into itself.
+/// A WireGuard exit is a hop with no protocol to speak: the daemon simply originates the
+/// connection from inside the tunnel, towards the next hop or the destination, and carries
+/// on with whatever handshakes the remaining hops need. That is why an exit can only ever be
+/// the first hop.
+///
+/// Every socket opened here carries the bypass mark, or a tunnel's mark, which is what stops
+/// the classifier from capturing the daemon's own upstream traffic and feeding the forwarder
+/// into itself.
 /// </remarks>
 public static class ProxyDialer
 {
@@ -98,16 +110,38 @@ public static class ProxyDialer
             return await OpenDirectAsync(destination, ct).ConfigureAwait(false);
         }
 
-        var first = hops[0].Endpoint;
-        var socket = await ConnectWithBypassAsync(first.Host, first.Port, ct).ConfigureAwait(false);
+        Socket socket;
+        var start = 0;
+        if (hops[0].Tunnel is { } tunnel)
+        {
+            // The exit is entered by originating from inside it: towards the next hop when
+            // there is one, otherwise straight at the destination.
+            var next = hops.Count > 1
+                ? new IPEndPoint(await ResolveAsync(hops[1].Endpoint.Host, ct).ConfigureAwait(false), hops[1].Endpoint.Port)
+                : destination;
+            socket = await ConnectViaTunnelAsync(tunnel, next, ct).ConfigureAwait(false);
+            start = 1;
+        }
+        else
+        {
+            var first = hops[0].Endpoint;
+            socket = await ConnectWithBypassAsync(first.Host, first.Port, ct).ConfigureAwait(false);
+        }
+
         Stream stream = new NetworkStream(socket, ownsSocket: false);
         var isTls = false;
 
         try
         {
-            for (var i = 0; i < hops.Count; i++)
+            for (var i = start; i < hops.Count; i++)
             {
                 var hop = hops[i];
+                if (hop.IsTunnel)
+                {
+                    throw new ProxyHandshakeException(
+                        $"'{hop.Endpoint.Name}' is a WireGuard exit and can only be the first hop of a chain.");
+                }
+
                 if (hop.Endpoint.Protocol == ProxyProtocol.Https)
                 {
                     stream = await WrapTlsAsync(stream, hop.Endpoint, ct).ConfigureAwait(false);
@@ -150,6 +184,36 @@ public static class ProxyDialer
         }
 
         return new UpstreamLeg(socket, new NetworkStream(socket, ownsSocket: false), isTls: false);
+    }
+
+    /// <summary>
+    /// Connects from inside a WireGuard exit: the socket carries the tunnel's mark, which
+    /// selects the tunnel's routing table, and is bound to the tunnel address so the far side
+    /// sees a source it will accept.
+    /// </summary>
+    public static async Task<Socket> ConnectViaTunnelAsync(WireGuardTunnel tunnel, IPEndPoint target, CancellationToken ct)
+    {
+        var source = tunnel.SourceFor(target.AddressFamily)
+                     ?? throw new ProxyHandshakeException(
+                         $"WireGuard exit '{tunnel.Name}' has no {(target.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4")} address, so it cannot reach {target}.");
+
+        var socket = new Socket(target.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+        socket.SetMark(tunnel.Mark);
+        socket.NoDelay = true;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(ConnectTimeout);
+        try
+        {
+            socket.Bind(new IPEndPoint(source, 0));
+            await socket.ConnectAsync(target, timeout.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+
+        return socket;
     }
 
     /// <summary>Resolves and connects to a proxy host with the bypass mark set.</summary>

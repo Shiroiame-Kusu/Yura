@@ -46,9 +46,15 @@ public sealed record DeciderState
 
     public IReadOnlyDictionary<Guid, ProxyEndpoint> Proxies { get; init; } = new Dictionary<Guid, ProxyEndpoint>();
 
-    public IReadOnlyDictionary<Guid, string?> Passwords { get; init; } = new Dictionary<Guid, string?>();
+    public IReadOnlyDictionary<Guid, ProxySecrets> Secrets { get; init; } = new Dictionary<Guid, ProxySecrets>();
 
     public IReadOnlyDictionary<Guid, ProxyChain> Chains { get; init; } = new Dictionary<Guid, ProxyChain>();
+
+    /// <summary>WireGuard exits that are up, by proxy id.</summary>
+    public IReadOnlyDictionary<Guid, WireGuardTunnel> Tunnels { get; init; } = new Dictionary<Guid, WireGuardTunnel>();
+
+    /// <summary>Why the WireGuard exits that are not up are not, by proxy id.</summary>
+    public IReadOnlyDictionary<Guid, string> TunnelFailures { get; init; } = new Dictionary<Guid, string>();
 
     public bool HasHostRules { get; init; }
 
@@ -58,14 +64,18 @@ public sealed record DeciderState
         switch (action)
         {
             case RuleAction.Proxy p:
+            {
                 if (!Proxies.TryGetValue(p.EndpointId, out var endpoint))
                 {
                     return (null, "Proxy", "The rule refers to a proxy the daemon does not know about.");
                 }
 
-                return ([new ProxyHop(endpoint, Passwords.GetValueOrDefault(endpoint.Id))], endpoint.Name, null);
+                var (hop, failure) = HopFor(endpoint);
+                return hop is null ? (null, endpoint.Name, failure) : ([hop], endpoint.Name, null);
+            }
 
             case RuleAction.Chain c:
+            {
                 if (!Chains.TryGetValue(c.ChainId, out var chain) || chain.Hops.Count == 0)
                 {
                     return (null, "Chain", "The rule refers to a proxy chain the daemon does not know about.");
@@ -74,19 +84,49 @@ public sealed record DeciderState
                 var hops = new List<ProxyHop>(chain.Hops.Count);
                 foreach (var hopId in chain.Hops)
                 {
-                    if (!Proxies.TryGetValue(hopId, out var hop))
+                    if (!Proxies.TryGetValue(hopId, out var endpoint))
                     {
                         return (null, chain.Name, $"Chain '{chain.Name}' refers to a proxy that no longer exists.");
                     }
 
-                    hops.Add(new ProxyHop(hop, Passwords.GetValueOrDefault(hop.Id)));
+                    if (hops.Count > 0 && endpoint.Protocol == ProxyProtocol.WireGuard)
+                    {
+                        return (null, chain.Name, $"'{endpoint.Name}' is a WireGuard exit and can only be the first hop of chain '{chain.Name}'.");
+                    }
+
+                    var (hop, failure) = HopFor(endpoint);
+                    if (hop is null)
+                    {
+                        return (null, chain.Name, failure);
+                    }
+
+                    hops.Add(hop);
                 }
 
                 return (hops, chain.Name, null);
+            }
 
             default:
                 return ([], action is RuleAction.Block ? "Blocked" : "Direct", null);
         }
+    }
+
+    /// <summary>One endpoint as a hop: a proxy with its password, or a WireGuard exit that is up.</summary>
+    private (ProxyHop? Hop, string? Failure) HopFor(ProxyEndpoint endpoint)
+    {
+        if (endpoint.Protocol != ProxyProtocol.WireGuard)
+        {
+            return (new ProxyHop(endpoint, Secrets.GetValueOrDefault(endpoint.Id)?.Password), null);
+        }
+
+        if (Tunnels.TryGetValue(endpoint.Id, out var tunnel))
+        {
+            return (new ProxyHop(endpoint, null, tunnel), null);
+        }
+
+        return (null, TunnelFailures.TryGetValue(endpoint.Id, out var why)
+            ? $"WireGuard exit '{endpoint.Name}' is not up: {why}"
+            : $"WireGuard exit '{endpoint.Name}' is not up.");
     }
 }
 
@@ -113,6 +153,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
 {
     private readonly CgroupManager _cgroups;
     private readonly NftablesManager _nftables;
+    private readonly WireGuardManager _wireguard;
     private readonly ProcProcessSource _processes;
     private readonly FlowRegistry _flows;
     private readonly SocketOwnership _ownership;
@@ -121,7 +162,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
 
     private readonly Dictionary<Guid, RoutingRule> _rules = [];
     private readonly Dictionary<Guid, ProxyEndpoint> _proxies = [];
-    private readonly Dictionary<Guid, string?> _passwords = [];
+    private readonly Dictionary<Guid, ProxySecrets> _secrets = [];
     private readonly Dictionary<Guid, ProxyChain> _chains = [];
     private readonly Dictionary<Guid, int> _slotIndexByRule = [];
     private readonly Dictionary<string, ProcessGroup> _groupsByKey = [];
@@ -175,6 +216,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     public RuleRuntime(
         CgroupManager cgroups,
         NftablesManager nftables,
+        WireGuardManager wireguard,
         ProcProcessSource processes,
         FlowRegistry flows,
         SocketOwnership ownership,
@@ -182,6 +224,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     {
         _cgroups = cgroups;
         _nftables = nftables;
+        _wireguard = wireguard;
         _processes = processes;
         _flows = flows;
         _ownership = ownership;
@@ -312,7 +355,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     // -- configuration ---------------------------------------------------------
 
     public async Task<ApplyOutcome> SetProxiesAsync(
-        IReadOnlyList<(ProxyEndpoint Endpoint, string? Password)> proxies,
+        IReadOnlyList<(ProxyEndpoint Endpoint, ProxySecrets Secrets)> proxies,
         IReadOnlyList<ProxyChain> chains,
         CancellationToken ct = default)
     {
@@ -320,12 +363,12 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         try
         {
             _proxies.Clear();
-            _passwords.Clear();
+            _secrets.Clear();
             _chains.Clear();
-            foreach (var (endpoint, password) in proxies)
+            foreach (var (endpoint, secrets) in proxies)
             {
                 _proxies[endpoint.Id] = endpoint;
-                _passwords[endpoint.Id] = password;
+                _secrets[endpoint.Id] = secrets;
             }
 
             foreach (var chain in chains)
@@ -333,7 +376,11 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
                 _chains[chain.Id] = chain;
             }
 
-            return await ReconcileAsync(ct).ConfigureAwait(false);
+            // Tunnels first: the decider snapshot published by the reconcile below must know
+            // which exits are up, and a tunnel that failed is a warning, not a failed apply.
+            var tunnelWarnings = await _wireguard.ReconcileAsync(proxies, ct).ConfigureAwait(false);
+            var outcome = await ReconcileAsync(ct).ConfigureAwait(false);
+            return outcome with { Warnings = [.. tunnelWarnings, .. outcome.Warnings] };
         }
         finally
         {
@@ -394,6 +441,23 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
                         FailureReason = $"Chain '{known.Name}' has a hop that is not a configured proxy.",
                     };
                 }
+
+                if (ProxyChain.Validate(known.Hops.Select(h => _proxies[h]).ToList()) is { } invalid)
+                {
+                    return new ApplyOutcome { Succeeded = false, FailureReason = $"Chain '{known.Name}': {invalid}" };
+                }
+            }
+
+            // A rule on an exit that is down is still a rule: its flows are refused with the
+            // reason until the exit comes up, and the reason is said here too.
+            string? exitWarning = null;
+            if (rule.Action is RuleAction.Proxy onExit &&
+                _proxies.TryGetValue(onExit.EndpointId, out var exit) && exit.Protocol == ProxyProtocol.WireGuard &&
+                !_wireguard.Tunnels.ContainsKey(exit.Id))
+            {
+                exitWarning = _wireguard.Failures.TryGetValue(exit.Id, out var why)
+                    ? $"WireGuard exit '{exit.Name}' is not up: {why}. Connections under this rule are refused until it is."
+                    : $"WireGuard exit '{exit.Name}' is not up. Connections under this rule are refused until it is.";
             }
 
             if (rule.Process.Kind == ProcessSelectorKind.Instance && rule.Process.Identity is { } identity)
@@ -445,7 +509,11 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             }
 
             var outcome = await ReconcileAsync(ct, snapshot).ConfigureAwait(false);
-            outcome = outcome with { PreExistingConnections = preExisting };
+            outcome = outcome with
+            {
+                PreExistingConnections = preExisting,
+                Warnings = exitWarning is null ? outcome.Warnings : [.. outcome.Warnings, exitWarning],
+            };
             if (!outcome.Succeeded)
             {
                 // Do not keep a rule the kernel refused; the list must describe reality.
@@ -1015,8 +1083,10 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             OrderedRules = ordered,
             GroupsByName = new Dictionary<string, ProcessGroup>(_groupsByName),
             Proxies = new Dictionary<Guid, ProxyEndpoint>(_proxies),
-            Passwords = new Dictionary<Guid, string?>(_passwords),
+            Secrets = new Dictionary<Guid, ProxySecrets>(_secrets),
             Chains = new Dictionary<Guid, ProxyChain>(_chains),
+            Tunnels = _wireguard.Tunnels,
+            TunnelFailures = _wireguard.Failures,
             HasHostRules = ordered.Any(r => r.Enabled && r.Destination.Hosts.Count > 0),
         };
     }
@@ -1170,10 +1240,22 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             _ => failure is null ? FlowPlanKind.Proxy : FlowPlanKind.Fail,
         };
 
+        // A lookup from a process on a WireGuard exit goes to the exit's own resolver: the one
+        // the application asked for is usually a LAN or loopback address the far end cannot
+        // reach. Only when the policy sends DNS through the route at all.
+        IPEndPoint? dial = null;
+        if (kind == FlowPlanKind.Proxy && destination.Port == 53 && _options.DnsPolicy == DnsPolicy.ThroughProxy &&
+            hops is [{ Tunnel: { } tunnel }] && tunnel.DnsFor(destination.AddressFamily) is { } resolver &&
+            !resolver.Equals(destination.Address))
+        {
+            dial = new IPEndPoint(resolver, 53);
+        }
+
         return new FlowPlan
         {
             Kind = kind,
             Hops = hops ?? [],
+            DialDestination = dial,
             RouteName = routeName,
             RuleId = decision.MatchedRule?.Id,
             RuleName = decision.MatchedRule?.Name,
@@ -1210,6 +1292,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
 
             _listeners.Clear();
             await _nftables.RemoveAsync().ConfigureAwait(false);
+            await _wireguard.RemoveAllAsync().ConfigureAwait(false);
             _cgroups.RemoveAllGroups();
             _installedSlots = [];
             _state = DeciderState.Empty;

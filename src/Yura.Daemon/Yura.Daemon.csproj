@@ -14,4 +14,9 @@
     <ProjectReference Include="../Yura.Core/Yura.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The pure halves of the privileged managers are tested without root. -->
+    <InternalsVisibleTo Include="Yura.Daemon.Tests" />
+  </ItemGroup>
+
 </Project>

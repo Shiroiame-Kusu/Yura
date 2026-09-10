@@ -26,6 +26,18 @@ public sealed class PolicyRouting
     /// </summary>
     public const uint BypassMark = 0x7200;
 
+    /// <summary>
+    /// Marks for the daemon's sockets inside a WireGuard exit: 0x7300 + tunnel index. Each
+    /// selects that tunnel's routing table, whose only route is the tunnel interface, so a
+    /// flow enters exactly the tunnel its rule named and nothing else on the machine does.
+    /// </summary>
+    public const uint TunnelMarkBase = 0x7300;
+    public const uint TunnelMarkMask = 0xFFFFFF00;
+
+    /// <summary>Routing table and rule priority for tunnel index n are both this plus n.</summary>
+    public const int TunnelTableBase = 7300;
+    public const int TunnelRulePriority = 7300;
+
     public const int RoutingTable = 711;
     public const int RulePriority = 7100;
 
@@ -79,10 +91,10 @@ public sealed class PolicyRouting
         await _commands.RunAsync("ip",
             ["rule", "del", "priority", RulePriority.ToString(),
              "fwmark", $"0x{MarkBase:x}/0x{MarkMask:x}", "lookup", RoutingTable.ToString()],
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+            cancellationToken: cancellationToken, quiet: true).ConfigureAwait(false);
         await _commands.RunAsync("ip",
             ["route", "flush", "table", RoutingTable.ToString()],
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+            cancellationToken: cancellationToken, quiet: true).ConfigureAwait(false);
     }
 
     public void RestoreSysctls()

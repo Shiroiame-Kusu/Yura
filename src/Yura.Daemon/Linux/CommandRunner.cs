@@ -34,11 +34,22 @@ public sealed class CommandRunner
 
     public CommandRunner(Action<string> log) => _log = log;
 
+    /// <param name="sensitiveInput">
+    /// True when <paramref name="standardInput"/> carries a secret, such as a WireGuard
+    /// private key. The input is then never written to the log, verbose or not.
+    /// </param>
+    /// <param name="quiet">
+    /// True for commands that may legitimately fail, such as deleting something that may not
+    /// exist. Their failure is not logged, because a "failed" line for an expected outcome
+    /// reads like a problem in an operator's log and is not one.
+    /// </param>
     public async Task<CommandResult> RunAsync(
         string fileName,
         IReadOnlyList<string> arguments,
         string? standardInput = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool sensitiveInput = false,
+        bool quiet = false)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -57,7 +68,9 @@ public sealed class CommandRunner
         _log($"exec: {fileName} {string.Join(' ', arguments)}");
         if (standardInput is not null)
         {
-            _log($"stdin:\n{Indent(standardInput)}");
+            _log(sensitiveInput
+                ? $"stdin: ({standardInput.Count(c => c == '\n') + 1} lines, not logged: contains a secret)"
+                : $"stdin:\n{Indent(standardInput)}");
         }
 
         using var process = new Process { StartInfo = startInfo };
@@ -85,7 +98,7 @@ public sealed class CommandRunner
             await stdoutTask.ConfigureAwait(false),
             await stderrTask.ConfigureAwait(false));
 
-        if (!result.Succeeded)
+        if (!result.Succeeded && !quiet)
         {
             _log($"failed ({result.ExitCode}): {result.FailureText}");
         }

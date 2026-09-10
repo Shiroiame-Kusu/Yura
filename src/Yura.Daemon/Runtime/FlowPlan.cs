@@ -40,6 +40,13 @@ public sealed record FlowPlan
 
     public string? Host { get; init; }
 
+    /// <summary>
+    /// Where the daemon actually dials when that differs from what the application asked for:
+    /// a WireGuard exit's own resolver in place of one that is unreachable from the far end.
+    /// Null means the original destination.
+    /// </summary>
+    public IPEndPoint? DialDestination { get; init; }
+
     public string? Explanation { get; init; }
 
     public string? FailureReason { get; init; }

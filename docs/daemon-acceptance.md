@@ -8,7 +8,8 @@ dotnet build src/Yura.Daemon
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-**64 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7.
+**83 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
+wireguard-tools 1.0.
 
 Nothing in the harness touches nftables, cgroups or policy routing directly. Every kernel
 change is made by `yura-daemon` in response to a rule sent over the Unix socket, which is
@@ -22,6 +23,12 @@ address to a local marker server. Receiving `YURA-VIA-PROXY-A` therefore proves 
 traversed proxy A; a timeout proves it did not. Three independent logs are cross-checked: the
 client's own record of every attempt, the proxy's audit log of every CONNECT and UDP
 ASSOCIATE, and the daemon's own view of the flows it is relaying.
+
+For the WireGuard exit the peer lives in its own **network namespace**, reachable from the
+host only over a veth pair, and the marker destination is an address that exists only inside
+that namespace. The single path from the host into it is the encrypted tunnel, so receiving
+the marker proves the flow left through the exit — and the peer's own log shows the tunnel
+address as the source, which is what an exit node's far end sees.
 
 ## Mandatory acceptance tests
 
@@ -55,6 +62,21 @@ ASSOCIATE, and the daemon's own view of the flows it is relaying.
 | Direct-versus-routed measurement | Both sides measured against one target by one method (TCP connect) in one call |
 | The daemon can dump exactly what it installed | nftables table with counters, ip rules, routing table and cgroup membership |
 | Clean shutdown removes the nft table, the ip rule and the cgroup subtree | All three verified absent afterwards |
+
+### WireGuard exits
+
+| Check | Result |
+| --- | --- |
+| The daemon brings a WireGuard exit up and says which one it could not | `WG exit` is up on `yura-wg0`; `WG broken` (an unparseable private key) is reported as not up with the reason, in the apply warnings and in status |
+| No key material reaches status or the log | The private key and preshared key are grepped for in both and never found; `wg setconf` reads them from standard input |
+| Probing completes a handshake and gets an answer from the tunnel's resolver | Handshake in 2 ms; the resolver inside the namespace answers through the tunnel |
+| TCP and UDP from a selected process leave through the tunnel | Both markers received; the peer's log shows every request arriving from `10.77.0.1`, the tunnel address |
+| Name lookups go to the exit's own resolver | 13 answers received; 13 queries reached the resolver at `10.77.0.2`, which only the tunnel can reach, though the application asked `198.51.100.7` |
+| The daemon reports the flows as confirmed through the exit | TCP and UDP flows `confirmedProxied` via `WG exit` |
+| A rule on an exit that is down is accepted with a warning, and its flows are refused with the reason | The application sees a reset, never a leak to the direct route; each refused flow carries `is not up: …` |
+| A chain with the exit as its first hop reaches a proxy that exists only behind it | The SOCKS5 proxy inside the namespace logs CONNECTs from the tunnel address and the last hop's marker comes back |
+| A chain with the exit anywhere but first is refused at apply time | `can only be the first hop` |
+| Shutdown removes the tunnel interfaces and their policy rules | Neither `yura-wg*` nor any `fwmark 0x73…` rule remains |
 
 ## The exclusion race
 
@@ -126,6 +148,17 @@ Per-rule nftables counters showed it climbing from 7 packets to 31 over the same
 assertion window was simply shorter than the direct instance's timeout cycle. Counters on
 every rule are now permanent for exactly this reason.
 
+## What the WireGuard fixture proved before the suite did
+
+The exit was first exercised by a standalone script against the same namespace fixture, and
+worked on its first run: handshake in 1 ms, every request at the peer from the tunnel
+address, DNS redirected to the tunnel's resolver, flows confirmed. The suite then found
+nothing wrong in the daemon; what it found were three defects in its own new checks — two
+`f['ruleId']` lookups on flows that legitimately have no rule, and an expectation of
+`ConnectionRefused` where a captured-then-reset connection reports a reset. Those are
+recorded here because a test that fails for the wrong reason is as misleading as one that
+passes for the wrong reason.
+
 ## Not proven here
 
 - **The exclusion race**, above: measured, bounded, not eliminated.
@@ -139,3 +172,9 @@ every rule are now permanent for exactly this reason.
 - Real Wine and Proton. Test 10 uses a process that presents to `/proc` exactly as a Wine
   process does — the runtime binary's name and a `.exe` in argv, which is what Yura reads —
   so it exercises the real classification path, but it is not a test of Wine itself.
+- **A WireGuard peer across a real network.** The peer here is a kernel `wireguard` interface
+  in a namespace on the same machine, so the handshake, the cryptokey routing and the
+  source-address requirement are real, but path MTU, NAT traversal and a peer that roams are
+  not exercised.
+- **IPv6 inside a tunnel.** The interface gets its IPv6 address and its own `ip -6` rule and
+  route when the configuration has one, but every flow in the suite is IPv4.

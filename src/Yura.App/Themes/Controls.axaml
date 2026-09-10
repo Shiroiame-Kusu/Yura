@@ -169,6 +169,13 @@
     <Setter Property="CornerRadius" Value="{DynamicResource YuraRadiusSm}" />
   </Style>
 
+  <!-- Keys and addresses are typed and read as monospace, upright, like the tables show them. -->
+  <Style Selector="TextBox.Mono">
+    <Setter Property="FontFamily" Value="{DynamicResource YuraFontMono}" />
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeSmall}" />
+    <Setter Property="FontStyle" Value="Normal" />
+  </Style>
+
   <Style Selector="TextBox.Invalid">
     <Setter Property="BorderBrush" Value="{DynamicResource YuraDanger}" />
     <Setter Property="BorderThickness" Value="1.5" />
@@ -222,8 +229,52 @@
 
   <!-- A panel that floats above other content earns a shadow; a docked one does not.
        This is the only shadow in the application. -->
-  <Style Selector="views|ProcessInspector.Floating > Border, views|RuleInspector.Floating > Border">
+  <Style Selector="views|ProcessInspector.Floating > Border, views|RuleInspector.Floating > Border,
+                   views|ProxyInspector.Floating > Panel > Border">
     <Setter Property="BoxShadow" Value="-10 0 28 0 #55000000" />
+  </Style>
+
+  <!-- ============================ Settings rows ============================
+       One setting per row: a title and a one-line description on the left, the control on
+       the right, rows separated by hairlines inside a panel. The same shape everywhere, so
+       the eye finds the control without reading the whole page. -->
+
+  <Style Selector="Border.SettingGroup">
+    <Setter Property="Background" Value="{DynamicResource YuraSurfaceRaised}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource YuraBorderSubtle}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="{DynamicResource YuraRadiusMd}" />
+    <Setter Property="ClipToBounds" Value="True" />
+  </Style>
+
+  <Style Selector="Border.SettingRow">
+    <Setter Property="Padding" Value="16,12" />
+    <Setter Property="BorderBrush" Value="{DynamicResource YuraBorderSubtle}" />
+    <Setter Property="BorderThickness" Value="0,0,0,1" />
+  </Style>
+
+  <Style Selector="Border.SettingRow:nth-last-child(1)">
+    <Setter Property="BorderThickness" Value="0" />
+  </Style>
+
+  <Style Selector="Border.SettingRow TextBlock.SettingTitle">
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeBody}" />
+    <Setter Property="TextWrapping" Value="Wrap" />
+  </Style>
+
+  <Style Selector="Border.SettingRow TextBlock.SettingDescription">
+    <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeCaption}" />
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextTertiary}" />
+    <Setter Property="TextWrapping" Value="Wrap" />
+    <Setter Property="Margin" Value="0,2,0,0" />
+  </Style>
+
+  <Style Selector="ToggleSwitch">
+    <Setter Property="FontFamily" Value="{DynamicResource YuraFontUi}" />
+    <Setter Property="OnContent" Value="" />
+    <Setter Property="OffContent" Value="" />
+    <Setter Property="MinWidth" Value="0" />
+    <Setter Property="Margin" Value="0" />
   </Style>
 
   <!-- ========================== Navigation rail ========================== -->

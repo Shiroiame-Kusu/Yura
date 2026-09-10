@@ -25,6 +25,10 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
     private readonly ISecretStore _secrets;
     private readonly ConfigStore _config;
     private readonly DispatcherTimer _saveDebounce;
+    private readonly DispatcherTimer _pushDebounce;
+
+    /// <summary>True while the banner shows a tunnel warning, so it can be cleared when the exit comes up.</summary>
+    private bool _tunnelWarningShown;
 
     /// <summary>
     /// Suppresses saving while the loaded configuration is being applied, so restoring a
@@ -35,7 +39,8 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
     public ShellViewModel(
         IDaemonClient? daemon = null,
         ISecretStore? secrets = null,
-        ConfigStore? config = null)
+        ConfigStore? config = null,
+        IServiceManager? services = null)
     {
         _daemon = daemon ?? new DisconnectedDaemonClient();
         _secrets = secrets ?? new SecretToolSecretStore();
@@ -50,7 +55,7 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
         Proxies = new ProxiesPageViewModel(Rules, _daemon, _secrets);
         RulesPage = new RulesPageViewModel(Rules, _daemon);
         Diagnostics = new DiagnosticsPageViewModel(_daemon, _config, _secrets);
-        Settings = new SettingsPageViewModel(this, _daemon);
+        Settings = new SettingsPageViewModel(this, _daemon, services);
 
         SelectedPage = Pages[0];
 
@@ -101,8 +106,31 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
         }
 
         Rules.Changed += (_, _) => ScheduleSave();
-        Rules.Proxies.CollectionChanged += (_, _) => ScheduleSave();
-        Rules.Chains.CollectionChanged += (_, _) => ScheduleSave();
+        Rules.Proxies.CollectionChanged += (_, _) => { ScheduleSave(); SchedulePush(); };
+        Rules.Chains.CollectionChanged += (_, _) => { ScheduleSave(); SchedulePush(); };
+
+        // The daemon must learn about a new or edited exit as soon as it is saved, or the
+        // next rule that names it is refused as referring to a proxy it does not know.
+        _pushDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(300) };
+        _pushDebounce.Tick += async (_, _) =>
+        {
+            _pushDebounce.Stop();
+            if (IsDaemonConnected)
+            {
+                await PushProxiesToDaemonAsync().ConfigureAwait(true);
+            }
+        };
+    }
+
+    private void SchedulePush()
+    {
+        if (_applyingLoadedConfig)
+        {
+            return;
+        }
+
+        _pushDebounce.Stop();
+        _pushDebounce.Start();
     }
 
     public RuleStore Rules { get; }
@@ -187,6 +215,24 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
         else
         {
             Games.Deactivate();
+        }
+
+        if (IsProxiesSelected)
+        {
+            Proxies.Activate();
+        }
+        else
+        {
+            Proxies.Deactivate();
+        }
+
+        if (IsSettingsSelected)
+        {
+            Settings.Activate();
+        }
+        else
+        {
+            Settings.Deactivate();
         }
 
         Processes.SetActive(IsProcessesSelected);
@@ -351,22 +397,7 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
 
     private async Task PushConfigurationToDaemonAsync()
     {
-        if (Rules.Proxies.Count > 0 || Rules.Chains.Count > 0)
-        {
-            // Secrets are read here, in the unprivileged app, and handed over the local
-            // socket. The daemon never reads the user's keyring and stores nothing at rest.
-            var withSecrets = new List<(ProxyEndpoint, string?)>(Rules.Proxies.Count);
-            foreach (var proxy in Rules.Proxies)
-            {
-                var password = proxy.PasswordRef is null
-                    ? null
-                    : await _secrets.GetAsync(proxy.PasswordRef).ConfigureAwait(true);
-                withSecrets.Add((proxy, password));
-            }
-
-            await _daemon.SetProxiesAsync(withSecrets, Rules.Chains).ConfigureAwait(true);
-        }
-
+        await PushProxiesToDaemonAsync().ConfigureAwait(true);
         await _daemon.SetDnsPolicyAsync(DnsPolicy).ConfigureAwait(true);
 
         foreach (var rule in Rules.Rules.Where(r => r.Lifetime == RuleLifetime.Persistent && r.Enabled))
@@ -380,6 +411,40 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
             {
                 ConfigWarning = $"Saved rule “{rule.Name}” could not be reapplied: {result.FailureReason}";
             }
+        }
+    }
+
+    /// <summary>Hands the daemon the current exits and chains, secrets included.</summary>
+    /// <remarks>
+    /// Secrets are read here, in the unprivileged app, and handed over the local socket.
+    /// The daemon never reads the user's keyring and stores nothing at rest. A tunnel that
+    /// could not come up is not a failed push: the proxies are in place, the reason is shown
+    /// where the exit is listed, and once in the banner until the exit comes up.
+    /// </remarks>
+    private async Task PushProxiesToDaemonAsync()
+    {
+        var withSecrets = new List<(ProxyEndpoint, ProxySecrets)>(Rules.Proxies.Count);
+        foreach (var proxy in Rules.Proxies)
+        {
+            var password = proxy.PasswordRef is null
+                ? null
+                : await _secrets.GetAsync(proxy.PasswordRef).ConfigureAwait(true);
+            var preshared = proxy.WireGuard?.PresharedKeyRef is { } pskRef
+                ? await _secrets.GetAsync(pskRef).ConfigureAwait(true)
+                : null;
+            withSecrets.Add((proxy, new ProxySecrets(password, preshared)));
+        }
+
+        var result = await _daemon.SetProxiesAsync(withSecrets, Rules.Chains).ConfigureAwait(true);
+        if (result.Warnings.Count > 0)
+        {
+            ConfigWarning = string.Join(" ", result.Warnings);
+            _tunnelWarningShown = true;
+        }
+        else if (_tunnelWarningShown)
+        {
+            ConfigWarning = null;
+            _tunnelWarningShown = false;
         }
     }
 
@@ -408,6 +473,7 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(DaemonStatusText));
         OnPropertyChanged(nameof(DaemonBannerDetail));
         Settings.NotifyShellChanged();
+        Proxies.NotifyLanguageChanged();
         ScheduleSave();
     }
 
@@ -441,9 +507,11 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         _saveDebounce.Stop();
+        _pushDebounce.Stop();
         Processes.Dispose();
         Games.Dispose();
         Connections.Dispose();
+        Proxies.Dispose();
         Diagnostics.Dispose();
     }
 }

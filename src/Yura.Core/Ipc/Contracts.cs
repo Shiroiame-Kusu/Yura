@@ -126,6 +126,36 @@ public sealed class StatusDto
 
     /// <summary>Environment checks the daemon ran at startup, each with its outcome.</summary>
     public List<CheckDto> Checks { get; init; } = [];
+
+    /// <summary>Every WireGuard exit the daemon was given, up or not, with what the kernel reports.</summary>
+    public List<TunnelDto> Tunnels { get; init; } = [];
+}
+
+/// <summary>The state of one WireGuard exit as the kernel reports it. Never carries a key.</summary>
+public sealed class TunnelDto
+{
+    public required Guid ProxyId { get; init; }
+
+    public required string Name { get; init; }
+
+    /// <summary>Kernel interface name, e.g. <c>yura-wg0</c>, when the tunnel is configured.</summary>
+    public string? Interface { get; init; }
+
+    /// <summary>True when the interface exists and is configured. Says nothing about the peer answering.</summary>
+    public required bool Up { get; init; }
+
+    /// <summary>Why the tunnel could not be brought up, when it could not.</summary>
+    public string? Failure { get; init; }
+
+    /// <summary>When the peer last completed a handshake. Null when it never has since the interface came up.</summary>
+    public DateTimeOffset? LatestHandshakeUtc { get; init; }
+
+    public long RxBytes { get; init; }
+
+    public long TxBytes { get; init; }
+
+    /// <summary>The peer address the kernel is currently sending to.</summary>
+    public string? Endpoint { get; init; }
 }
 
 public sealed class CheckDto
@@ -248,7 +278,12 @@ public sealed class ProxyDto
 
     public bool AllowInvalidCertificate { get; init; }
 
-    public static ProxyDto From(ProxyEndpoint endpoint, string? password) => new()
+    /// <summary>The WireGuard preshared key. App-to-daemon only, like <see cref="Password"/>.</summary>
+    public string? PresharedKey { get; init; }
+
+    public WireGuardDto? WireGuard { get; init; }
+
+    public static ProxyDto From(ProxyEndpoint endpoint, ProxySecrets secrets) => new()
     {
         Id = endpoint.Id,
         Name = endpoint.Name,
@@ -256,8 +291,10 @@ public sealed class ProxyDto
         Host = endpoint.Host,
         Port = endpoint.Port,
         Username = endpoint.Username,
-        Password = password,
+        Password = secrets.Password,
+        PresharedKey = secrets.PresharedKey,
         AllowInvalidCertificate = endpoint.AllowInvalidCertificate,
+        WireGuard = endpoint.WireGuard is { } wg ? WireGuardDto.From(wg) : null,
     };
 
     public ProxyEndpoint ToEndpoint() => new()
@@ -269,6 +306,45 @@ public sealed class ProxyDto
         Port = Port,
         Username = Username,
         AllowInvalidCertificate = AllowInvalidCertificate,
+        WireGuard = WireGuard?.ToSettings(),
+    };
+
+    public ProxySecrets ToSecrets() => new(Password, PresharedKey);
+}
+
+/// <summary>The non-secret WireGuard settings, flat for the wire.</summary>
+public sealed class WireGuardDto
+{
+    public required string PeerPublicKey { get; init; }
+
+    public List<string> Addresses { get; init; } = [];
+
+    public List<string> Dns { get; init; } = [];
+
+    public List<string> AllowedIps { get; init; } = [];
+
+    public int? Mtu { get; init; }
+
+    public int PersistentKeepalive { get; init; }
+
+    public static WireGuardDto From(WireGuardSettings settings) => new()
+    {
+        PeerPublicKey = settings.PeerPublicKey,
+        Addresses = settings.Addresses.ToList(),
+        Dns = settings.DnsServers.ToList(),
+        AllowedIps = settings.AllowedIps.ToList(),
+        Mtu = settings.Mtu,
+        PersistentKeepalive = settings.PersistentKeepalive,
+    };
+
+    public WireGuardSettings ToSettings() => new()
+    {
+        PeerPublicKey = PeerPublicKey,
+        Addresses = Addresses.ToArray(),
+        DnsServers = Dns.ToArray(),
+        AllowedIps = AllowedIps.Count == 0 ? ["0.0.0.0/0", "::/0"] : AllowedIps.ToArray(),
+        Mtu = Mtu,
+        PersistentKeepalive = PersistentKeepalive,
     };
 }
 

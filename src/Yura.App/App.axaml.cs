@@ -41,7 +41,11 @@ public sealed partial class YuraApplication : Application
                 ? ThemeVariant.Light
                 : ThemeVariant.Dark;
 
-            var shell = new ShellViewModel(daemon, secrets, config)
+            // Design review shows a running service; a screenshot of the real app shows the
+            // real state, which only ever reads systemd until a button is pressed.
+            IServiceManager services = options.Demo ? new SimulatedServiceManager() : new ServiceManager();
+
+            var shell = new ShellViewModel(daemon, secrets, config, services)
             {
                 IsDarkTheme = !options.Theme.Equals("light", StringComparison.OrdinalIgnoreCase),
                 IsChinese = options.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase),
@@ -56,7 +60,7 @@ public sealed partial class YuraApplication : Application
 
             if (options.Demo)
             {
-                DemoData.Populate(shell);
+                DemoData.Populate(shell, options.DemoEditor);
             }
 
             // Probe the daemon once at startup so the shell shows its real state rather

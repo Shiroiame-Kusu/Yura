@@ -66,6 +66,28 @@ public sealed class NftablesRulesetTests
     }
 
     [Fact]
+    public void Always_lets_the_daemons_tunnel_sockets_through_untouched()
+    {
+        var text = NftablesManager.Build([], []);
+
+        Assert.Contains($"meta mark & 0x{PolicyRouting.TunnelMarkMask:x} == 0x{PolicyRouting.TunnelMarkBase:x} return", text);
+    }
+
+    [Fact]
+    public void Never_captures_the_outer_packets_of_a_wireguard_exit()
+    {
+        var exit = new ProxyEndpoint
+        {
+            Id = ProxyA, Name = "exit", Protocol = ProxyProtocol.WireGuard, Host = "203.0.113.9", Port = 51820,
+            WireGuard = new WireGuardSettings { PeerPublicKey = "k", Addresses = ["10.8.0.7/32"] },
+        };
+
+        var text = NftablesManager.Build([], [exit]);
+
+        Assert.Contains("ip daddr 203.0.113.9 th dport 51820 return", text);
+    }
+
+    [Fact]
     public void Never_captures_traffic_addressed_to_a_configured_proxy()
     {
         var proxy = new ProxyEndpoint

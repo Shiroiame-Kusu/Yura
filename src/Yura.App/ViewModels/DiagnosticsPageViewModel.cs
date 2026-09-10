@@ -8,6 +8,24 @@ using Yura.App.Services;
 
 namespace Yura.App.ViewModels;
 
+/// <summary>One WireGuard exit as the daemon reports it.</summary>
+public sealed record TunnelRow(TunnelStatus Status)
+{
+    public string Name => Status.Name;
+
+    public bool Up => Status.Up && Status.LatestHandshakeUtc is not null;
+
+    public string StateDisplay => Status.Up
+        ? Loc.Current[Status.LatestHandshakeUtc is null ? "Proxy.Tunnel.NoHandshake" : "Diagnostics.Ok"]
+        : Loc.Current["Diagnostics.Failed"];
+
+    /// <summary>Interface, peer, last handshake and transfer, in one line.</summary>
+    public string Summary => Status.Up
+        ? string.Create(CultureInfo.InvariantCulture,
+            $"{Status.Interface} → {Status.Endpoint}; handshake {(Status.LatestHandshakeUtc is { } h ? h.ToLocalTime().ToString("HH:mm:ss", CultureInfo.CurrentCulture) : "never")}; rx {Status.RxBytes} B, tx {Status.TxBytes} B")
+        : Status.Failure ?? Loc.Current["Common.Unknown"];
+}
+
 /// <summary>One environment check the daemon ran, with its outcome.</summary>
 public sealed record CheckRow(string Name, bool Passed, string? Detail)
 {
@@ -42,6 +60,10 @@ public sealed partial class DiagnosticsPageViewModel : ObservableObject, IDispos
     }
 
     public ObservableCollection<CheckRow> Checks { get; } = [];
+
+    public ObservableCollection<TunnelRow> Tunnels { get; } = [];
+
+    public bool HasTunnels => Tunnels.Count > 0;
 
     public ObservableCollection<string> Log { get; } = [];
 
@@ -131,6 +153,12 @@ public sealed partial class DiagnosticsPageViewModel : ObservableObject, IDispos
                 Checks.Add(new CheckRow(check.Name, check.Passed, check.Detail));
             }
 
+            Tunnels.Clear();
+            foreach (var tunnel in Status?.Tunnels ?? [])
+            {
+                Tunnels.Add(new TunnelRow(tunnel));
+            }
+
             var log = await _daemon.GetLogAsync(200).ConfigureAwait(true);
             Log.Clear();
             foreach (var line in log)
@@ -192,6 +220,16 @@ public sealed partial class DiagnosticsPageViewModel : ObservableObject, IDispos
                 $"[{(check.Passed ? "ok" : "FAILED")}] {check.Name}{(check.Detail is null ? string.Empty : ": " + check.Detail)}");
         }
 
+        if (Tunnels.Count > 0)
+        {
+            report.AppendLine();
+            report.AppendLine("## WireGuard exits");
+            foreach (var tunnel in Tunnels)
+            {
+                report.AppendLine(CultureInfo.InvariantCulture, $"{tunnel.Name}: {tunnel.Summary}");
+            }
+        }
+
         if (Ruleset is { Length: > 0 })
         {
             report.AppendLine();
@@ -228,6 +266,7 @@ public sealed partial class DiagnosticsPageViewModel : ObservableObject, IDispos
         OnPropertyChanged(nameof(SocketDisplay));
         OnPropertyChanged(nameof(AllowedUidsDisplay));
         OnPropertyChanged(nameof(HasFailedChecks));
+        OnPropertyChanged(nameof(HasTunnels));
     }
 
     public void Dispose() => _timer.Stop();

@@ -22,6 +22,7 @@ public sealed class SimulatedDaemonClient : IDaemonClient
     private readonly Random _random = new(20260910);
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(41);
     private DnsPolicy _dnsPolicy = DnsPolicy.ThroughProxy;
+    private IReadOnlyList<ProxyEndpoint> _proxies = [];
 
     public DaemonState State => DaemonState.Connected;
 
@@ -58,8 +59,15 @@ public sealed class SimulatedDaemonClient : IDaemonClient
                 new DaemonCheck("Policy routing installed", true, "fwmark 0x7100/0xffffff00 -> table 711"),
                 new DaemonCheck("Kernel accepts the base ruleset (nft_socket, nft_tproxy)", true, null),
                 new DaemonCheck("rp_filter relaxed on lo and all", true, null),
+                new DaemonCheck("wg tool available (wireguard-tools)", true, "wireguard-tools v1.0.20260223"),
+                new DaemonCheck("Kernel supports WireGuard interfaces", true, null),
                 new DaemonCheck("Kernel process events (netlink connector)", true, null),
             ],
+            // Every WireGuard exit the app pushed is reported as up with a recent handshake, so
+            // the row states that need a live tunnel can be laid out.
+            Tunnels = _proxies.Where(p => p.IsWireGuard).Select((p, i) => new TunnelStatus(
+                p.Id, p.Name, $"yura-wg{i}", true, null, DateTimeOffset.UtcNow.AddSeconds(-42 - 17 * i),
+                RxBytes: 48_211_904 + 1_000_000 * i, TxBytes: 6_402_118, Endpoint: p.Authority)).ToArray(),
         });
 
     public Task<IReadOnlyDictionary<int, int>> GetConnectionCountsAsync(CancellationToken cancellationToken = default) =>
@@ -167,10 +175,13 @@ public sealed class SimulatedDaemonClient : IDaemonClient
     }
 
     public Task<RuleApplyResult> SetProxiesAsync(
-        IReadOnlyList<(ProxyEndpoint Endpoint, string? Password)> proxies,
+        IReadOnlyList<(ProxyEndpoint Endpoint, ProxySecrets Secrets)> proxies,
         IReadOnlyList<ProxyChain> chains,
-        CancellationToken cancellationToken = default) =>
-        Task.FromResult(new RuleApplyResult { Succeeded = true, ConfirmedAtUtc = DateTimeOffset.UtcNow });
+        CancellationToken cancellationToken = default)
+    {
+        _proxies = proxies.Select(p => p.Endpoint).ToArray();
+        return Task.FromResult(new RuleApplyResult { Succeeded = true, ConfirmedAtUtc = DateTimeOffset.UtcNow });
+    }
 
     public Task<RuleApplyResult> SetDnsPolicyAsync(DnsPolicy policy, CancellationToken cancellationToken = default)
     {
@@ -180,7 +191,7 @@ public sealed class SimulatedDaemonClient : IDaemonClient
 
     public async Task<ProxyProbeResult> ProbeProxyAsync(
         ProxyEndpoint endpoint,
-        string? password,
+        ProxySecrets secrets,
         CancellationToken cancellationToken = default)
     {
         await Task.Delay(500, cancellationToken).ConfigureAwait(false);
@@ -190,12 +201,15 @@ public sealed class SimulatedDaemonClient : IDaemonClient
             TimestampUtc = DateTimeOffset.UtcNow,
             Reachable = true,
             HandshakeLatency = TimeSpan.FromMilliseconds(_random.Next(12, 60)),
-            Udp = endpoint.Protocol == ProxyProtocol.Socks5
+            Udp = endpoint.Protocol is ProxyProtocol.Socks5 or ProxyProtocol.WireGuard
                 ? CapabilityState.Supported
                 : CapabilityState.Unsupported,
-            Diagnostics = endpoint.Protocol == ProxyProtocol.Socks5
-                ? "SOCKS5 negotiation and UDP ASSOCIATE both succeeded."
-                : "TCP connect succeeded. HTTP CONNECT itself is only exercised by a real flow.",
+            Diagnostics = endpoint.Protocol switch
+            {
+                ProxyProtocol.Socks5 => "SOCKS5 negotiation and UDP ASSOCIATE both succeeded.",
+                ProxyProtocol.WireGuard => "Handshake completed in 31 ms. The resolver at 10.8.0.1 answered through the tunnel in 44 ms. A WireGuard tunnel carries IP, so UDP passes by construction.",
+                _ => "TCP connect succeeded. HTTP CONNECT itself is only exercised by a real flow.",
+            },
         };
     }
 

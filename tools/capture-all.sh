@@ -56,6 +56,15 @@ shot --out "$OUT/25-settings-zh-demo.png"    --page settings    --theme dark --l
 shot --out "$OUT/26-connections-min-demo.png" --page connections --theme dark --size 960x640 --demo
 shot --out "$OUT/27-rules-min-demo.png"       --page rules       --theme dark --size 960x640 --demo
 
+echo "== WireGuard exits, chains and the service section =="
+shot --out "$OUT/30-proxies-wireguard-dark-demo.png"  --page proxies  --theme dark  --demo --demo-editor wireguard
+shot --out "$OUT/31-proxies-chain-light-demo.png"     --page proxies  --theme light --demo --demo-editor chain
+shot --out "$OUT/32-settings-light-demo.png"          --page settings --theme light --demo
+shot --out "$OUT/33-settings-min-demo.png"            --page settings --theme dark  --size 960x640 --demo
+shot --out "$OUT/34-proxies-min-demo.png"             --page proxies  --theme dark  --size 960x640 --demo --demo-editor wireguard
+shot --out "$OUT/35-proxies-wireguard-zh-demo.png"    --page proxies  --theme dark  --lang zh-Hans --demo --demo-editor wireguard
+shot --out "$OUT/36-settings-not-installed.png"       --page settings --theme dark
+
 echo "== disconnected: the default, with no daemon =="
 shot --out "$OUT/28-connections-disconnected.png" --page connections --theme dark
 shot --out "$OUT/29-diagnostics-disconnected.png" --page diagnostics --theme dark

@@ -36,7 +36,7 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
 
     public string? UnavailableReason => _state == DaemonState.Connected
         ? null
-        : _unavailableReason ?? $"No daemon is listening on {_socketPath}. Start it with: sudo systemctl start yura-daemon";
+        : _unavailableReason ?? $"No daemon is listening on {_socketPath}. Install it from Settings, or start it with: sudo systemctl start yura-daemon";
 
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
@@ -68,6 +68,8 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
             SocketPath = status.SocketPath,
             AllowedUids = status.AllowedUids,
             Checks = status.Checks.Select(c => new DaemonCheck(c.Name, c.Passed, c.Detail)).ToArray(),
+            Tunnels = status.Tunnels.Select(t => new TunnelStatus(
+                t.ProxyId, t.Name, t.Interface, t.Up, t.Failure, t.LatestHandshakeUtc, t.RxBytes, t.TxBytes, t.Endpoint)).ToArray(),
         };
     }
 
@@ -105,14 +107,14 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
     }
 
     public async Task<RuleApplyResult> SetProxiesAsync(
-        IReadOnlyList<(ProxyEndpoint Endpoint, string? Password)> proxies,
+        IReadOnlyList<(ProxyEndpoint Endpoint, ProxySecrets Secrets)> proxies,
         IReadOnlyList<ProxyChain> chains,
         CancellationToken cancellationToken = default)
     {
         var response = await SendAsync(new IpcRequest
         {
             Op = "set-proxies",
-            Proxies = proxies.Select(p => ProxyDto.From(p.Endpoint, p.Password)).ToList(),
+            Proxies = proxies.Select(p => ProxyDto.From(p.Endpoint, p.Secrets)).ToList(),
             Chains = chains.Select(ChainDto.From).ToList(),
         }, cancellationToken).ConfigureAwait(false);
         return ToApplyResult(response);
@@ -129,12 +131,12 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
     }
 
     public async Task<ProxyProbeResult> ProbeProxyAsync(
-        ProxyEndpoint endpoint, string? password, CancellationToken cancellationToken = default)
+        ProxyEndpoint endpoint, ProxySecrets secrets, CancellationToken cancellationToken = default)
     {
         var response = await SendAsync(new IpcRequest
         {
             Op = "probe-proxy",
-            Proxy = ProxyDto.From(endpoint, password),
+            Proxy = ProxyDto.From(endpoint, secrets),
         }, cancellationToken).ConfigureAwait(false);
 
         if (!response.Ok || response.Probe is null)
@@ -208,7 +210,7 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
             {
                 SocketError.AccessDenied =>
                     $"Not permitted to use {_socketPath}. The daemon only accepts root and the user that started it.",
-                _ => $"No daemon is listening on {_socketPath}. Start it with: sudo systemctl start yura-daemon",
+                _ => $"No daemon is listening on {_socketPath}. Install it from Settings, or start it with: sudo systemctl start yura-daemon",
             };
             SetState(DaemonState.Disconnected);
             return IpcResponse.Failure(_unavailableReason, e.Message);

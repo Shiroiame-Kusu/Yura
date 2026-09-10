@@ -116,7 +116,7 @@ public sealed class TransparentTcpListener : IAsyncDisposable
                     break;
 
                 default:
-                    upstream = await ProxyDialer.OpenAsync(plan.Hops, original, ct).ConfigureAwait(false);
+                    upstream = await ProxyDialer.OpenAsync(plan.Hops, plan.DialDestination ?? original, ct).ConfigureAwait(false);
                     flow.MarkEstablished(RouteObservation.ConfirmedProxied);
                     break;
             }
@@ -134,7 +134,9 @@ public sealed class TransparentTcpListener : IAsyncDisposable
         {
             var reason = flow.Route == RouteObservation.ConfirmedDirect || upstream is null && flow.ProxyName is null
                 ? $"Could not reach {original}: {e.SocketErrorCode}"
-                : $"Could not reach the proxy: {e.SocketErrorCode}";
+                : flow.ViaTunnel
+                    ? $"Could not reach {original} through WireGuard exit '{flow.ProxyName}': {e.SocketErrorCode}"
+                    : $"Could not reach the proxy: {e.SocketErrorCode}";
             flow.MarkFailed(reason);
             _log($"slot {_slot.Name}: {peer} -> {original}: {reason}");
             Reset(client);

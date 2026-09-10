@@ -90,6 +90,28 @@ public sealed class DnsCache
 /// <summary>Just enough DNS wire-format parsing to pull addresses out of an answer.</summary>
 public static class DnsMessage
 {
+    /// <summary>A minimal recursive A query for <paramref name="name"/>, with the given id.</summary>
+    public static byte[] BuildQuery(ushort id, string name)
+    {
+        var labels = name.Trim().TrimEnd('.').Split('.');
+        var message = new List<byte>(12 + name.Length + 6);
+        message.Add((byte)(id >> 8));
+        message.Add((byte)id);
+        message.AddRange([0x01, 0x00]); // RD
+        message.AddRange([0x00, 0x01]); // QDCOUNT
+        message.AddRange([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        foreach (var label in labels)
+        {
+            var bytes = System.Text.Encoding.ASCII.GetBytes(label);
+            message.Add((byte)bytes.Length);
+            message.AddRange(bytes);
+        }
+
+        message.Add(0);
+        message.AddRange([0x00, 0x01, 0x00, 0x01]); // A, IN
+        return message.ToArray();
+    }
+
     private const ushort TypeA = 1;
     private const ushort TypeAaaa = 28;
 

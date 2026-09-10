@@ -178,6 +178,26 @@ public sealed class TransparentUdpListener : IAsyncDisposable
 
                 default:
                 {
+                    if (plan.Hops.Count == 1 && plan.Hops[0].Tunnel is { } tunnel)
+                    {
+                        // A WireGuard exit relays UDP the way a direct route does, from inside the
+                        // tunnel: same session, different mark and source.
+                        var target = plan.DialDestination ?? original;
+                        var source = tunnel.SourceFor(target.AddressFamily);
+                        if (source is null)
+                        {
+                            var why = $"WireGuard exit '{tunnel.Name}' has no {(target.AddressFamily == AddressFamily.InterNetworkV6 ? "IPv6" : "IPv4")} address.";
+                            flow.MarkFailed(why);
+                            _log($"slot {_slot.Name}: udp {client} -> {original} dropped: {why}");
+                            return new DropSession(flow);
+                        }
+
+                        var session = await DirectUdpSession.OpenAsync(_replies, client, original, flow, learn, _stopping.Token,
+                            tunnel.Mark, source, target).ConfigureAwait(false);
+                        flow.MarkEstablished(RouteObservation.ConfirmedProxied);
+                        return session;
+                    }
+
                     if (plan.Hops.Count == 1 && plan.Hops[0].Endpoint.Protocol == ProxyProtocol.Socks5)
                     {
                         var session = await Socks5UdpSession.OpenAsync(_replies, plan.Hops[0], client, original, flow, learn, _stopping.Token)
@@ -378,12 +398,22 @@ internal sealed class DirectUdpSession : UdpSession
         _ = PumpRepliesAsync(_closing.Token);
     }
 
+    /// <param name="mark">The bypass mark, or a WireGuard tunnel's mark.</param>
+    /// <param name="bindTo">A tunnel address to originate from, or null for the kernel's choice.</param>
+    /// <param name="target">Where to send, when that differs from the original destination.</param>
     public static Task<DirectUdpSession> OpenAsync(
-        ReplySocketPool replies, IPEndPoint client, IPEndPoint original, Flow flow, DnsCache? learn, CancellationToken ct)
+        ReplySocketPool replies, IPEndPoint client, IPEndPoint original, Flow flow, DnsCache? learn, CancellationToken ct,
+        uint mark = PolicyRouting.BypassMark, IPAddress? bindTo = null, IPEndPoint? target = null)
     {
-        var relay = new Socket(original.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
-        relay.SetMark(PolicyRouting.BypassMark);
-        relay.Connect(original);
+        target ??= original;
+        var relay = new Socket(target.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+        relay.SetMark(mark);
+        if (bindTo is not null)
+        {
+            relay.Bind(new IPEndPoint(bindTo, 0));
+        }
+
+        relay.Connect(target);
         replies.Reserve(original);
         return Task.FromResult(new DirectUdpSession(replies, relay, client, original, flow, learn));
     }

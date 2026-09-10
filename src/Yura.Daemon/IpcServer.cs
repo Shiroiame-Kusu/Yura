@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Yura.Core.Ipc;
+using Yura.Core.Proxies;
 using Yura.Core.Rules;
 using Yura.Daemon.Diagnostics;
 using Yura.Daemon.Forwarding;
@@ -45,6 +46,7 @@ public sealed class IpcServer : IAsyncDisposable
     private readonly SocketOwnership _ownership;
     private readonly ConnectionLister _connections;
     private readonly NftablesManager _nftables;
+    private readonly WireGuardManager _wireguard;
     private readonly CommandRunner _commands;
     private readonly LogBuffer _logBuffer;
     private readonly DaemonEnvironment _environment;
@@ -62,6 +64,7 @@ public sealed class IpcServer : IAsyncDisposable
         SocketOwnership ownership,
         ConnectionLister connections,
         NftablesManager nftables,
+        WireGuardManager wireguard,
         CommandRunner commands,
         LogBuffer logBuffer,
         DaemonEnvironment environment,
@@ -74,6 +77,7 @@ public sealed class IpcServer : IAsyncDisposable
         _ownership = ownership;
         _connections = connections;
         _nftables = nftables;
+        _wireguard = wireguard;
         _commands = commands;
         _logBuffer = logBuffer;
         _environment = environment;
@@ -209,13 +213,14 @@ public sealed class IpcServer : IAsyncDisposable
                         SocketPath = _socketPath,
                         AllowedUids = _allowedUids.ToList(),
                         Checks = _environment.Checks.ToList(),
+                        Tunnels = (await _wireguard.StatusAsync(ct).ConfigureAwait(false)).ToList(),
                     },
                 };
 
             case "set-proxies":
             {
                 var proxies = (request.Proxies ?? [])
-                    .Select(p => (p.ToEndpoint(), p.Password))
+                    .Select(p => (p.ToEndpoint(), p.ToSecrets()))
                     .ToList();
                 var chains = (request.Chains ?? []).Select(c => c.ToChain()).ToList();
                 var outcome = await _runtime.SetProxiesAsync(proxies, chains, ct).ConfigureAwait(false);
@@ -279,8 +284,10 @@ public sealed class IpcServer : IAsyncDisposable
                     return IpcResponse.Failure("probe-proxy needs a proxy.");
                 }
 
-                var probe = await ProxyProbe.RunAsync(request.Proxy.ToEndpoint(), request.Proxy.Password, ct)
-                    .ConfigureAwait(false);
+                var endpoint = request.Proxy.ToEndpoint();
+                var probe = endpoint.Protocol == ProxyProtocol.WireGuard
+                    ? await _wireguard.ProbeAsync(endpoint, request.Proxy.ToSecrets(), ct).ConfigureAwait(false)
+                    : await ProxyProbe.RunAsync(endpoint, request.Proxy.Password, ct).ConfigureAwait(false);
                 return new IpcResponse { Ok = true, Probe = probe };
             }
 
@@ -336,7 +343,11 @@ public sealed class IpcServer : IAsyncDisposable
                     cancellationToken: ct).ConfigureAwait(false);
                 var groups = string.Join('\n', _runtime.Groups.OrderBy(g => g.Index).Select(g =>
                     $"{g.Name}: pids [{string.Join(", ", ReadMembers(g.Name))}] rules [{string.Join(", ", g.RuleIds.Select(id => _runtime.Rules.FirstOrDefault(r => r.Id == id)?.Name ?? id.ToString()))}]"));
-                var text = $"# nft list table inet yura\n{table}\n# ip rule show\n{rules.StandardOutput}\n# ip route show table {PolicyRouting.RoutingTable}\n{routes.StandardOutput}\n# process groups\n{groups}\n";
+                // wg show prints public keys and hides private and preshared ones by design.
+                var tunnels = _wireguard.Tunnels.Count == 0
+                    ? string.Empty
+                    : "\n# wg show\n" + (await _commands.RunAsync("wg", ["show"], cancellationToken: ct).ConfigureAwait(false)).StandardOutput;
+                var text = $"# nft list table inet yura\n{table}\n# ip rule show\n{rules.StandardOutput}\n# ip route show table {PolicyRouting.RoutingTable}\n{routes.StandardOutput}{tunnels}\n# process groups\n{groups}\n";
                 return new IpcResponse { Ok = true, Ruleset = text };
             }
 

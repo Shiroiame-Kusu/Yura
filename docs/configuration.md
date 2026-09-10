@@ -54,7 +54,8 @@ live now, and the UI shows it as pending until the daemon confirms it.
 
 `passwordRef` is a key into the desktop secret service, reached through `secret-tool`, which
 works with gnome-keyring and kwallet alike because both implement the same D-Bus interface.
-The secret is written to the tool's stdin, so it never appears in the process table.
+The secret is written to the tool's stdin, so it never appears in the process table. For a
+WireGuard exit the same reference holds the private key.
 
 If no secret service is available Yura keeps the password **in memory for that session
 only** and says so under the password field. It does not fall back to a file: writing a
@@ -98,6 +99,21 @@ Beyond settings, proxies and persistent rules, the configuration also holds:
   start, so the file does not fill up with games nobody has configured.
 - **The DNS policy**, which is global rather than per rule because it changes the shape of the
   installed nftables ruleset.
+- **WireGuard exits**, as proxies with `"protocol": "wireGuard"` and a `wireGuard` object
+  holding the non-secret half of the peer configuration:
+
+  ```json
+  { "id": "…", "name": "Frankfurt exit", "protocol": "wireGuard",
+    "host": "wg.example.net", "port": 51820, "passwordRef": "…",
+    "wireGuard": { "peerPublicKey": "…", "addresses": ["10.8.0.7/32"],
+                   "dnsServers": ["10.8.0.1"], "allowedIps": ["0.0.0.0/0", "::/0"],
+                   "persistentKeepalive": 25, "presharedKeyRef": "…" } }
+  ```
+
+  The **private key** is the exit's secret, stored under `passwordRef` exactly as a proxy
+  password is; the **preshared key**, when there is one, is stored under
+  `wireGuard.presharedKeyRef`. Neither ever appears in this file, and `ConfigStoreTests`
+  asserts it. Importing a wg-quick `.conf` reads both keys straight into the secret store.
 
 A game profile's id is derived from its Steam app id, so a saved route survives the library
 moving to another drive or being rescanned.

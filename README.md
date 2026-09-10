@@ -3,15 +3,17 @@
 A Linux-first alternative to Proxifier and ProxyBridge, with an integrated game
 acceleration workflow.
 
-Yura routes the traffic of **specific running processes** through proxies you already run.
+Yura routes the traffic of **specific running processes** through exits you already have.
 It does not ship or manage a routing engine: you point it at your own SOCKS5 or HTTP(S)
-endpoint, and Yura decides which process's traffic goes there.
+proxy, or at a WireGuard peer to use as an exit node, and Yura decides which process's
+traffic goes there.
 
 > **Status: working end to end.** The privileged daemon routes selected running processes
-> through user-supplied proxies, verified by
-> [64 acceptance checks](docs/daemon-acceptance.md) driven through its real IPC socket, and
-> the desktop application drives it. All eleven mandatory acceptance tests are covered. See
-> [Current state](#current-state) for what is proven and what is not.
+> through user-supplied proxies and WireGuard exits, verified by
+> [83 acceptance checks](docs/daemon-acceptance.md) driven through its real IPC socket, and
+> the desktop application drives it and can install it as a systemd service. All eleven
+> mandatory acceptance tests are covered. See [Current state](#current-state) for what is
+> proven and what is not.
 
 ## Why per-process routing is hard on Linux
 
@@ -33,6 +35,7 @@ Yura's answer:
 | Pre-existing connections | Keep their old route, because a socket's cgroup is fixed at creation |
 | Process lifecycle | The kernel's **process connector** reports fork, exec and exit; a sweep re-derives from `/proc` as a safety net |
 | Destination host names | Learned from DNS answers passing through the relay, and from TLS SNI / HTTP `Host` |
+| WireGuard exit nodes | A kernel `wireguard` interface per exit, entered only by the daemon's own sockets through a per-tunnel fwmark and routing table; nothing else on the machine is routed through it |
 
 That last row is a feature, not a limitation: it is exactly the semantic the UI reports.
 
@@ -46,7 +49,7 @@ tests/Yura.Core.Tests  unit tests for the rule system and /proc reader
 tests/Yura.Daemon.Tests unit tests for the nftables ruleset builder
 tests/acceptance/      the daemon acceptance suite, driven through the real IPC socket
 spikes/                the routing spike: proves running-process routing end to end
-tools/                 screenshot harness, contrast checker
+tools/                 screenshot harness, contrast checker, string-table checker
 docs/                  architecture notes, verification reports, screenshots
 ```
 
@@ -55,6 +58,8 @@ docs/                  architecture notes, verification reports, screenshots
 - .NET 10 SDK
 - Linux with cgroup v2 unified hierarchy and nftables (for the daemon and the spike)
 - `nft`, `ip`, `python3` for the spike
+- `wireguard-tools` (`wg`) and a kernel with the `wireguard` module, for WireGuard exits only;
+  without them the daemon runs and says so in Diagnostics
 
 Verified on CachyOS, kernel 7.2, nftables 1.1.7, .NET 10.0.302.
 
@@ -86,8 +91,10 @@ Useful flags:
 | `--lang en\|zh-Hans` | Start in a language |
 | `--page processes\|games\|connections\|proxies\|rules\|diagnostics\|settings` | Start on a page |
 | `--demo` | Populate from a **simulated** daemon, for design review only |
+| `--demo-editor socks\|wireguard\|chain` | Which editor the demo opens on the Proxies page |
 | `--font-report` | Print what Avalonia's font manager actually resolves |
 | `--config-report` | Print where configuration and secrets are stored |
+| `--service-report` | Print the systemd unit and install script the Settings page would use |
 | `--config-dir DIR` | Use a different configuration directory |
 
 ## The routing spike
@@ -115,8 +122,8 @@ rule and reports which links a packet actually reached.
 
 ## Run the daemon
 
-The daemon is the only privileged component. It configures nftables, policy routing and
-cgroups, and forwards captured flows to your proxies.
+The daemon is the only privileged component. It configures nftables, policy routing,
+cgroups and WireGuard interfaces, and forwards captured flows to your exits.
 
 ```bash
 dotnet build src/Yura.Daemon
@@ -124,7 +131,17 @@ sudo ./src/Yura.Daemon/bin/Debug/net10.0/yura-daemon --verbose
 ```
 
 It authorises callers by peer credential (`SO_PEERCRED`): root, plus whichever user invoked
-it via sudo. On SIGTERM it removes every rule, route and cgroup it created.
+it via sudo. On SIGTERM it removes every rule, route, tunnel and cgroup it created.
+
+**As a service.** The Settings page installs it as `yura-daemon.service`: it shows the unit
+and the exact script that will run as root, then asks for your password once through polkit.
+The unit runs the daemon with `ProtectHome=yes`, `ProtectSystem=strict`, `NoNewPrivileges`
+and `HOME` pointed at its tmpfs runtime directory, so it can never write into a home
+directory. Without a polkit agent, the same script is offered to run with sudo:
+
+```bash
+dotnet run --project src/Yura.App -- --service-report
+```
 
 `yura-daemon ctl <op>` speaks the same socket for scripting and diagnostics:
 
@@ -142,17 +159,19 @@ yura-daemon ctl log
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-64 checks against a controlled network on a dummy interface, where each marker payload is
-reachable only through one specific proxy. **64 passed, 0 failed.** All eleven mandatory
+83 checks against a controlled network on a dummy interface, where each marker payload is
+reachable only through one specific proxy — or, for the WireGuard exit, only inside a network
+namespace that the tunnel is the sole way into. **83 passed, 0 failed.** All eleven mandatory
 acceptance tests are covered, including child exclusion, rule precedence in the kernel, and
 Wine/Proton isolation. See [docs/daemon-acceptance.md](docs/daemon-acceptance.md) for the
 evidence behind each one and for the limits that remain.
 
 ## Configuration
 
-Settings, proxies and persistent rules live in **`~/.config/Yura/config.json`**
-(`$XDG_CONFIG_HOME` is honoured). Passwords are kept in the desktop secret service, never in
-that file. See [docs/configuration.md](docs/configuration.md).
+Settings, proxies, WireGuard exits, chains and persistent rules live in
+**`~/.config/Yura/config.json`** (`$XDG_CONFIG_HOME` is honoured). Passwords and WireGuard
+keys are kept in the desktop secret service, never in that file. See
+[docs/configuration.md](docs/configuration.md).
 
 ```bash
 dotnet run --project src/Yura.App -- --config-report
@@ -172,6 +191,15 @@ python3 tools/check-contrast.py --verbose
 
 All 52 required foreground/background pairs meet their target in both themes.
 
+The string table is checked the same way, so a mistyped key cannot survive a build:
+
+```bash
+python3 tools/check-strings.py
+```
+
+All 434 keys exist in both languages, everything referenced exists, and nothing in the table
+is unreferenced.
+
 ## Current state
 
 **Built and verified**
@@ -182,19 +210,26 @@ All 52 required foreground/background pairs meet their target in both themes.
 - All seven pages: Processes, Games, Connections, Proxies, Rules, Diagnostics, Settings
 - Design system, both themes, both languages, 960×640 to 1280×800, 100–200% scaling —
   see [docs/ux-verification.md](docs/ux-verification.md)
-- **Routing spike passing 12/12** and the **daemon acceptance suite passing 64/64**: a running
+- **Routing spike passing 12/12** and the **daemon acceptance suite passing 83/83**: a running
   process migrated into a cgroup live, classified by nftables, captured by TPROXY and
-  forwarded to a SOCKS5 proxy — TCP and UDP, per instance, with the process still running as
-  its original user
+  forwarded to a SOCKS5 proxy or through a WireGuard tunnel — TCP and UDP, per instance, with
+  the process still running as its original user
 - The privileged daemon: cgroup manager, nftables ruleset builder, transparent TCP and UDP
-  forwarder, SOCKS5 / HTTP CONNECT / HTTPS clients, proxy chains, socket-ownership
-  attribution, kernel process events, DNS name learning, SNI and `Host` sniffing, a
-  direct-versus-routed measurement, and a peer-credential-authorised IPC server
-- 93 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
-  wire format, the DNS parser, the SNI parser, the Steam library reader, the rule store and
+  forwarder, SOCKS5 / HTTP CONNECT / HTTPS clients, WireGuard exits on kernel interfaces,
+  proxy chains (with a WireGuard exit as the first hop), socket-ownership attribution, kernel
+  process events, DNS name learning, SNI and `Host` sniffing, a direct-versus-routed
+  measurement, and a peer-credential-authorised IPC server
+- WireGuard exits imported from a wg-quick `.conf`, probed by a real handshake and a DNS
+  answer through the tunnel, with the peer's handshake time and transfer shown live
+- A systemd service installed from Settings through polkit, with the unit and the script
+  shown before anything runs as root, and start / stop / restart / uninstall from the same
+  page
+- 132 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+  wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and
+  tunnel manager, the systemd unit generator, the Steam library reader, the rule store and
   the configuration file
-- Configuration under `~/.config/Yura`, with passwords in the desktop secret service and
-  persistent rules reapplied to the daemon on every connection
+- Configuration under `~/.config/Yura`, with passwords and keys in the desktop secret service
+  and persistent rules reapplied to the daemon on every connection
 
 **Known limits, stated where they matter**
 
@@ -205,6 +240,10 @@ All 52 required foreground/background pairs meet their target in both themes.
   reported — see [the exclusion race](docs/daemon-acceptance.md#the-exclusion-race).
 - **UDP through a chain, or through an HTTP proxy, is refused rather than lost.** DNS is
   carried over TCP in that case so name resolution still works.
-- **IPv6** works for TCP; the UDP path is IPv4-only by construction.
+- **A WireGuard exit can only be the first hop of a chain.** The daemon reaches later hops
+  through the tunnel, but a kernel tunnel cannot be carried inside a SOCKS connection; the
+  app and the daemon both refuse such a chain with the reason.
+- **IPv6** works for TCP; the UDP path is IPv4-only by construction, and the daemon originates
+  inside a tunnel from its IPv4 address.
 - Keyboard-only walkthroughs, screen-reader behaviour and real application icons are not
   verified — see [docs/ux-verification.md](docs/ux-verification.md#not-verified).

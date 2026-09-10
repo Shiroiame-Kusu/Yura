@@ -127,6 +127,30 @@
           </StackPanel>
         </Border>
 
+        <!-- ===================== WireGuard exits ===================== -->
+        <Border Classes="Panel" Padding="16" IsVisible="{Binding HasTunnels}">
+          <StackPanel Spacing="10">
+            <TextBlock Classes="SectionTitle" Text="{loc:Tr Diagnostics.Tunnels}" />
+            <ItemsControl ItemsSource="{Binding Tunnels}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="vm:TunnelRow">
+                  <Grid ColumnDefinitions="74,*" Margin="0,3">
+                    <Border Grid.Column="0" Classes="Badge" HorizontalAlignment="Left"
+                            Classes.Success="{Binding Up}"
+                            Classes.Warning="{Binding !Up}">
+                      <TextBlock Text="{Binding StateDisplay}" />
+                    </Border>
+                    <StackPanel Grid.Column="1" Spacing="1">
+                      <TextBlock Text="{Binding Name}" />
+                      <TextBlock Classes="Caption Mono" Text="{Binding Summary}" TextWrapping="Wrap" />
+                    </StackPanel>
+                  </Grid>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </StackPanel>
+        </Border>
+
         <!-- ==================== Installed ruleset ==================== -->
         <Border Classes="Panel" Padding="16">
           <StackPanel Spacing="10">

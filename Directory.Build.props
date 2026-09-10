@@ -16,7 +16,7 @@
     <RuntimeIdentifiers>linux-x64;linux-arm64</RuntimeIdentifiers>
     <Product>Yura</Product>
     <Company>Yura</Company>
-    <Version>0.1.0</Version>
+    <Version>0.3.0</Version>
   </PropertyGroup>
 
   <PropertyGroup>

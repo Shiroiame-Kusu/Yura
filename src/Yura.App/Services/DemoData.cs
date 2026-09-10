@@ -17,7 +17,7 @@ namespace Yura.App.Services;
 /// </remarks>
 internal static class DemoData
 {
-    public static void Populate(ShellViewModel shell)
+    public static void Populate(ShellViewModel shell, string editor = "socks")
     {
         var socks = new ProxyEndpoint
         {
@@ -57,15 +57,41 @@ internal static class DemoData
             Username = "hakuu",
         };
 
+        // A WireGuard exit: keys live in the secret store, so the demo endpoint only carries
+        // the public half, exactly as a real one does.
+        var wireguard = new ProxyEndpoint
+        {
+            Id = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000004"),
+            Name = "Frankfurt exit",
+            Protocol = ProxyProtocol.WireGuard,
+            Host = "wg.example.net",
+            Port = 51820,
+            PasswordRef = "aaaaaaaa-0000-4000-8000-000000000004",
+            WireGuard = new WireGuardSettings
+            {
+                PeerPublicKey = "n4rHz8mE4GmR7p8Jq2xZ0lWfD6h1vY3sQ9cK5tB2aU8=",
+                Addresses = ["10.8.0.7/32"],
+                DnsServers = ["10.8.0.1"],
+                PersistentKeepalive = 25,
+            },
+        };
+
         shell.Rules.Proxies.Add(socks);
         shell.Rules.Proxies.Add(v6);
         shell.Rules.Proxies.Add(http);
+        shell.Rules.Proxies.Add(wireguard);
 
         shell.Rules.Chains.Add(new ProxyChain
         {
             Id = Guid.Parse("cccccccc-0000-4000-8000-00000000000c"),
             Name = "Home then Tokyo",
             Hops = [socks.Id, v6.Id],
+        });
+        shell.Rules.Chains.Add(new ProxyChain
+        {
+            Id = Guid.Parse("cccccccc-0000-4000-8000-00000000000d"),
+            Name = "Exit then Tokyo",
+            Hops = [wireguard.Id, v6.Id],
         });
 
         shell.Games.LoadProfiles(
@@ -208,6 +234,17 @@ internal static class DemoData
         }
 
         shell.RulesPage.SelectedRule = shell.RulesPage.Rules.FirstOrDefault(r => r.Id == cs2Profile.Id);
-        shell.Proxies.Editor.BeginEdit(socks);
+        // Selected rather than edited directly: the editor follows the list selection, so
+        // this is also what proves the highlighted row and the open editor agree.
+        shell.Proxies.SelectedProxy = editor switch
+        {
+            "wireguard" => shell.Proxies.Proxies.FirstOrDefault(p => p.Id == wireguard.Id),
+            "chain" => null,
+            _ => shell.Proxies.Proxies.FirstOrDefault(p => p.Id == socks.Id),
+        };
+        if (editor == "chain")
+        {
+            shell.Proxies.SelectedChain = shell.Proxies.Chains.LastOrDefault();
+        }
     }
 }

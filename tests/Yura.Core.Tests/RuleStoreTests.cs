@@ -283,4 +283,51 @@ public sealed class RuleStoreTests
         Assert.Equal(2, covering.Count);
         Assert.Equal(300, covering[0].Order);
     }
+    [Fact]
+    public void Removing_a_proxy_takes_it_out_of_chains_and_drops_a_chain_left_empty()
+    {
+        var store = new RuleStore();
+        var a = new ProxyEndpoint { Id = Guid.NewGuid(), Name = "A", Protocol = ProxyProtocol.Socks5, Host = "h", Port = 1 };
+        var b = new ProxyEndpoint { Id = Guid.NewGuid(), Name = "B", Protocol = ProxyProtocol.Socks5, Host = "h", Port = 2 };
+        store.Proxies.Add(a);
+        store.Proxies.Add(b);
+        var both = new ProxyChain { Id = Guid.NewGuid(), Name = "A then B", Hops = [a.Id, b.Id] };
+        var onlyA = new ProxyChain { Id = Guid.NewGuid(), Name = "just A", Hops = [a.Id] };
+        store.PutChain(both);
+        store.PutChain(onlyA);
+
+        Assert.Equal(2, store.ChainsUsing(a.Id).Count);
+
+        var emptied = store.RemoveProxy(a.Id);
+
+        Assert.Single(emptied);
+        Assert.Equal(onlyA.Id, emptied[0].Id);
+        Assert.DoesNotContain(store.Proxies, p => p.Id == a.Id);
+        var remaining = Assert.Single(store.Chains);
+        Assert.Equal([b.Id], remaining.Hops);
+        Assert.Equal(both.Id, remaining.Id);
+        // The route list follows: one proxy and one chain remain.
+        Assert.Equal(2, store.Routes.Count);
+    }
+
+    [Fact]
+    public void Putting_a_chain_replaces_it_in_place_and_removing_it_removes_only_it()
+    {
+        var store = new RuleStore();
+        var a = new ProxyEndpoint { Id = Guid.NewGuid(), Name = "A", Protocol = ProxyProtocol.Socks5, Host = "h", Port = 1 };
+        store.Proxies.Add(a);
+        var first = new ProxyChain { Id = Guid.NewGuid(), Name = "first", Hops = [a.Id] };
+        var second = new ProxyChain { Id = Guid.NewGuid(), Name = "second", Hops = [a.Id] };
+        store.PutChain(first);
+        store.PutChain(second);
+
+        store.PutChain(first with { Name = "renamed" });
+
+        Assert.Equal("renamed", store.Chains[0].Name);
+        Assert.Equal(second.Id, store.Chains[1].Id);
+
+        store.RemoveChain(first.Id);
+        Assert.Single(store.Chains);
+        Assert.Equal(second.Id, store.Chains[0].Id);
+    }
 }

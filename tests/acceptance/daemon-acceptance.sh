@@ -30,6 +30,18 @@ MARK_UDP_A="YURA-UDP-VIA-PROXY-A"
 PROXY_A_ID="aaaaaaaa-0000-4000-8000-00000000000a"
 PROXY_B_ID="bbbbbbbb-0000-4000-8000-00000000000b"
 
+# The WireGuard peer lives in its own network namespace, reached over a veth pair.
+WG_NS="yura-wgns"
+WG_VETH_H="yuraacc1"
+WG_VETH_N="yuraacc2"
+WG_ID="eeee0000-0000-4000-8000-00000000000e"
+WG_BAD_ID="eeee0000-0000-4000-8000-00000000000f"
+WG_SOCKS_ID="dddd0000-0000-4000-8000-0000000000dd"
+WG_CHAIN_ID="cccc0000-0000-4000-8000-0000000000cc"
+MARK_WG="YURA-VIA-WIREGUARD"
+MARK_UDP_WG="YURA-UDP-VIA-WIREGUARD"
+MARK_WG_SOCKS="YURA-VIA-WG-THEN-SOCKS"
+
 KEEP=0
 [[ "${1:-}" == "--keep" ]] && KEEP=1
 
@@ -130,6 +142,13 @@ cleanup() {
   ip rule del priority 7100 2>/dev/null
   ip route flush table 711 2>/dev/null
   ip link del "$DUMMY_IF" 2>/dev/null
+  ip netns pids "$WG_NS" 2>/dev/null | xargs -r kill -9 2>/dev/null
+  ip netns del "$WG_NS" 2>/dev/null
+  ip link del "$WG_VETH_H" 2>/dev/null
+  for l in $(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | grep '^yura-wg'); do ip link del "$l" 2>/dev/null; done
+  for fam in -4 -6; do
+    for p in $(ip $fam rule show 2>/dev/null | awk -F: '$1>=7300 && $1<=7555 {print $1}'); do ip $fam rule del priority "$p" 2>/dev/null; done
+  done
   if [[ -d /sys/fs/cgroup/yura ]]; then
     for d in /sys/fs/cgroup/yura/*/; do
       [[ -d "$d" ]] || continue
@@ -147,7 +166,11 @@ trap cleanup EXIT
 step "Preflight"
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
 [[ -x "$DAEMON" ]] || { echo "daemon not built: $DAEMON (run: dotnet build src/Yura.Daemon)" >&2; exit 1; }
-for t in nft ip python3 setpriv; do command -v "$t" >/dev/null || { echo "missing $t" >&2; exit 1; }; done
+for t in nft ip python3 setpriv wg; do command -v "$t" >/dev/null || { echo "missing $t" >&2; exit 1; }; done
+if systemctl is-active --quiet yura-daemon 2>/dev/null; then
+  echo "the installed yura-daemon service is running and owns $SOCK; stop it first: sudo systemctl stop yura-daemon" >&2
+  exit 1
+fi
 "${ROOT}/spikes/kill-orphans.sh" >/dev/null
 mkdir -p "$RUN"; rm -f "$RUN"/*.jsonl "$RUN"/*.out "$RUN"/*.log "$RUN"/*.pid "$RUN"/*.txt "$RUN"/*.json
 [[ -n "${SUDO_USER:-}" ]] && chown -R "$SUDO_USER" "$RUN"
@@ -530,12 +553,162 @@ for needle in ('chain classify','chain capture','ip rule show','process groups')
 print('ruleset, routing and group membership all reported')\""
 
 # ---------------------------------------------------------------------------
+step "WireGuard exit: a peer that exists only inside a network namespace"
+# The marker destination is an address that exists only inside the peer's namespace, and
+# the only path from the host into that namespace is the encrypted tunnel. Receiving the
+# marker therefore proves the flow left through the exit, and the peer's own log shows the
+# tunnel address as the source, which is what an exit node's far end sees.
+ip netns add "$WG_NS"
+ip link add "$WG_VETH_H" type veth peer name "$WG_VETH_N"
+ip link set "$WG_VETH_N" netns "$WG_NS"
+ip addr add 10.77.1.1/30 dev "$WG_VETH_H"; ip link set "$WG_VETH_H" up
+ip -n "$WG_NS" addr add 10.77.1.2/30 dev "$WG_VETH_N"; ip -n "$WG_NS" link set "$WG_VETH_N" up; ip -n "$WG_NS" link set lo up
+WG_SRV_PRIV="$(wg genkey)"; WG_SRV_PUB="$(wg pubkey <<< "$WG_SRV_PRIV")"
+WG_CLI_PRIV="$(wg genkey)"; WG_CLI_PUB="$(wg pubkey <<< "$WG_CLI_PRIV")"
+WG_PSK="$(wg genpsk)"
+ip -n "$WG_NS" link add wg-srv type wireguard
+( umask 077; printf '[Interface]\nPrivateKey = %s\nListenPort = 51999\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = 10.77.0.1/32\n' \
+    "$WG_SRV_PRIV" "$WG_CLI_PUB" "$WG_PSK" > "$RUN/wg-peer.conf" )
+ip netns exec "$WG_NS" wg setconf wg-srv "$RUN/wg-peer.conf"
+ip -n "$WG_NS" addr add 10.77.0.2/24 dev wg-srv; ip -n "$WG_NS" link set wg-srv up
+ip -n "$WG_NS" addr add "${UNREACHABLE}/32" dev lo
+ip netns exec "$WG_NS" python3 "${LIB}/marker_server.py" --listen "$UNREACHABLE" --tcp-port 8080 --hold-port 8081 --udp-port 9090 \
+  --tcp-marker "$MARK_WG" --udp-marker "$MARK_UDP_WG" --log "$RUN/marker-wg.jsonl" > "$RUN/marker-wg.out" 2>&1 & BG+=($!)
+ip netns exec "$WG_NS" python3 "${LIB}/dns_server.py" --listen 10.77.0.2 --port 53 --answer "$UNREACHABLE" \
+  --log "$RUN/dns-wg.jsonl" > "$RUN/dns-wg.out" 2>&1 & BG+=($!)
+# A SOCKS5 proxy that is itself only reachable through the tunnel, for the chain test.
+ip netns exec "$WG_NS" python3 "${LIB}/socks5_proxy.py" --listen 10.77.0.2 --port 11085 --log "$RUN/proxy-wg.jsonl" \
+  --rewrite "${UNREACHABLE}:8080=${UNREACHABLE}:8085" > "$RUN/proxy-wg.out" 2>&1 & BG+=($!)
+ip netns exec "$WG_NS" python3 "${LIB}/marker_server.py" --listen "$UNREACHABLE" --tcp-port 8085 --hold-port 8086 --udp-port 9095 \
+  --tcp-marker "$MARK_WG_SOCKS" --udp-marker unused --log "$RUN/marker-wg-socks.jsonl" > "$RUN/marker-wg-socks.out" 2>&1 & BG+=($!)
+sleep 1
+info "peer wg-srv in netns ${WG_NS} at 10.77.1.2:51999; ${UNREACHABLE} now exists only inside the namespace"
+
+wg_proxy_json() {  # id name private-key preshared-key peer-public-key
+  python3 -c "
+import json,sys
+print(json.dumps({'id':sys.argv[1],'name':sys.argv[2],'protocol':'wireGuard','host':'10.77.1.2','port':51999,
+  'password':sys.argv[3],'presharedKey':sys.argv[4],
+  'wireGuard':{'peerPublicKey':sys.argv[5],'addresses':['10.77.0.1/24'],'dns':['10.77.0.2'],'allowedIps':['0.0.0.0/0'],'persistentKeepalive':0}}))" \
+    "$1" "$2" "$3" "$4" "$5"
+}
+WG_JSON="$(wg_proxy_json "$WG_ID" "WG exit" "$WG_CLI_PRIV" "$WG_PSK" "$WG_SRV_PUB")"
+WG_BAD_JSON="$(wg_proxy_json "$WG_BAD_ID" "WG broken" "not-a-key" "$WG_PSK" "$WG_SRV_PUB")"
+PROXY_A_JSON="{\"id\":\"$PROXY_A_ID\",\"name\":\"Proxy A\",\"protocol\":\"socks5\",\"host\":\"127.0.0.1\",\"port\":11080}"
+WG_SOCKS_JSON="{\"id\":\"$WG_SOCKS_ID\",\"name\":\"SOCKS behind the exit\",\"protocol\":\"socks5\",\"host\":\"10.77.0.2\",\"port\":11085}"
+WG_CHAIN_BAD_ID="cccc0000-0000-4000-8000-0000000000cd"
+check "daemon accepts a WireGuard exit and says which one it could not bring up" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' set-proxies '{\"proxies\":[$PROXY_A_JSON,$WG_JSON,$WG_BAD_JSON,$WG_SOCKS_JSON],\"chains\":[{\"id\":\"$WG_CHAIN_ID\",\"name\":\"exit then SOCKS\",\"hops\":[\"$WG_ID\",\"$WG_SOCKS_ID\"]},{\"id\":\"$WG_CHAIN_BAD_ID\",\"name\":\"SOCKS then exit\",\"hops\":[\"$PROXY_A_ID\",\"$WG_ID\"]}]}' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)
+assert r['ok'], r
+w=r['apply']['warnings']
+assert any('WG broken' in x and 'not up' in x for x in w), w
+assert not any('WG exit' in x for x in w), w
+print('warned: ' + w[0])\""
+check "status reports the tunnel that is up and the one that is not, without any key" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' status | python3 -c \"
+import json,sys
+raw=sys.stdin.read(); s=json.loads(raw)['status']
+t={x['name']:x for x in s['tunnels']}
+assert t['WG exit']['up'] and t['WG exit']['interface'].startswith('yura-wg'), t
+assert not t['WG broken']['up'] and 'key' in t['WG broken']['failure'].lower(), t
+assert '$WG_CLI_PRIV' not in raw and '$WG_PSK' not in raw, 'a key leaked into status'
+print(f\\\"{t['WG exit']['interface']} up; broken exit: {t['WG broken']['failure']}\\\")\""
+check "the private key never reaches the daemon log" bash -c "
+  ! grep -q -- '$WG_CLI_PRIV' '$RUN/daemon.log' && ! grep -q -- '$WG_PSK' '$RUN/daemon.log' && echo 'no key material in the log'"
+check "probing the exit completes a handshake and gets an answer from the tunnel's resolver" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' probe-proxy '{\"proxy\":$WG_JSON}' | python3 -c \"
+import json,sys
+p=json.load(sys.stdin)['probe']
+assert p['reachable'], p
+assert 'answered through the tunnel' in p['diagnostics'], p
+print(f\\\"handshake in {p['handshakeMilliseconds']:.0f} ms; udp {p['udp']}\\\")\""
+
+WG_APP="$RUN/yura-wgapp"
+cp /usr/bin/python3 "$WG_APP"; chmod 755 "$WG_APP"
+WG_PID="$(start_client_as "$WG_APP" wg --udp-target "${UNREACHABLE}:9090" --dns-query "game.example.net@${UNREACHABLE}:53")"; BG+=("$WG_PID")
+RULE_WG="eeee1111-0000-4000-8000-000000000011"
+check "daemon applies a rule routing a process through the exit" ctl apply-rule "$(exe_rule "$RULE_WG" "wgapp via exit" "$WG_APP" proxy "\"$WG_ID\"" 111)"
+T_WG="$(date +%s.%N)"
+sleep 6
+check "TCP from the process leaves through the tunnel" lq assert "$RUN/client-wg.jsonl" --event tcp --since "$T_WG" --window 3 --min-count 2 --expect-ok true --expect-contains "$MARK_WG"
+check "UDP from the process leaves through the tunnel" lq assert "$RUN/client-wg.jsonl" --event udp --since "$T_WG" --window 3 --min-count 2 --expect-ok true --expect-contains "$MARK_UDP_WG"
+check "the far end sees the tunnel address as the source" bash -c "
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/marker-wg.jsonl' --event tcp_request --since $T_WG --where-contains client=10.77.0.1:)
+  [[ \$n -ge 2 ]] && echo \"\$n requests arrived from 10.77.0.1, the tunnel address\""
+check "name lookups go to the exit's own resolver, not the one the application asked for" bash -c "
+  ok=\$(python3 '$LIB/logquery.py' count '$RUN/client-wg.jsonl' --event dns --since $T_WG)
+  q=\$(python3 '$LIB/logquery.py' count '$RUN/dns-wg.jsonl' --event query --since $T_WG)
+  [[ \$ok -ge 2 && \$q -ge 2 ]] && echo \"\$ok answers received; \$q queries reached the resolver at 10.77.0.2, which nothing else could answer\""
+check "the daemon reports the flows as confirmed through the exit" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' list-flows | python3 -c \"
+import json,sys
+fl=[f for f in json.load(sys.stdin)['flows'] if f.get('ruleId')=='$RULE_WG' and f['route']=='confirmedProxied']
+assert len(fl)>=3, len(fl)
+assert all(f['proxyName']=='WG exit' for f in fl), fl[0]
+print(f'{len(fl)} confirmed flows via WG exit, transports {sorted(set(f[\\\"protocol\\\"] for f in fl))}')\""
+
+# The exit that could not be brought up: its rule is accepted with a warning and its flows are
+# refused with the reason, rather than silently going direct.
+BAD_APP="$RUN/yura-wgbadapp"
+cp /usr/bin/python3 "$BAD_APP"; chmod 755 "$BAD_APP"
+BAD_PID="$(start_client_as "$BAD_APP" wgbad)"; BG+=("$BAD_PID")
+RULE_WGB="eeee2222-0000-4000-8000-000000000022"
+check "a rule on an exit that is down is accepted with a warning that says so" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' apply-rule '$(exe_rule "$RULE_WGB" "wgbadapp via broken exit" "$BAD_APP" proxy "\"$WG_BAD_ID\"" 112)' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)
+assert r['ok'], r
+w=[x for x in r['apply']['warnings'] if 'WG broken' in x and 'refused' in x]
+assert w, r['apply']['warnings']
+print(w[0])\""
+T_WGB="$(date +%s.%N)"
+sleep 4
+# The listener accepts the captured connection and resets it, so the application sees a
+# reset rather than a refusal; either way it never reaches the destination directly.
+check "its connections are reset, not leaked to the direct route" lq assert "$RUN/client-wgbad.jsonl" --event tcp --since "$T_WGB" --window 3 --min-count 2 --expect-ok false --expect-contains "ConnectionResetError"
+check "and each refused flow carries the reason" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' list-flows | python3 -c \"
+import json,sys
+fl=[f for f in json.load(sys.stdin)['flows'] if f.get('ruleId')=='$RULE_WGB']
+bad=[f for f in fl if f['state']=='failed' and 'not up' in (f.get('failureReason') or '')]
+assert bad, fl[-1] if fl else 'no flows'
+print(bad[0]['failureReason'])\""
+ctl remove-rule "{\"ruleId\":\"$RULE_WGB\"}" > /dev/null
+kill -9 "$BAD_PID" 2>/dev/null || true
+
+# Chains: the exit as the first hop reaches a proxy that only exists behind it.
+CHAIN_WG_APP="$RUN/yura-wgchainapp"
+cp /usr/bin/python3 "$CHAIN_WG_APP"; chmod 755 "$CHAIN_WG_APP"
+CHAIN_WG_PID="$(start_client_as "$CHAIN_WG_APP" wgchain)"; BG+=("$CHAIN_WG_PID")
+RULE_WGC="eeee3333-0000-4000-8000-000000000033"
+check "daemon applies a rule through the chain 'exit then SOCKS'" ctl apply-rule "$(exe_rule "$RULE_WGC" "chained through the exit" "$CHAIN_WG_APP" chain "\"$WG_CHAIN_ID\"" 113)"
+T_WGC="$(date +%s.%N)"
+sleep 6
+check "traffic reaches the proxy behind the exit and comes back with its marker" lq assert "$RUN/client-wgchain.jsonl" --event tcp --since "$T_WGC" --window 3 --min-count 2 --expect-ok true --expect-contains "$MARK_WG_SOCKS"
+check "the proxy behind the exit saw the tunnel address dial it" bash -c "
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/proxy-wg.jsonl' --event connect --since $T_WGC)
+  [[ \$n -ge 2 ]] && echo \"\$n CONNECTs at the SOCKS proxy inside the namespace\""
+check "a chain with the exit anywhere but first is refused at apply time" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' apply-rule '$(exe_rule "eeee4444-0000-4000-8000-000000000044" "backwards chain" "$CHAIN_WG_APP" chain "\"$WG_CHAIN_BAD_ID\"" 114)' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)
+assert not r['ok'] and 'first hop' in r['error'], r
+print(r['error'])\"" || true
+ctl remove-rule "{\"ruleId\":\"$RULE_WGC\"}" > /dev/null
+ctl remove-rule "{\"ruleId\":\"$RULE_WG\"}" > /dev/null
+kill -9 "$CHAIN_WG_PID" "$WG_PID" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
 step "Clean shutdown"
 kill -TERM "$DAEMON_PID"
 for _ in $(seq 1 40); do kill -0 "$DAEMON_PID" 2>/dev/null || break; sleep 0.25; done
 check "nft table removed on shutdown" bash -c "! nft list table inet yura >/dev/null 2>&1 && echo removed"
 check "policy routing removed on shutdown" bash -c "! ip rule show | grep -q 'fwmark 0x7100/0xffffff00' && echo removed"
 check "cgroup subtree removed on shutdown" bash -c "[[ ! -d /sys/fs/cgroup/yura ]] && echo removed"
+check "WireGuard interfaces removed on shutdown" bash -c "! ip -o link show type wireguard | grep -q yura-wg && echo removed"
+check "tunnel policy rules removed on shutdown" bash -c "! ip rule show | grep -q 'fwmark 0x73' && echo removed"
 DAEMON_PID=""
 
 step "Result"

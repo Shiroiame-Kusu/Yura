@@ -66,9 +66,24 @@ public sealed record DaemonStatus
     public IReadOnlyList<uint> AllowedUids { get; init; } = [];
 
     public IReadOnlyList<DaemonCheck> Checks { get; init; } = [];
+
+    /// <summary>Every WireGuard exit the daemon knows, whether or not it came up.</summary>
+    public IReadOnlyList<TunnelStatus> Tunnels { get; init; } = [];
 }
 
 public sealed record DaemonCheck(string Name, bool Passed, string? Detail);
+
+/// <summary>What the kernel reports about one WireGuard exit. Never carries a key.</summary>
+public sealed record TunnelStatus(
+    Guid ProxyId,
+    string Name,
+    string? Interface,
+    bool Up,
+    string? Failure,
+    DateTimeOffset? LatestHandshakeUtc,
+    long RxBytes,
+    long TxBytes,
+    string? Endpoint);
 
 /// <summary>
 /// The unprivileged app's only channel to the privileged daemon.
@@ -108,20 +123,20 @@ public interface IDaemonClient
 
     Task<RuleApplyResult> RemoveRuleAsync(Guid ruleId, CancellationToken cancellationToken = default);
 
-    /// <summary>Replaces the daemon's proxy and chain list. Passwords travel only here.</summary>
+    /// <summary>Replaces the daemon's proxy and chain list. Secrets travel only here.</summary>
     Task<RuleApplyResult> SetProxiesAsync(
-        IReadOnlyList<(ProxyEndpoint Endpoint, string? Password)> proxies,
+        IReadOnlyList<(ProxyEndpoint Endpoint, ProxySecrets Secrets)> proxies,
         IReadOnlyList<ProxyChain> chains,
         CancellationToken cancellationToken = default);
 
     Task<RuleApplyResult> SetDnsPolicyAsync(DnsPolicy policy, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Tests an endpoint. The password is passed in rather than read by the daemon: only the
+    /// Tests an endpoint. The secrets are passed in rather than read by the daemon: only the
     /// app can reach the user's secret store, and the daemon holds no credentials at rest.
     /// </summary>
     Task<ProxyProbeResult> ProbeProxyAsync(
-        ProxyEndpoint endpoint, string? password, CancellationToken cancellationToken = default);
+        ProxyEndpoint endpoint, ProxySecrets secrets, CancellationToken cancellationToken = default);
 
     /// <summary>Measures one target directly and, when a route is given, through it.</summary>
     Task<MeasurementDto?> MeasureAsync(
@@ -157,7 +172,7 @@ public sealed class DisconnectedDaemonClient : IDaemonClient
     }
 
     public string? UnavailableReason =>
-        $"No daemon is listening on {_socketPath}. Start it with: sudo systemctl start yura-daemon";
+        $"No daemon is listening on {_socketPath}. Install it from Settings, or start it with: sudo systemctl start yura-daemon";
 
     public Task ConnectAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 
@@ -178,7 +193,7 @@ public sealed class DisconnectedDaemonClient : IDaemonClient
         Task.FromResult(Refused());
 
     public Task<RuleApplyResult> SetProxiesAsync(
-        IReadOnlyList<(ProxyEndpoint Endpoint, string? Password)> proxies,
+        IReadOnlyList<(ProxyEndpoint Endpoint, ProxySecrets Secrets)> proxies,
         IReadOnlyList<ProxyChain> chains,
         CancellationToken cancellationToken = default) =>
         Task.FromResult(Refused());
@@ -187,7 +202,7 @@ public sealed class DisconnectedDaemonClient : IDaemonClient
         Task.FromResult(Refused());
 
     public Task<ProxyProbeResult> ProbeProxyAsync(
-        ProxyEndpoint endpoint, string? password, CancellationToken cancellationToken = default) =>
+        ProxyEndpoint endpoint, ProxySecrets secrets, CancellationToken cancellationToken = default) =>
         Task.FromResult(new ProxyProbeResult
         {
             TimestampUtc = DateTimeOffset.UtcNow,

@@ -34,6 +34,9 @@ public sealed record StartupOptions
     /// </summary>
     public string? ConfigDirectory { get; init; }
 
+    /// <summary>Which editor the demo opens on the Proxies page: socks, wireguard or chain.</summary>
+    public string DemoEditor { get; init; } = "socks";
+
     public static StartupOptions Parse(string[] args)
     {
         var options = new StartupOptions();
@@ -67,6 +70,9 @@ public sealed record StartupOptions
                     break;
                 case "--config-dir" when i + 1 < args.Length:
                     options = options with { ConfigDirectory = args[++i] };
+                    break;
+                case "--demo-editor" when i + 1 < args.Length:
+                    options = options with { DemoEditor = args[++i] };
                     break;
             }
         }
