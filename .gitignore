@@ -15,3 +15,6 @@ spikes/.run/
 docs/screenshots/.scratch/
 tests/acceptance/.run/
 tests/acceptance/.run-last*.log
+
+# The product specification this repository was built from. Kept locally, never committed.
+PROMPT.md
