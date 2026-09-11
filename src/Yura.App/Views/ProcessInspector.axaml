@@ -47,33 +47,49 @@
 
               <Border Classes="Divider" />
 
-              <!-- Rule scope: the three scopes, each with the consequence spelled out. -->
+              <!-- Rule scope: the three scopes, each with the consequence spelled out.
+
+                   No GroupName: Avalonia groups a radio button with its siblings when none is
+                   set, and this control is instantiated twice in the same window (docked and
+                   floating). A shared group name makes the two copies fight over one group,
+                   which leaves the hidden copy with nothing selected. -->
               <StackPanel Spacing="8">
                 <TextBlock Classes="FieldLabel" Text="{loc:Tr Processes.Scope.Title}" />
 
-                <RadioButton GroupName="scope" IsChecked="{Binding ScopeChoice,
+                <RadioButton IsChecked="{Binding ScopeChoice,
                                Converter={StaticResource EnumToBool}, ConverterParameter=Instance}">
                   <StackPanel Spacing="1">
-                    <TextBlock Text="{loc:Tr Processes.Scope.Instance}" />
+                    <TextBlock Text="{loc:Tr Processes.Scope.Instance}" TextWrapping="Wrap" />
                     <TextBlock Classes="Caption" Text="{loc:Tr Processes.Scope.InstanceHint}" TextWrapping="Wrap" />
                   </StackPanel>
                 </RadioButton>
 
-                <RadioButton GroupName="scope" IsChecked="{Binding ScopeChoice,
+                <RadioButton IsChecked="{Binding ScopeChoice,
                                Converter={StaticResource EnumToBool}, ConverterParameter=Executable}">
                   <StackPanel Spacing="1">
-                    <TextBlock Text="{loc:Tr Processes.Scope.Executable}" />
+                    <TextBlock Text="{loc:Tr Processes.Scope.Executable}" TextWrapping="Wrap" />
                     <TextBlock Classes="Caption" Text="{loc:Tr Processes.Scope.ExecutableHint}" TextWrapping="Wrap" />
                   </StackPanel>
                 </RadioButton>
 
-                <RadioButton GroupName="scope" IsChecked="{Binding ScopeChoice,
+                <RadioButton IsChecked="{Binding ScopeChoice,
                                Converter={StaticResource EnumToBool}, ConverterParameter=Tree}">
                   <StackPanel Spacing="1">
-                    <TextBlock Text="{loc:Tr Processes.Scope.Tree}" />
+                    <TextBlock Text="{loc:Tr Processes.Scope.Tree}" TextWrapping="Wrap" />
                     <TextBlock Classes="Caption" Text="{loc:Tr Processes.Scope.TreeHint}" TextWrapping="Wrap" />
                   </StackPanel>
                 </RadioButton>
+
+                <!-- Children belong with the scope, not with the actions: it is the same
+                     question. The tree scope already answers it, so the box is only offered
+                     for the two scopes where the user still has a choice. -->
+                <StackPanel Spacing="2" IsVisible="{Binding ChildrenChoiceApplies}">
+                  <CheckBox IsChecked="{Binding IncludeChildren}">
+                    <TextBlock Text="{loc:Tr Processes.Action.IncludeChildren}" TextWrapping="Wrap" />
+                  </CheckBox>
+                  <TextBlock Classes="FieldHint" Text="{loc:Tr Processes.Scope.ExcludeHint}"
+                             IsVisible="{Binding !IncludeChildren}" TextWrapping="Wrap" />
+                </StackPanel>
               </StackPanel>
 
               <!-- Route -->
@@ -92,7 +108,13 @@
                 </ComboBox>
               </StackPanel>
 
-              <!-- Actions -->
+              <!-- Actions.
+
+                   One button per row, and every label allowed to wrap. The panel is 288 DIPs
+                   wide docked, so a two-up grid leaves about 120 for a label: "Inspect
+                   connections" and "Block network access" were being cut off mid-word, with
+                   no ellipsis to show that anything was missing. Pairing them saved a little
+                   height and cost the user the labels. -->
               <StackPanel Spacing="8">
                 <TextBlock Classes="FieldLabel" Text="{loc:Tr Processes.Inspector.Actions}" />
 
@@ -112,44 +134,71 @@
 
                 <Button Classes="accent" HorizontalAlignment="Stretch"
                         Command="{Binding ProxyThisInstanceCommand}"
-                        IsEnabled="{Binding CanApply}"
                         Content="{loc:Tr Processes.Action.ProxyInstance}" />
 
                 <Button HorizontalAlignment="Stretch"
-                        Command="{Binding AlwaysProxyExecutableCommand}"
-                        IsEnabled="{Binding CanApply}"
-                        Content="{loc:Tr Processes.Action.AlwaysProxy}" />
+                        Command="{Binding AlwaysProxyExecutableCommand}">
+                  <TextBlock Text="{loc:Tr Processes.Action.AlwaysProxy}" TextWrapping="Wrap"
+                             TextAlignment="Center" />
+                </Button>
 
-                <Grid ColumnDefinitions="*,8,*">
-                  <Button Grid.Column="0" HorizontalAlignment="Stretch"
-                          Command="{Binding RouteDirectCommand}" IsEnabled="{Binding CanApply}"
-                          Content="{loc:Tr Processes.Action.Direct}" />
-                  <Button Grid.Column="2" HorizontalAlignment="Stretch"
-                          Command="{Binding BlockCommand}" IsEnabled="{Binding CanApply}"
-                          Content="{loc:Tr Processes.Action.Block}" />
-                </Grid>
+                <Button HorizontalAlignment="Stretch"
+                        Command="{Binding RouteDirectCommand}">
+                  <TextBlock Text="{loc:Tr Processes.Action.Direct}" TextWrapping="Wrap"
+                             TextAlignment="Center" />
+                </Button>
 
-                <CheckBox IsChecked="{Binding IncludeChildren}"
-                          Content="{loc:Tr Processes.Action.IncludeChildren}" />
-                <TextBlock Classes="FieldHint" Text="{loc:Tr Processes.Scope.ExcludeHint}"
-                           IsVisible="{Binding !IncludeChildren}" />
+                <Button HorizontalAlignment="Stretch"
+                        Command="{Binding BlockCommand}">
+                  <TextBlock Text="{loc:Tr Processes.Action.Block}" TextWrapping="Wrap"
+                             TextAlignment="Center" />
+                </Button>
+
+                <!-- Why an action is unavailable, beside the control rather than in a tooltip. -->
+                <TextBlock Classes="FieldHint" Text="{Binding ApplyBlockedReason}" TextWrapping="Wrap"
+                           IsVisible="{Binding ApplyBlockedReason, Converter={x:Static ObjectConverters.IsNotNull}}" />
+
+                <!-- Result of the last apply, where the user is looking when they press the
+                     button. It used to be below the covering-rules list, off the bottom of a
+                     panel this narrow. -->
+                <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraAccentSubtle}"
+                        BorderBrush="{DynamicResource YuraAccent}"
+                        IsVisible="{Binding LastApplied, Converter={x:Static ObjectConverters.IsNotNull}}">
+                  <StackPanel Spacing="4">
+                    <TextBlock FontWeight="SemiBold" Text="{Binding LastApplied.Headline}" TextWrapping="Wrap" />
+                    <TextBlock Classes="Caption" Text="{Binding LastApplied.Body}" TextWrapping="Wrap" />
+                    <TextBlock Classes="Caption" Text="{Binding LastApplied.Caveat}" TextWrapping="Wrap"
+                               Foreground="{DynamicResource YuraWarning}"
+                               IsVisible="{Binding LastApplied.Caveat, Converter={x:Static ObjectConverters.IsNotNull}}" />
+                  </StackPanel>
+                </Border>
+
+                <!-- Failure: what failed, plus expandable technical detail. -->
+                <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraDangerSubtle}"
+                        BorderBrush="{DynamicResource YuraDanger}"
+                        IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+                  <StackPanel Spacing="6">
+                    <TextBlock FontWeight="SemiBold" Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
+                    <Expander Header="{loc:Tr Common.Details}"
+                              IsVisible="{Binding ErrorDiagnostics, Converter={x:Static ObjectConverters.IsNotNull}}">
+                      <SelectableTextBlock Classes="Mono" Text="{Binding ErrorDiagnostics}" TextWrapping="Wrap" />
+                    </Expander>
+                  </StackPanel>
+                </Border>
 
                 <Button HorizontalAlignment="Stretch"
                         Command="{Binding RemoveOverrideCommand}"
                         Content="{loc:Tr Processes.Action.RemoveOverride}" />
 
-                <Grid ColumnDefinitions="*,8,*">
-                  <Button Grid.Column="0" HorizontalAlignment="Stretch"
-                          Command="{Binding InspectConnectionsCommand}"
-                          Content="{loc:Tr Processes.Action.InspectConnections}" />
-                  <Button Grid.Column="2" HorizontalAlignment="Stretch"
-                          Command="{Binding AddAsGameCommand}"
-                          Content="{loc:Tr Processes.Action.AddAsGame}" />
-                </Grid>
+                <Button HorizontalAlignment="Stretch"
+                        Command="{Binding InspectConnectionsCommand}">
+                  <TextBlock Text="{loc:Tr Processes.Action.InspectConnections}" TextWrapping="Wrap"
+                             TextAlignment="Center" />
+                </Button>
 
-                <!-- Why an action is unavailable, beside the control rather than in a tooltip. -->
-                <TextBlock Classes="FieldHint" Text="{Binding ApplyBlockedReason}"
-                           IsVisible="{Binding ApplyBlockedReason, Converter={x:Static ObjectConverters.IsNotNull}}" />
+                <Button HorizontalAlignment="Stretch"
+                        Command="{Binding AddAsGameCommand}"
+                        Content="{loc:Tr Processes.Action.AddAsGame}" />
               </StackPanel>
 
               <!-- Every rule that covers this process, in evaluation order, so precedence is
@@ -173,32 +222,6 @@
                   </ItemsControl.ItemTemplate>
                 </ItemsControl>
               </StackPanel>
-
-              <!-- Result of the last apply: separates "new connections" from "existing". -->
-              <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraAccentSubtle}"
-                      BorderBrush="{DynamicResource YuraAccent}"
-                      IsVisible="{Binding LastApplied, Converter={x:Static ObjectConverters.IsNotNull}}">
-                <StackPanel Spacing="4">
-                  <TextBlock FontWeight="SemiBold" Text="{Binding LastApplied.Headline}" TextWrapping="Wrap" />
-                  <TextBlock Classes="Caption" Text="{Binding LastApplied.Body}" TextWrapping="Wrap" />
-                  <TextBlock Classes="Caption" Text="{Binding LastApplied.Caveat}" TextWrapping="Wrap"
-                             Foreground="{DynamicResource YuraWarning}"
-                             IsVisible="{Binding LastApplied.Caveat, Converter={x:Static ObjectConverters.IsNotNull}}" />
-                </StackPanel>
-              </Border>
-
-              <!-- Failure: what failed, plus expandable technical detail. -->
-              <Border Classes="Panel" Padding="12" Background="{DynamicResource YuraDangerSubtle}"
-                      BorderBrush="{DynamicResource YuraDanger}"
-                      IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
-                <StackPanel Spacing="6">
-                  <TextBlock FontWeight="SemiBold" Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
-                  <Expander Header="{loc:Tr Common.Details}"
-                            IsVisible="{Binding ErrorDiagnostics, Converter={x:Static ObjectConverters.IsNotNull}}">
-                    <SelectableTextBlock Classes="Mono" Text="{Binding ErrorDiagnostics}" TextWrapping="Wrap" />
-                  </Expander>
-                </StackPanel>
-              </Border>
 
             </StackPanel>
           </StackPanel>

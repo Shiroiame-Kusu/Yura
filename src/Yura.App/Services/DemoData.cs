@@ -143,6 +143,12 @@ internal static class DemoData
             },
         ]);
 
+        // The process inspector only exists when something is selected, so a capture of the
+        // Processes page without a selection shows an empty panel and proves nothing about
+        // the layout of the part that does the work.
+        shell.Processes.SelectedProcess = shell.Processes.Processes.FirstOrDefault();
+        shell.Processes.SelectedProxy = shell.Rules.Proxies.FirstOrDefault();
+
         shell.Games.SelectedGame = shell.Games.Games.FirstOrDefault(g => g.Name.StartsWith("Counter", StringComparison.Ordinal));
         shell.Games.SelectedRoute = shell.Rules.FindRoute(socks.Id);
         shell.Games.MeasurementTargetInput = "162.254.192.71:27015";
