@@ -9,6 +9,7 @@ using System.Net;
 using Yura.Core.Connections;
 using Yura.Core.Games;
 using Yura.Core.Ipc;
+using Yura.Core.Net;
 using Yura.Core.Processes;
 using Yura.Core.Proxies;
 using Yura.Core.Rules;
@@ -836,6 +837,183 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(LastMeasurementDisplay));
         OnPropertyChanged(nameof(MeasurementTargetDisplay));
         OnPropertyChanged(nameof(MeasurementMethodDisplay));
+    }
+
+    // -- NAT type -------------------------------------------------------------
+
+    /// <summary>
+    /// What the direct path looks like to a peer, and what the route looks like.
+    /// </summary>
+    /// <remarks>
+    /// Separate from the latency measurement because it answers a different question and
+    /// costs different traffic: latency asks "how fast", this asks "can another player reach
+    /// me at all". For a peer-to-peer game the second one decides whether there is a match to
+    /// have, and routing can move it in either direction — a proxy on a public address can
+    /// turn Strict into Open, and a badly chosen one can do the opposite.
+    /// </remarks>
+    [ObservableProperty]
+    public partial NatReportDto? DirectNat { get; set; }
+
+    [ObservableProperty]
+    public partial NatReportDto? RoutedNat { get; set; }
+
+    [ObservableProperty]
+    public partial DateTimeOffset? LastNatTestUtc { get; set; }
+
+    public bool HasNatResult => DirectNat is not null || RoutedNat is not null;
+
+    public string DirectNatVerdict => VerdictLabel(DirectNat);
+
+    public string RoutedNatVerdict => VerdictLabel(RoutedNat);
+
+    public string DirectNatDetail => Detail(DirectNat);
+
+    public string RoutedNatDetail => Detail(RoutedNat);
+
+    /// <summary>
+    /// Said plainly when routing makes peer-to-peer worse, because that is the one outcome a
+    /// player would otherwise discover from their friends failing to join.
+    /// </summary>
+    public string? NatComparison
+    {
+        get
+        {
+            if (DirectNat is not { } direct || RoutedNat is not { } routed)
+            {
+                return null;
+            }
+
+            if (!routed.SupportsP2P() && direct.SupportsP2P())
+            {
+                return string.Format(CultureInfo.CurrentCulture,
+                    Loc.Current["Games.Nat.WorseOnRoute"], RouteName);
+            }
+
+            if (routed.SupportsP2P() && !direct.SupportsP2P())
+            {
+                return string.Format(CultureInfo.CurrentCulture,
+                    Loc.Current["Games.Nat.BetterOnRoute"], RouteName);
+            }
+
+            return routed.Verdict == direct.Verdict
+                ? Loc.Current["Games.Nat.Same"]
+                : null;
+        }
+    }
+
+    public bool NatComparisonIsWarning => DirectNat is { } direct && RoutedNat is { } routed &&
+                                          direct.SupportsP2P() && !routed.SupportsP2P();
+
+    public string LastNatTestDisplay => LastNatTestUtc is { } t
+        ? t.ToLocalTime().ToString("HH:mm:ss", CultureInfo.CurrentCulture)
+        : Loc.Current["Common.NotMeasured"];
+
+    public bool CanTestNat => _daemon.State == DaemonState.Connected && !IsTestingNat;
+
+    [ObservableProperty]
+    public partial bool IsTestingNat { get; set; }
+
+    /// <summary>The verdict in the words games use, or plainly that it is not known.</summary>
+    private static string VerdictLabel(NatReportDto? report) => report?.Verdict switch
+    {
+        NatVerdict.Open => Loc.Current["Games.Nat.Open"],
+        NatVerdict.Moderate => Loc.Current["Games.Nat.Moderate"],
+        NatVerdict.Strict => Loc.Current["Games.Nat.Strict"],
+        NatVerdict.Blocked => Loc.Current["Games.Nat.Blocked"],
+        _ => Loc.Current["Common.Unavailable"],
+    };
+
+    /// <summary>
+    /// The behaviour behind the verdict, in one line.
+    /// </summary>
+    /// <remarks>
+    /// The verdict alone is a label; this is the part that can be acted on. It says what the
+    /// mapping does, whether the filtering question was answered at all, and which address a
+    /// peer would be told to use.
+    /// </remarks>
+    private static string Detail(NatReportDto? report)
+    {
+        if (report is null)
+        {
+            return Loc.Current["Common.NotMeasured"];
+        }
+
+        var mapping = report.Mapping switch
+        {
+            NatMapping.EndpointIndependent => Loc.Current["Games.Nat.MappingStable"],
+            NatMapping.AddressDependent or NatMapping.AddressAndPortDependent or NatMapping.DestinationDependent =>
+                Loc.Current["Games.Nat.MappingVaries"],
+            _ => Loc.Current["Games.Nat.MappingUnknown"],
+        };
+
+        var filtering = report.Filtering switch
+        {
+            NatFiltering.EndpointIndependent => Loc.Current["Games.Nat.FilterOpen"],
+            NatFiltering.AddressDependent => Loc.Current["Games.Nat.FilterAddress"],
+            NatFiltering.AddressAndPortDependent => Loc.Current["Games.Nat.FilterStrict"],
+            _ => Loc.Current["Games.Nat.FilterUnknown"],
+        };
+
+        var seen = report.MappedEndpoint is { Length: > 0 } endpoint
+            ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Nat.SeenAs"], endpoint)
+            : null;
+
+        return string.Join(" ", new[] { mapping, filtering, seen }.Where(s => s is { Length: > 0 }));
+    }
+
+    /// <summary>
+    /// Tests the NAT behaviour of both paths, in one call, through the daemon.
+    /// </summary>
+    /// <remarks>
+    /// The daemon has to do it: the test must leave by the route the game's traffic leaves by,
+    /// and only the daemon can originate traffic inside a WireGuard exit or on a proxy's UDP
+    /// association. Both paths are tested in the same call against the same servers, for the
+    /// same reason the latency figures are.
+    /// </remarks>
+    [RelayCommand]
+    private async Task TestNatAsync()
+    {
+        if (IsTestingNat)
+        {
+            return;
+        }
+
+        IsTestingNat = true;
+        FailureReason = null;
+        OnPropertyChanged(nameof(CanTestNat));
+        try
+        {
+            var (proxyId, chainId) = SelectedRoute is { } route
+                ? route.IsChain ? ((Guid?)null, (Guid?)route.Id) : (route.Id, null)
+                : (null, null);
+
+            var result = await _daemon.TestNatAsync(proxyId, chainId).ConfigureAwait(true);
+            if (result is null)
+            {
+                FailureReason = _daemon.State == DaemonState.Connected
+                    ? Loc.Current["Games.Nat.Failed"]
+                    : _daemon.UnavailableReason;
+                return;
+            }
+
+            DirectNat = result.Direct;
+            RoutedNat = result.Routed;
+            LastNatTestUtc = result.TestedAtUtc;
+
+            OnPropertyChanged(nameof(HasNatResult));
+            OnPropertyChanged(nameof(DirectNatVerdict));
+            OnPropertyChanged(nameof(RoutedNatVerdict));
+            OnPropertyChanged(nameof(DirectNatDetail));
+            OnPropertyChanged(nameof(RoutedNatDetail));
+            OnPropertyChanged(nameof(NatComparison));
+            OnPropertyChanged(nameof(NatComparisonIsWarning));
+            OnPropertyChanged(nameof(LastNatTestDisplay));
+        }
+        finally
+        {
+            IsTestingNat = false;
+            OnPropertyChanged(nameof(CanTestNat));
+        }
     }
 
     /// <summary>The two halves of an agent route in one sentence, or null when unknown.</summary>

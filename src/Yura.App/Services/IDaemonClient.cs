@@ -197,6 +197,17 @@ public interface IDaemonClient
         string host, ushort port, Guid? proxyId, Guid? chainId, int samples,
         CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Discovers the NAT behaviour of the direct path and, when a route is given, of the
+    /// route — which is what decides whether a peer-to-peer game can connect players.
+    /// </summary>
+    /// <remarks>
+    /// Only ever on request: the test asks third-party STUN servers what address they see,
+    /// which is not something to do in the background on someone's behalf.
+    /// </remarks>
+    Task<NatTestResultDto?> TestNatAsync(
+        Guid? proxyId, Guid? chainId, CancellationToken cancellationToken = default);
+
     /// <summary>The nftables table, policy routing and group membership the daemon installed.</summary>
     Task<string?> DumpRulesetAsync(CancellationToken cancellationToken = default);
 
@@ -274,6 +285,10 @@ public sealed class DisconnectedDaemonClient : IDaemonClient
         string host, ushort port, Guid? proxyId, Guid? chainId, int samples,
         CancellationToken cancellationToken = default) =>
         Task.FromResult<MeasurementDto?>(null);
+
+    public Task<NatTestResultDto?> TestNatAsync(
+        Guid? proxyId, Guid? chainId, CancellationToken cancellationToken = default) =>
+        Task.FromResult<NatTestResultDto?>(null);
 
     public Task<string?> DumpRulesetAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult<string?>(null);

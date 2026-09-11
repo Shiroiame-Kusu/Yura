@@ -1,5 +1,6 @@
 using Yura.App.ViewModels;
 using Yura.Core.Games;
+using Yura.Core.Ipc;
 using Yura.Core.Net;
 using Yura.Core.Processes;
 using Yura.Core.Proxies;
@@ -151,6 +152,32 @@ internal static class DemoData
 
         shell.Games.SelectedGame = shell.Games.Games.FirstOrDefault(g => g.Name.StartsWith("Counter", StringComparison.Ordinal));
         shell.Games.SelectedRoute = shell.Rules.FindRoute(socks.Id);
+        // A NAT result too, and the case worth laying out: a home connection that cannot do
+        // peer-to-peer at all, and a route that fixes it.
+        shell.Games.DirectNat = new NatReportDto
+        {
+            Verdict = NatVerdict.Strict,
+            Mapping = NatMapping.AddressAndPortDependent,
+            Filtering = NatFiltering.AddressAndPortDependent,
+            MappedEndpoint = "203.0.113.44:51820",
+            BehindNat = true,
+            Servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"],
+            Diagnostics = "Two different servers saw two different mappings, so the address a peer " +
+                          "would be told is not the address it would see.",
+        };
+        shell.Games.RoutedNat = new NatReportDto
+        {
+            Verdict = NatVerdict.Open,
+            Mapping = NatMapping.EndpointIndependent,
+            Filtering = NatFiltering.EndpointIndependent,
+            MappedEndpoint = "198.51.100.9:41003",
+            BehindNat = false,
+            Servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"],
+            Diagnostics = "The far side sees the route's own address and port, so nothing is " +
+                          "translating it.",
+        };
+        shell.Games.LastNatTestUtc = DateTimeOffset.UtcNow;
+
         shell.Games.MeasurementTargetInput = "162.254.192.71:27015";
         shell.Games.EnterSimulatedSession(BoostState.Routing, TimeSpan.FromMinutes(7).Add(TimeSpan.FromSeconds(24)));
         shell.Games.MeasurementTarget = "162.254.192.71:27015";

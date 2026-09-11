@@ -205,6 +205,18 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
         return response.Ok ? response.Measurement : null;
     }
 
+    public async Task<NatTestResultDto?> TestNatAsync(
+        Guid? proxyId, Guid? chainId, CancellationToken cancellationToken = default)
+    {
+        var response = await SendAsync(new IpcRequest
+        {
+            Op = "nat-test",
+            NatTest = new NatTestRequestDto { ProxyId = proxyId, ChainId = chainId },
+        }, cancellationToken).ConfigureAwait(false);
+
+        return response.Ok ? response.Nat : null;
+    }
+
     public async Task<string?> DumpRulesetAsync(CancellationToken cancellationToken = default)
     {
         var response = await SendAsync(new IpcRequest { Op = "dump-ruleset" }, cancellationToken).ConfigureAwait(false);

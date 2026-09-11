@@ -214,6 +214,70 @@
           </StackPanel>
         </Border>
 
+        <!-- ===================== NAT type, direct and routed =====================
+             A separate panel from the latency comparison because it answers a different
+             question: not how fast the route is, but whether another player can reach this
+             machine through it at all. For a peer-to-peer game that decides whether there is
+             a game to play, and routing can move it either way. -->
+        <Border Classes="Panel" Padding="16">
+          <StackPanel Spacing="12">
+            <Grid ColumnDefinitions="*,Auto">
+              <StackPanel Grid.Column="0" Spacing="2">
+                <TextBlock Classes="SectionTitle" Text="{loc:Tr Games.Nat.Title}" />
+                <TextBlock Classes="FieldHint" Text="{loc:Tr Games.Nat.Hint}" TextWrapping="Wrap"
+                           MaxWidth="620" HorizontalAlignment="Left" />
+              </StackPanel>
+              <Button Grid.Column="1" VerticalAlignment="Top"
+                      Command="{Binding TestNatCommand}" IsEnabled="{Binding CanTestNat}"
+                      Content="{loc:Tr Games.Nat.Test}" />
+            </Grid>
+
+            <Grid ColumnDefinitions="150,*,*" RowDefinitions="Auto,Auto,Auto" ColumnSpacing="16"
+                  IsVisible="{Binding HasNatResult}">
+              <TextBlock Grid.Row="0" Grid.Column="1" Classes="FieldLabel" Text="{loc:Tr Games.Direct}" />
+              <TextBlock Grid.Row="0" Grid.Column="2" Classes="FieldLabel" Text="{loc:Tr Games.Routed}" />
+
+              <TextBlock Grid.Row="1" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Games.Nat.Verdict}"
+                         Margin="0,0,0,6" />
+              <TextBlock Grid.Row="1" Grid.Column="1" Classes="Metric" Text="{Binding DirectNatVerdict}"
+                         Margin="0,0,0,6" />
+              <TextBlock Grid.Row="1" Grid.Column="2" Classes="Metric" Text="{Binding RoutedNatVerdict}"
+                         Margin="0,0,0,6" />
+
+              <TextBlock Grid.Row="2" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Games.Nat.Behaviour}" />
+              <TextBlock Grid.Row="2" Grid.Column="1" Classes="Caption" Text="{Binding DirectNatDetail}"
+                         TextWrapping="Wrap" />
+              <TextBlock Grid.Row="2" Grid.Column="2" Classes="Caption" Text="{Binding RoutedNatDetail}"
+                         TextWrapping="Wrap" />
+            </Grid>
+
+            <!-- The one sentence a player acts on: whether routing helps or hurts. -->
+            <Border Classes="Panel" Padding="12"
+                    Background="{DynamicResource YuraAccentSubtle}"
+                    BorderBrush="{DynamicResource YuraAccent}"
+                    IsVisible="{Binding NatComparison, Converter={x:Static ObjectConverters.IsNotNull}}">
+              <TextBlock Text="{Binding NatComparison}" TextWrapping="Wrap"
+                         Foreground="{DynamicResource YuraText}" />
+            </Border>
+
+            <Grid ColumnDefinitions="*,Auto" IsVisible="{Binding HasNatResult}">
+              <Expander Grid.Column="0" Header="{loc:Tr Common.Details}">
+                <StackPanel Spacing="6">
+                  <SelectableTextBlock Classes="Caption" TextWrapping="Wrap"
+                                       Text="{Binding DirectNat.Diagnostics}" />
+                  <SelectableTextBlock Classes="Caption" TextWrapping="Wrap"
+                                       Text="{Binding RoutedNat.Diagnostics}"
+                                       IsVisible="{Binding RoutedNat, Converter={x:Static ObjectConverters.IsNotNull}}" />
+                </StackPanel>
+              </Expander>
+              <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Top">
+                <TextBlock Classes="Caption" Text="{loc:Tr Games.LastUpdate}" VerticalAlignment="Center" />
+                <TextBlock Classes="Mono Tertiary" Text="{Binding LastNatTestDisplay}" VerticalAlignment="Center" />
+              </StackPanel>
+            </Grid>
+          </StackPanel>
+        </Border>
+
         <!-- Libraries Steam lists that could not be read: named, because an unmounted drive
              is the difference between a short list and a complete one. -->
         <Border Classes="Panel" Padding="16" IsVisible="{Binding HasSkippedLibraries}">

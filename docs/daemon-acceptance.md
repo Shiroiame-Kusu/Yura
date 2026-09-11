@@ -8,7 +8,7 @@ dotnet build src/Yura.Daemon
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-**83 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
+**128 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
 wireguard-tools 1.0.
 
 Nothing in the harness touches nftables, cgroups or policy routing directly. Every kernel
@@ -102,6 +102,26 @@ what a user experiences as "the route does nothing":
   escaped is reported as routed.
 - IPv6 from a covered process is refused, and the refusal is counted in the kernel, so the
   ruleset cannot quietly go back to letting it out.
+
+### NAT type, direct and through a route
+
+What a peer-to-peer game needs is not that its packets leave but that a peer's packets arrive,
+which depends on the route rather than on the machine. Seven checks measure it the way the
+harness proves everything else — with a server that only one path can reach:
+
+| Check | Result |
+| --- | --- |
+| The direct path is measured, not guessed | `open`, `behindNat: false`, endpoint-independent mapping; the address a peer would be told is this machine's own |
+| Both STUN servers were really asked | One binding request logged at each |
+| A SOCKS5 route is measured through its UDP association | `moderate`: one mapping for both servers, and `behindNat` is null because the socket facing them is the proxy's |
+| The proxy's own log shows it carried the probes | Two `udp_send` entries naming the STUN ports |
+| **An agent route is measured from the agent** | The mapped address is inside the agent's network namespace — nothing on this machine can reach it, so it can only have come from the agent |
+| **And it is honest about what that costs** | `strict`, `addressAndPortDependent`: a channel is one destination, so two peers are two sockets at the agent and see two different source ports |
+| A chain is reported as carrying no UDP | `blocked`, with "carries TCP only" — a definite answer, not an unknown |
+
+The fixture (`spikes/lib/stun_server.py`) answers binding requests and logs every query, and
+deliberately ignores `CHANGE-REQUEST`: it exists to pin the mapping behaviour, and simulating
+the filtering tests would let the suite assert something the fixture was only pretending to do.
 
 ### A rule reaching connections that were already open
 
@@ -218,6 +238,32 @@ Because `socket cgroupv2` resolves a path to a cgroup id when the ruleset loads,
 left the installed rule pointing at an id that no longer existed — matching nothing, with the
 rule visibly present and the counters stuck at zero. A rule's group is now created with the
 rule and kept for its lifetime.
+
+### A superseded rule left live in the daemon (found in a user's own daemon)
+
+Reported as "the app says proxied but nothing is routed". The daemon's rule list, read from a
+live session, held two rules for the same process:
+
+```
+order 100  action direct   descendants exclude
+order 101  action proxy    descendants includeFuture
+```
+
+Evaluation is first match, so the process was **direct** while the panel showed only rule 101
+and labelled it *Proxied*. Neither rule was wrong; what was wrong was that both existed. The
+app's rule store replaced a superseded selection in its own list and never asked the daemon to
+remove it, and because positions are handed out in ascending order, the rule that had been
+replaced always won.
+
+The same dump proved two more faults at once. Rule 100 was `direct` because the panel's
+"Proxy this instance" button fell back to Direct when no route was selected — a button that
+installed the opposite of its label and then reported success. And rule 101 had
+`descendants: includeFuture`, the instance scope, although the panel had "this process and
+its children" selected: the button ignored the scope radio entirely.
+
+All three are fixed at the point they were caused, and the app now also prunes rules the
+daemon holds that it does not know about, so a daemon that survives an app crash mid-edit
+does not keep deciding routes from a rule no page shows.
 
 ### IPv6 marked but never captured (found by reading the ruleset)
 

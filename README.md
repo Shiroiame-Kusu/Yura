@@ -10,7 +10,7 @@ traffic goes there.
 
 > **Status: working end to end.** The privileged daemon routes selected running processes
 > through user-supplied proxies and WireGuard exits, verified by
-> [83 acceptance checks](docs/daemon-acceptance.md) driven through its real IPC socket, and
+> [128 acceptance checks](docs/daemon-acceptance.md) driven through its real IPC socket, and
 > the desktop application drives it and can install it as a systemd service. All eleven
 > mandatory acceptance tests are covered. See [Current state](#current-state) for what is
 > proven and what is not.
@@ -161,9 +161,9 @@ yura-daemon ctl log
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-113 checks against a controlled network on a dummy interface, where each marker payload is
+128 checks against a controlled network on a dummy interface, where each marker payload is
 reachable only through one specific proxy — or, for a WireGuard exit and a Yura agent, only
-inside a network namespace that the tunnel or the agent is the sole way into. **113 passed, 0
+inside a network namespace that the tunnel or the agent is the sole way into. **128 passed, 0
 failed.** All eleven mandatory acceptance tests are covered, including child exclusion, rule
 precedence in the kernel, and Wine/Proton isolation. See
 [docs/daemon-acceptance.md](docs/daemon-acceptance.md) for the evidence behind each one and for
@@ -243,7 +243,7 @@ is unreferenced.
 - All seven pages: Processes, Games, Connections, Proxies, Rules, Diagnostics, Settings
 - Design system, both themes, both languages, 960×640 to 1280×800, 100–200% scaling —
   see [docs/ux-verification.md](docs/ux-verification.md)
-- **Routing spike passing 12/12** and the **daemon acceptance suite passing 113/113**: a
+- **Routing spike passing 12/12** and the **daemon acceptance suite passing 128/128**: a
   running process migrated into a cgroup live, classified by nftables, captured by TPROXY and
   forwarded to a SOCKS5 proxy, through a WireGuard tunnel, or through a Yura agent — TCP and
   UDP, per instance, with the process still running as its original user
@@ -258,6 +258,12 @@ is unreferenced.
   key, a shared token, an AES-GCM datagram channel for UDP, latency measured from the agent's
   own vantage point, and the resolver it offers used for lookups on that exit. Added by
   pasting one connect string, deployable as one self-contained file with one command
+- **NAT type for peer-to-peer games**, measured over the route rather than guessed from the
+  machine: STUN through the route's own UDP path — a marked socket, a WireGuard exit, a SOCKS5
+  association or an agent's datagram channel — so the Games page can say whether routing this
+  game makes other players able to reach you, or less able. Nothing is sent until the button is
+  pressed, and filtering behaviour that could not be tested is reported as untested rather than
+  rounded up to Open
 - **Honest reporting of what is actually routed**: the Games page reads the daemon's account of
   each of the game's connections and says how many are going through the route, how many are
   going to a proxy on this machine, and how many predate the rule — because a rule being
@@ -265,12 +271,13 @@ is unreferenced.
 - A systemd service installed from Settings through polkit, with the unit and the script
   shown before anything runs as root, and start / stop / restart / uninstall from the same
   page
-- 266 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+- 327 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
   wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and
   tunnel manager, the agent protocol end to end against a real agent, the connect string, the
   datagram sealing and its replay window, the systemd unit generators, the Steam library
-  reader and its KeyValues parser, the rule store, the proxy, agent and chain editors, the
-  routing-evidence sentences, and the configuration file
+  reader and its KeyValues parser, the STUN codec and the NAT classifier's table of cases,
+  the socket-abort request's byte layout, the rule store, the process inspector, the proxy,
+  agent and chain editors, the routing-evidence sentences, and the configuration file
 - Configuration under `~/.config/Yura`, with passwords and keys in the desktop secret service
   and persistent rules reapplied to the daemon on every connection
 

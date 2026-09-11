@@ -1010,6 +1010,78 @@ ctl remove-rule "{\"ruleId\":\"$RULE_AGM\"}" > /dev/null
 ctl remove-rule "{\"ruleId\":\"$RULE_AG\"}" > /dev/null
 kill -9 "$AG_MID_PID" "$AG_APP_PID" 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# NAT type. What a peer-to-peer game cares about is not whether the route works but what
+# address the far side sees, and that is a property of the route: measured here against STUN
+# servers on this machine for the direct path, and against servers that exist only inside the
+# agent's namespace for the routed one — so the address reported for the route can only have
+# come from the agent.
+step "NAT type, direct and through a route"
+
+as_user python3 "${LIB}/stun_server.py" --listen "$LOCAL_ADDR" --port 3478 \
+  --log "$RUN/stun-a.jsonl" > "$RUN/stun-a.out" 2>&1 & BG+=($!)
+as_user python3 "${LIB}/stun_server.py" --listen "$LOCAL_ADDR" --port 3479 \
+  --log "$RUN/stun-b.jsonl" > "$RUN/stun-b.out" 2>&1 & BG+=($!)
+ip netns exec "$AG_NS" python3 "${LIB}/stun_server.py" --listen "$UNREACHABLE" --port 3478 \
+  --log "$RUN/stun-agent-a.jsonl" > "$RUN/stun-agent-a.out" 2>&1 & BG+=($!)
+ip netns exec "$AG_NS" python3 "${LIB}/stun_server.py" --listen "$UNREACHABLE" --port 3479 \
+  --log "$RUN/stun-agent-b.jsonl" > "$RUN/stun-agent-b.out" 2>&1 & BG+=($!)
+sleep 1
+HOST_STUN="\"${LOCAL_ADDR}:3478\",\"${LOCAL_ADDR}:3479\""
+NS_STUN="\"${UNREACHABLE}:3478\",\"${UNREACHABLE}:3479\""
+info "stun ${LOCAL_ADDR}:3478/3479 on this machine; ${UNREACHABLE}:3478/3479 exists only inside ${AG_NS}"
+
+check "the direct path's NAT behaviour is measured, not guessed" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"servers\":[$HOST_STUN]}}' | python3 -c \"
+import json,sys
+d=json.load(sys.stdin)['nat']['direct']
+assert d['verdict']=='open', d
+assert d['behindNat'] is False, d
+assert d['mapping']=='endpointIndependent', d
+assert len(d['servers'])==2, d
+print(f\\\"{d['verdict']}: peers see {d['mappedEndpoint']}, nothing translating it\\\")\""
+check "both STUN servers were actually asked" bash -c "
+  a=\$(python3 '$LIB/logquery.py' count '$RUN/stun-a.jsonl' --event binding)
+  b=\$(python3 '$LIB/logquery.py' count '$RUN/stun-b.jsonl' --event binding)
+  [[ \$a -ge 1 && \$b -ge 1 ]] && echo \"\$a query at :3478, \$b at :3479\""
+
+T_NAT="$(date +%s.%N)"
+check "a SOCKS5 route's NAT behaviour is measured through its UDP association" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"proxyId\":\"$PROXY_A_ID\",\"servers\":[$HOST_STUN]}}' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)['nat']['routed']
+assert r['verdict']=='moderate', r
+assert r['mapping']=='endpointIndependent', r
+assert r.get('behindNat') is None, r   # the socket facing the servers is the proxy's, not ours
+print(f\\\"{r['verdict']}: one mapping for both servers, peers see {r['mappedEndpoint']}\\\")\""
+check "the proxy's own log shows it carried the probes" bash -c "
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/proxy-a.jsonl' --event udp_send --since $T_NAT --where-contains requested=${LOCAL_ADDR}:347)
+  [[ \$n -ge 2 ]] && echo \"\$n STUN datagram(s) went through the association\""
+
+check "an agent route is measured from the agent, and reports what a peer would really see" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"proxyId\":\"$AG_ID\",\"servers\":[$NS_STUN],\"routeOnly\":true}}' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)['nat']['routed']
+# The address can only have come from inside the namespace: nothing here can reach it.
+assert r['mappedEndpoint'].startswith('${UNREACHABLE}:'), r
+# And it is honest about the consequence of a socket per destination at the agent.
+assert r['verdict']=='strict', r
+assert r['mapping']=='addressAndPortDependent', r
+assert 'own socket' in r['diagnostics'], r
+print(f\\\"{r['verdict']}: peers see {r['mappedEndpoint']}, a different port each\\\")\""
+check "the servers inside the namespace saw the probes arrive from the agent" bash -c "
+  a=\$(python3 '$LIB/logquery.py' count '$RUN/stun-agent-a.jsonl' --event binding)
+  b=\$(python3 '$LIB/logquery.py' count '$RUN/stun-agent-b.jsonl' --event binding)
+  [[ \$a -ge 1 && \$b -ge 1 ]] && echo \"\$a query at :3478 and \$b at :3479, inside ${AG_NS}\""
+
+check "a chain is reported as carrying no UDP at all, rather than as unknown" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"chainId\":\"$AG_CHAIN_ID\",\"servers\":[$NS_STUN],\"routeOnly\":true}}' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)['nat']['routed']
+assert r['verdict']=='blocked', r
+assert 'TCP only' in r['diagnostics'], r
+print('blocked: ' + r['diagnostics'])\""
+
 # The agent going away is a state the daemon has to notice rather than discover mid-flow.
 kill -TERM "$AG_PID" 2>/dev/null || true
 sleep 2

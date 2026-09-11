@@ -1,6 +1,7 @@
 using System.Net;
 using Yura.Core.Connections;
 using Yura.Core.Ipc;
+using Yura.Core.Net;
 using Yura.Core.Proxies;
 using Yura.Core.Rules;
 
@@ -255,6 +256,43 @@ public sealed class SimulatedDaemonClient : IDaemonClient
             Direct = Set(samples, samples, 84.3, 11.2),
             Routed = proxyId is null && chainId is null ? null : Set(samples, samples, 46.1, 3.7),
             MeasuredAtUtc = DateTimeOffset.UtcNow,
+        };
+    }
+
+    /// <summary>
+    /// A home connection behind a typical router, and a route that improves it — which is the
+    /// case worth showing, because it is the reason to route a peer-to-peer game at all.
+    /// </summary>
+    public async Task<NatTestResultDto?> TestNatAsync(
+        Guid? proxyId, Guid? chainId, CancellationToken cancellationToken = default)
+    {
+        await Task.Delay(1200, cancellationToken).ConfigureAwait(false);
+
+        return new NatTestResultDto
+        {
+            Direct = new NatReportDto
+            {
+                Verdict = NatVerdict.Strict,
+                Mapping = NatMapping.AddressAndPortDependent,
+                Filtering = NatFiltering.AddressAndPortDependent,
+                MappedEndpoint = "203.0.113.44:51820",
+                BehindNat = true,
+                Servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"],
+                RoundTripMilliseconds = 31.4,
+                Diagnostics = "Two different servers saw two different mappings.",
+            },
+            Routed = proxyId is null && chainId is null ? null : new NatReportDto
+            {
+                Verdict = NatVerdict.Open,
+                Mapping = NatMapping.EndpointIndependent,
+                Filtering = NatFiltering.EndpointIndependent,
+                MappedEndpoint = "198.51.100.9:41003",
+                Servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"],
+                RoundTripMilliseconds = 12.8,
+                Diagnostics = "Two different servers saw the same mapping.",
+            },
+            RouteName = "Home server",
+            TestedAtUtc = DateTimeOffset.UtcNow,
         };
     }
 

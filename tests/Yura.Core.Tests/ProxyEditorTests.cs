@@ -50,9 +50,6 @@ internal sealed class RecordingDaemonClient : IDaemonClient
     /// <summary>Makes removals fail, the way a daemon that went away mid-edit would.</summary>
     public bool FailRemovals { get; set; }
 
-    /// <summary>What the daemon is holding, as it would answer list-rules.</summary>
-    public List<(Guid Id, string Name)> Installed { get; } = [];
-
     public DaemonState State { get; set; } = DaemonState.Connected;
 
     public event EventHandler<DaemonState>? StateChanged { add { } remove { } }
@@ -99,6 +96,9 @@ internal sealed class RecordingDaemonClient : IDaemonClient
         return Task.FromResult(new RuleApplyResult { Succeeded = true });
     }
 
+    /// <summary>What the daemon is holding, as it would answer list-rules.</summary>
+    public List<(Guid Id, string Name)> Installed { get; } = [];
+
     public Task<IReadOnlyList<(Guid Id, string Name)>> GetInstalledRulesAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<(Guid, string)>>(Installed.ToArray());
 
@@ -118,6 +118,17 @@ internal sealed class RecordingDaemonClient : IDaemonClient
 
     public Task<MeasurementDto?> MeasureAsync(string host, ushort port, Guid? proxyId, Guid? chainId, int samples, CancellationToken ct = default) =>
         Task.FromResult<MeasurementDto?>(null);
+
+    /// <summary>What the next NAT test reports, so a test can drive the comparison.</summary>
+    public NatTestResultDto? NextNatResult { get; set; }
+
+    public List<(Guid? ProxyId, Guid? ChainId)> NatTests { get; } = [];
+
+    public Task<NatTestResultDto?> TestNatAsync(Guid? proxyId, Guid? chainId, CancellationToken ct = default)
+    {
+        NatTests.Add((proxyId, chainId));
+        return Task.FromResult(NextNatResult);
+    }
 
     public Task<string?> DumpRulesetAsync(CancellationToken ct = default) => Task.FromResult<string?>(null);
 

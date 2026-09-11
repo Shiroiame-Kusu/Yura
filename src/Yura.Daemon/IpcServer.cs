@@ -361,6 +361,55 @@ public sealed class IpcServer : IAsyncDisposable
                 return new IpcResponse { Ok = true, Measurement = measurement };
             }
 
+            case "nat-test":
+            {
+                // Only ever on request. The test talks to a third party to learn what that
+                // third party sees, so it is not something to do in the background.
+                var wanted = request.NatTest ?? new NatTestRequestDto();
+
+                IReadOnlyList<ProxyHop>? route = null;
+                string? routeName = null;
+                if (wanted.ChainId is { } chain)
+                {
+                    var (hops, name, failure) = _runtime.State.ResolveRoute(new RuleAction.Chain(chain));
+                    if (failure is not null)
+                    {
+                        return IpcResponse.Failure(failure);
+                    }
+
+                    (route, routeName) = (hops, name);
+                }
+                else if (wanted.ProxyId is { } proxy)
+                {
+                    var (hops, name, failure) = _runtime.State.ResolveRoute(new RuleAction.Proxy(proxy));
+                    if (failure is not null)
+                    {
+                        return IpcResponse.Failure(failure);
+                    }
+
+                    (route, routeName) = (hops, name);
+                }
+
+                var routed = route is { Count: > 0 }
+                    ? await NatProbe.RunAsync(wanted.Servers, route, ct).ConfigureAwait(false)
+                    : null;
+                var direct = wanted.RouteOnly && routed is not null
+                    ? null
+                    : await NatProbe.RunAsync(wanted.Servers, null, ct).ConfigureAwait(false);
+
+                return new IpcResponse
+                {
+                    Ok = true,
+                    Nat = new NatTestResultDto
+                    {
+                        Direct = direct,
+                        Routed = routed,
+                        RouteName = routeName,
+                        TestedAtUtc = DateTimeOffset.UtcNow,
+                    },
+                };
+            }
+
             case "dump-ruleset":
             {
                 var table = await _nftables.DumpAsync(ct).ConfigureAwait(false);

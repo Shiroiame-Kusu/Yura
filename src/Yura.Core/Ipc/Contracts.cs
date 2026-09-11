@@ -38,7 +38,7 @@ public sealed class IpcRequest
     /// <summary>
     /// status | set-proxies | set-options | apply-rule | remove-rule | list-rules |
     /// list-flows | list-connections | connection-counts | probe-proxy | measure |
-    /// dump-ruleset | log
+    /// nat-test | dump-ruleset | log
     /// </summary>
     public required string Op { get; init; }
 
@@ -61,6 +61,8 @@ public sealed class IpcRequest
     public OptionsDto? Options { get; init; }
 
     public MeasureRequestDto? Measure { get; init; }
+
+    public NatTestRequestDto? NatTest { get; init; }
 
     /// <summary>For list-connections: restrict to one owning pid.</summary>
     public int? Pid { get; init; }
@@ -90,6 +92,8 @@ public sealed class IpcResponse
     public ProbeResultDto? Probe { get; init; }
 
     public MeasurementDto? Measurement { get; init; }
+
+    public NatTestResultDto? Nat { get; init; }
 
     public Dictionary<int, int>? Counts { get; init; }
 
@@ -274,6 +278,78 @@ public sealed class MeasureRequestDto
     public Guid? ChainId { get; init; }
 
     public int Samples { get; init; } = 5;
+}
+
+/// <summary>What to test the NAT behaviour of.</summary>
+public sealed class NatTestRequestDto
+{
+    /// <summary>Test this route as well as the direct path. Null tests direct only.</summary>
+    public Guid? ProxyId { get; init; }
+
+    public Guid? ChainId { get; init; }
+
+    /// <summary>
+    /// STUN servers as <c>host:port</c>. Empty uses the daemon's defaults.
+    /// </summary>
+    /// <remarks>
+    /// Overridable because a NAT test necessarily talks to a third party, and anyone who
+    /// would rather it were their own third party must be able to say so. Which servers
+    /// actually answered comes back in the result.
+    /// </remarks>
+    public List<string> Servers { get; init; } = [];
+
+    /// <summary>
+    /// Skip the direct half. Only useful when the direct path cannot reach the servers the
+    /// route can, which is how the acceptance tests prove a result came from the route.
+    /// </summary>
+    public bool RouteOnly { get; init; }
+}
+
+/// <summary>The NAT behaviour of one path, and what it means for peer-to-peer traffic.</summary>
+public sealed class NatReportDto
+{
+    public required NatVerdict Verdict { get; init; }
+
+    public NatMapping Mapping { get; init; }
+
+    public NatFiltering Filtering { get; init; }
+
+    /// <summary>The address the far side sees. Null when nothing answered.</summary>
+    public string? MappedEndpoint { get; init; }
+
+    /// <summary>Null when it could not be told, which is the case for every relayed route.</summary>
+    public bool? BehindNat { get; init; }
+
+    /// <summary>What was tried and what came back, for the expandable detail.</summary>
+    public string? Diagnostics { get; init; }
+
+    /// <summary>The servers that answered, so a verdict is never credited to a silent one.</summary>
+    public List<string> Servers { get; init; } = [];
+
+    public double? RoundTripMilliseconds { get; init; }
+
+    /// <summary>
+    /// True when peer-to-peer traffic can be expected to work with most peers.
+    /// </summary>
+    /// <remarks>
+    /// A method rather than a property so it stays out of the serialised shape: the wire
+    /// carries what was measured, and this is a reading of it.
+    /// </remarks>
+    public bool SupportsP2P() => Verdict is NatVerdict.Open or NatVerdict.Moderate;
+}
+
+/// <summary>A NAT test: the direct path, and the route, measured the same way.</summary>
+public sealed class NatTestResultDto
+{
+    /// <summary>Null only when the caller asked for the route alone.</summary>
+    public NatReportDto? Direct { get; init; }
+
+    /// <summary>Null when no route was named.</summary>
+    public NatReportDto? Routed { get; init; }
+
+    public string? RouteName { get; init; }
+
+    public DateTimeOffset TestedAtUtc { get; init; }
 }
 
 /// <summary>One side of a direct-versus-routed comparison, measured the same way.</summary>
