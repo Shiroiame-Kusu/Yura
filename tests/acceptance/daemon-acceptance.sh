@@ -410,8 +410,11 @@ RULE_R="55550000-0000-4000-8000-000000000055"
 : > "$RUN/tree-r.out"
 ctl apply-rule "$(instance_rule "$RULE_R" "immediate-connect shell via A" "$TREE_R_PID" proxy "\"$PROXY_A_ID\"" 110 exclude)" > /dev/null
 sleep 8
-LEAKED=$(grep -o "$MARK_A" "$RUN/tree-r.out" | wc -l)
-TOTAL=$(grep -c '' "$RUN/tree-r.out")
+# Both tolerate no matches: under `set -o pipefail` a grep that finds nothing fails the
+# whole assignment, which under `set -e` ended the run — and it ended it precisely when the
+# result was good, because zero leaked children is zero matches.
+LEAKED=$(grep -o "$MARK_A" "$RUN/tree-r.out" | wc -l || true)
+TOTAL=$(grep -c '' "$RUN/tree-r.out" || true)
 info "children that connected before the fork notification could arrive: ${LEAKED} of ${TOTAL}"
 check "the race is bounded: a child that connects instantly is the only one that can leak" bash -c "
   [[ $TOTAL -ge 2 ]] && echo 'measured over $TOTAL immediate-connect children; see docs for why this is inherent'"
