@@ -396,6 +396,7 @@ internal static class Strings
         ["Processes.Action.AddAsGame"] = "Add as a game",
         ["Processes.Scope.ExcludeHint"] = "Children are moved out of the rule as soon as the kernel reports them. One that connects in its first instant can still use the parent's route.",
         ["Processes.RulesCovering"] = "Rules covering this process",
+        ["Processes.Inspector.NoRoute"] = "Pick a route above to proxy this process. Route directly and Block need no route.",
 
         // -- shell additions ------------------------------------------------
         ["App.Tagline"] = "Per-process routing for Linux",
@@ -912,6 +913,7 @@ internal static class Strings
         ["Processes.Action.AddAsGame"] = "添加为游戏",
         ["Processes.Scope.ExcludeHint"] = "内核报告子进程后会立即将其移出规则。在创建瞬间就建立连接的子进程仍可能使用父进程的路由。",
         ["Processes.RulesCovering"] = "覆盖此进程的规则",
+        ["Processes.Inspector.NoRoute"] = "请在上方选择线路以代理此进程。直连和阻止无需选择线路。",
 
         ["App.Tagline"] = "Linux 按进程路由",
 

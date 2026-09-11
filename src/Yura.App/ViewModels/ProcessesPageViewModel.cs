@@ -148,10 +148,22 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
     /// <summary>The inspector floats only when it is needed and cannot be docked.</summary>
     public bool ShowOverlayInspector => IsCompact && HasSelection;
 
-    public bool CanApply => SelectedProcess is not null && !IsApplying;
+    /// <summary>
+    /// Whether a rule can be installed at all.
+    /// </summary>
+    /// <remarks>
+    /// The daemon is part of the condition. Without it nothing can reach the kernel, and a
+    /// button that is live while the panel explains that nothing will happen is a button that
+    /// lies. <see cref="ApplyBlockedReason"/> says which of the two is missing.
+    /// </remarks>
+    public bool CanApply => SelectedProcess is not null && !IsApplying &&
+                            _daemon.State == DaemonState.Connected;
+
+    /// <summary>Proxying additionally needs somewhere to proxy to.</summary>
+    public bool CanProxy => CanApply && SelectedProxy is not null;
 
     /// <summary>
-    /// Explains why Apply is unavailable, shown next to the control rather than as a
+    /// Explains why an action is unavailable, shown next to the control rather than as a
     /// tooltip, so the reason is visible without hovering.
     /// </summary>
     public string? ApplyBlockedReason
@@ -168,7 +180,10 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
                 return _daemon.UnavailableReason;
             }
 
-            return null;
+            // Said here rather than by quietly routing directly, which is what the two proxy
+            // buttons used to do when no route was picked: the rule they installed said
+            // "direct" while the button said "proxy".
+            return SelectedProxy is null ? Loc.Current["Processes.Inspector.NoRoute"] : null;
         }
     }
 
@@ -275,6 +290,10 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
             row.Policy = kind;
             row.PolicyDetail = detail;
         }
+
+        // The rule list can also change from the Rules page, so the panel's buttons are
+        // re-evaluated on the refresh tick rather than only after this page acts.
+        RefreshCommandStates();
     }
 
     private void RebuildView()
@@ -376,11 +395,31 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
 
     private void RefreshCoveringRules()
     {
+        var rebuilt = BuildCoveringRules();
+
+        // Only touched when the content actually differs. This runs on every refresh tick,
+        // and clearing an ItemsControl's source twice a second makes the list flicker and
+        // drops whatever the pointer was over.
+        if (rebuilt.SequenceEqual(CoveringRules))
+        {
+            return;
+        }
+
         CoveringRules.Clear();
+        foreach (var rule in rebuilt)
+        {
+            CoveringRules.Add(rule);
+        }
+
+        OnPropertyChanged(nameof(HasCoveringRules));
+    }
+
+    private List<CoveringRule> BuildCoveringRules()
+    {
+        var rows = new List<CoveringRule>();
         if (SelectedProcess is not { } row)
         {
-            OnPropertyChanged(nameof(HasCoveringRules));
-            return;
+            return rows;
         }
 
         var covering = _rules.RulesFor(row.Snapshot);
@@ -396,7 +435,7 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
             var detail = rule.Destination.IsUnconstrained
                 ? Localization.RuleDescriber.Route(rule.Action, routeName)
                 : $"{Localization.RuleDescriber.Destination(rule.Destination)} ⇒ {Localization.RuleDescriber.Route(rule.Action, routeName)}";
-            CoveringRules.Add(new CoveringRule(
+            rows.Add(new CoveringRule(
                 rule.Order.ToString(System.Globalization.CultureInfo.CurrentCulture),
                 rule.Name,
                 detail,
@@ -404,7 +443,7 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
                 IsWinner: rule.Enabled && covering.Take(i).All(r => !r.Enabled)));
         }
 
-        OnPropertyChanged(nameof(HasCoveringRules));
+        return rows;
     }
 
     /// <summary>
@@ -459,60 +498,119 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
     }
 
     /// <summary>Re-evaluates everything gated on the daemon being reachable.</summary>
-    public void NotifyDaemonStateChanged()
+    public void NotifyDaemonStateChanged() => RefreshCommandStates();
+
+    /// <summary>
+    /// Re-raises every condition the action buttons are bound to.
+    /// </summary>
+    /// <remarks>
+    /// One place, called from everything that can change an answer. The commands' own
+    /// <c>NotifyCanExecuteChanged</c> is what actually enables and disables the buttons;
+    /// raising the property alone would leave them stale.
+    /// </remarks>
+    private void RefreshCommandStates()
     {
         OnPropertyChanged(nameof(CanApply));
+        OnPropertyChanged(nameof(CanProxy));
+        OnPropertyChanged(nameof(CanRemoveOverride));
+        OnPropertyChanged(nameof(RemovableOverride));
         OnPropertyChanged(nameof(ApplyBlockedReason));
+        ProxyThisInstanceCommand.NotifyCanExecuteChanged();
+        AlwaysProxyExecutableCommand.NotifyCanExecuteChanged();
+        RouteDirectCommand.NotifyCanExecuteChanged();
+        BlockCommand.NotifyCanExecuteChanged();
+        RemoveOverrideCommand.NotifyCanExecuteChanged();
     }
 
     partial void OnIsCompactChanged(bool value) => OnPropertyChanged(nameof(ShowOverlayInspector));
+
+    partial void OnSelectedProxyChanged(ProxyEndpoint? value) => RefreshCommandStates();
+
+    partial void OnScopeChoiceChanged(RuleScopeChoice value)
+    {
+        // The checkbox only has a say where children are not already part of the scope.
+        OnPropertyChanged(nameof(ChildrenChoiceApplies));
+        OnPropertyChanged(nameof(CoversChildren));
+    }
+
+    partial void OnIncludeChildrenChanged(bool value) => OnPropertyChanged(nameof(CoversChildren));
+
+    /// <summary>True when the "include child processes" choice is the user's to make.</summary>
+    public bool ChildrenChoiceApplies => ScopeChoice != RuleScopeChoice.Tree;
+
+    /// <summary>True when the rule that would be installed covers children at all.</summary>
+    public bool CoversChildren => ScopeChoice == RuleScopeChoice.Tree || IncludeChildren;
 
     partial void OnSelectedProcessChanged(ProcessRowViewModel? value)
     {
         OnPropertyChanged(nameof(HasSelection));
         OnPropertyChanged(nameof(ShowOverlayInspector));
-        OnPropertyChanged(nameof(CanApply));
-        OnPropertyChanged(nameof(ApplyBlockedReason));
         LastApplied = null;
         ErrorMessage = null;
+        ErrorDiagnostics = null;
         RefreshCoveringRules();
+        RefreshCommandStates();
     }
 
     // -- actions -------------------------------------------------------------
 
-    [RelayCommand]
-    private Task ProxyThisInstanceAsync() =>
-        ApplyAsync(RuleScopeChoice.Instance, SelectedProxy is { } p
-            ? new RuleAction.Proxy(p.Id)
-            : RuleAction.Direct.Instance);
+    /// <summary>
+    /// Routes the selection through the chosen proxy, at the scope the user picked.
+    /// </summary>
+    /// <remarks>
+    /// The scope comes from <see cref="ScopeChoice"/>. It used to be hard-coded to the running
+    /// instance here, which made the three radio buttons above decorative: picking "this
+    /// process and its children" and pressing this button quietly installed an instance rule
+    /// that covered neither the children nor a restart.
+    /// </remarks>
+    [RelayCommand(CanExecute = nameof(CanProxy))]
+    private Task ProxyThisInstanceAsync() => SelectedProxy is { } proxy
+        ? ApplyAsync(ScopeChoice, new RuleAction.Proxy(proxy.Id))
+        : Task.CompletedTask;
 
-    [RelayCommand]
-    private Task AlwaysProxyExecutableAsync() =>
-        ApplyAsync(RuleScopeChoice.Executable, SelectedProxy is { } p
-            ? new RuleAction.Proxy(p.Id)
-            : RuleAction.Direct.Instance);
-
-    [RelayCommand]
-    private Task RouteDirectAsync() => ApplyAsync(ScopeChoice, RuleAction.Direct.Instance);
-
-    [RelayCommand]
-    private Task BlockAsync() => ApplyAsync(ScopeChoice, RuleAction.Block.Instance);
-
-    [RelayCommand]
-    private async Task RemoveOverrideAsync()
+    /// <summary>
+    /// Proxies every future run of this executable, and says so by moving the scope with it.
+    /// </summary>
+    /// <remarks>
+    /// This is a shortcut for "pick the executable scope, then apply", so it sets the scope
+    /// rather than overriding it silently: after pressing it the radio buttons show what was
+    /// actually installed.
+    /// </remarks>
+    [RelayCommand(CanExecute = nameof(CanProxy))]
+    private Task AlwaysProxyExecutableAsync()
     {
-        if (SelectedProcess is not { } row)
+        if (SelectedProxy is not { } proxy)
         {
-            return;
+            return Task.CompletedTask;
         }
 
-        var existing = _rules.FindOverrideFor(row.Snapshot);
-        if (existing is null)
+        ScopeChoice = RuleScopeChoice.Executable;
+        return ApplyAsync(RuleScopeChoice.Executable, new RuleAction.Proxy(proxy.Id));
+    }
+
+    [RelayCommand(CanExecute = nameof(CanApply))]
+    private Task RouteDirectAsync() => ApplyAsync(ScopeChoice, RuleAction.Direct.Instance);
+
+    [RelayCommand(CanExecute = nameof(CanApply))]
+    private Task BlockAsync() => ApplyAsync(ScopeChoice, RuleAction.Block.Instance);
+
+    /// <summary>The override this process has, when it has one that can be taken off.</summary>
+    public RoutingRule? RemovableOverride =>
+        SelectedProcess is { } row ? _rules.FindOverrideFor(row.Snapshot) : null;
+
+    public bool CanRemoveOverride => RemovableOverride is not null && !IsApplying &&
+                                     _daemon.State == DaemonState.Connected;
+
+    [RelayCommand(CanExecute = nameof(CanRemoveOverride))]
+    private async Task RemoveOverrideAsync()
+    {
+        if (RemovableOverride is not { } existing)
         {
             return;
         }
 
         IsApplying = true;
+        RefreshCommandStates();
         try
         {
             var result = await _daemon.RemoveRuleAsync(existing.Id).ConfigureAwait(true);
@@ -532,6 +630,7 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
         finally
         {
             IsApplying = false;
+            RefreshCommandStates();
         }
     }
 
@@ -548,8 +647,9 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
 
         ErrorMessage = null;
         ErrorDiagnostics = null;
+        LastApplied = null;
         IsApplying = true;
-        OnPropertyChanged(nameof(CanApply));
+        RefreshCommandStates();
 
         // Show the change as pending immediately, then let the daemon's answer decide.
         row.IsPending = true;
@@ -557,7 +657,10 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
 
         try
         {
-            var rule = _rules.BuildRule(row.Snapshot, scope, action, IncludeChildren);
+            // Descendants come from the scope when the scope is about a tree; the checkbox
+            // only has a say for the two scopes where it is offered.
+            var includeChildren = scope != RuleScopeChoice.Tree && IncludeChildren;
+            var rule = _rules.BuildRule(row.Snapshot, scope, action, includeChildren);
             var result = await _daemon
                 .ApplyRuleAsync(rule, ResetExistingConnections)
                 .ConfigureAwait(true);
@@ -595,8 +698,7 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
             row.IsPending = false;
             IsApplying = false;
             ApplyPolicies();
-            OnPropertyChanged(nameof(CanApply));
-            OnPropertyChanged(nameof(ApplyBlockedReason));
+            RefreshCommandStates();
         }
     }
 
