@@ -115,8 +115,17 @@ internal static class Strings
         ["Processes.Policy.NewConnectionsOnly"] = "New connections only",
 
         ["Processes.Applied.Title"] = "Rule active for new connections",
-        ["Processes.Applied.Body"] =
-            "Connections opened from now on use {0}. Connections that were already open keep their previous route until the application reconnects.",
+        ["Processes.Applied.TitleNow"] = "Rule active",
+        ["Processes.Applied.Body"] = "Every connection this process opens uses {0}.",
+        ["Processes.Applied.BodyReset"] =
+            "{0} open connection(s) were dropped so they reopen through {1}. The application reconnects by itself; anything it opens from now on uses {1} too.",
+        ["Processes.Applied.BodyKept"] =
+            "Connections opened from now on use {0}. {1} that were already open keep their previous route until the application reconnects — a connection can only be routed by a rule that existed when it was opened.",
+        ["Processes.Applied.ResetFailed"] =
+            "Connections that were already open could not be dropped: {0}",
+        ["Processes.Action.ResetExisting"] = "Apply to connections already open",
+        ["Processes.Action.ResetExistingHint"] = "Drops them so the application reconnects through the new route. Without this the rule only governs connections opened later, because a connection's route is fixed when it is opened.",
+        ["Processes.Action.ResetExistingOffHint"] = "Connections already open keep their previous route until the application reconnects by itself.",
         ["Processes.Applied.StaleRule"] =
             "The new rule is in place, but the rule it replaces (“{0}”) could not be taken out of the daemon. It sits above the new one, so it may still decide. Remove it on the Rules page.",
         ["Processes.PathDenied"] = "Permission denied",
@@ -379,6 +388,7 @@ internal static class Strings
         ["Games.RuleName"] = "{0} (game boost)",
         ["Games.Started"] = "Boost started. New connections from the game use the selected route.",
         ["Games.StartedWithExisting"] = "Boost started. {0} connection(s) were already open and keep their previous route until the game reconnects.",
+        ["Games.StartedWithReset"] = "Boost started. {0} connection(s) the game already had open were dropped so it reconnects through the route.",
         ["Games.Stopped"] = "Boost stopped.",
         ["Games.AddFromProcess"] = "Add a running process as a game",
 
@@ -636,7 +646,14 @@ internal static class Strings
         ["Processes.Policy.NewConnectionsOnly"] = "仅新建连接",
 
         ["Processes.Applied.Title"] = "规则已对新连接生效",
-        ["Processes.Applied.Body"] = "此后建立的连接将使用 {0}。已经打开的连接在应用程序重新连接之前仍使用原有路由。",
+        ["Processes.Applied.TitleNow"] = "规则已生效",
+        ["Processes.Applied.Body"] = "此进程建立的每个连接都将使用 {0}。",
+        ["Processes.Applied.BodyReset"] = "已断开 {0} 个已打开的连接，使其通过 {1} 重新建立。应用程序会自行重连；此后新建的连接同样使用 {1}。",
+        ["Processes.Applied.BodyKept"] = "此后建立的连接将使用 {0}。已经打开的 {1} 个连接在应用程序重新连接之前仍使用原有路由——连接只能由建立时已存在的规则来路由。",
+        ["Processes.Applied.ResetFailed"] = "无法断开已经打开的连接：{0}",
+        ["Processes.Action.ResetExisting"] = "同时应用于已打开的连接",
+        ["Processes.Action.ResetExistingHint"] = "断开这些连接，使应用程序通过新路由重新建立。不勾选时规则仅对之后建立的连接生效，因为连接的路由在建立时即已确定。",
+        ["Processes.Action.ResetExistingOffHint"] = "已经打开的连接在应用程序自行重新连接之前仍使用原有路由。",
         ["Processes.Applied.StaleRule"] = "新规则已生效，但它所替换的规则（“{0}”）未能从守护进程中移除。该规则位于新规则之前，因此仍可能生效。请在规则页面将其删除。",
         ["Processes.PathDenied"] = "权限不足",
         ["Processes.PathDeleted"] = "启动后可执行文件已被替换",
@@ -888,6 +905,7 @@ internal static class Strings
         ["Games.RuleName"] = "{0}（游戏加速）",
         ["Games.Started"] = "加速已开始。游戏新建的连接将使用所选线路。",
         ["Games.StartedWithExisting"] = "加速已开始。已有 {0} 个连接处于打开状态，在游戏重新连接前仍使用原有路由。",
+        ["Games.StartedWithReset"] = "加速已开始。已断开游戏原有的 {0} 个连接，使其通过所选线路重新建立。",
         ["Games.Stopped"] = "加速已停止。",
         ["Games.AddFromProcess"] = "将运行中的进程添加为游戏",
 

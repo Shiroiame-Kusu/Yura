@@ -44,6 +44,12 @@ public sealed class IpcRequest
 
     public RuleDto? Rule { get; init; }
 
+    /// <summary>
+    /// For apply-rule: also abort the covered processes' open connections whose route this
+    /// rule changes, so it governs them too instead of only the next connection.
+    /// </summary>
+    public bool ResetExisting { get; init; }
+
     public Guid? RuleId { get; init; }
 
     public List<ProxyDto>? Proxies { get; init; }
@@ -229,6 +235,16 @@ public sealed class ApplyResultDto
     /// could not be established, which is different from zero.
     /// </summary>
     public int? PreExistingConnections { get; init; }
+
+    /// <summary>
+    /// Connections that were aborted so the rule would apply to them as well. Null when the
+    /// daemon was not asked to. A socket's cgroup is fixed when it is created, so this is the
+    /// only way a rule reaches a connection older than itself.
+    /// </summary>
+    public int? ResetConnections { get; init; }
+
+    /// <summary>Why connections that should have been aborted were not.</summary>
+    public string? ResetFailure { get; init; }
 
     public List<string> Warnings { get; init; } = [];
 }

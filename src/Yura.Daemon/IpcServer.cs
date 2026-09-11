@@ -260,7 +260,9 @@ public sealed class IpcServer : IAsyncDisposable
                     return IpcResponse.Failure("apply-rule needs a rule.");
                 }
 
-                var outcome = await _runtime.ApplyRuleAsync(request.Rule.ToRule(), ct).ConfigureAwait(false);
+                var outcome = await _runtime
+                    .ApplyRuleAsync(request.Rule.ToRule(), request.ResetExisting, ct)
+                    .ConfigureAwait(false);
                 return FromOutcome(outcome);
             }
 
@@ -464,6 +466,8 @@ public sealed class IpcServer : IAsyncDisposable
             ConfirmedAtUtc = outcome.ConfirmedAtUtc,
             MigratedProcesses = outcome.MigratedProcesses,
             PreExistingConnections = outcome.PreExistingConnections,
+            ResetConnections = outcome.ResetConnections,
+            ResetFailure = outcome.ResetFailure,
             Warnings = outcome.Warnings.ToList(),
         },
     };

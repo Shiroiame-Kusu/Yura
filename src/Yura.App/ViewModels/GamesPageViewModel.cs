@@ -931,7 +931,11 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             CreatedAtUtc = DateTimeOffset.UtcNow,
         };
 
-        var result = await _daemon.ApplyRuleAsync(rule).ConfigureAwait(true);
+        // A boost is asked for while the game is already running and already talking to its
+        // servers, so the connections that matter are the ones that exist. They cannot be
+        // captured where they are — a socket's cgroup is fixed when it is created — so the
+        // daemon drops them and the game reconnects through the route.
+        var result = await _daemon.ApplyRuleAsync(rule, resetExisting: true).ConfigureAwait(true);
         if (!result.Succeeded)
         {
             Fail(result.FailureReason);
@@ -948,9 +952,14 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         }
 
         State = row.Running is null ? BoostState.WaitingForGame : BoostState.Routing;
-        StatusMessage = result.PreExistingConnections is > 0
-            ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.StartedWithExisting"], result.PreExistingConnections)
-            : Loc.Current["Games.Started"];
+        StatusMessage = (result.ResetConnections, result.PreExistingConnections) switch
+        {
+            ( > 0, _) => string.Format(
+                CultureInfo.CurrentCulture, Loc.Current["Games.StartedWithReset"], result.ResetConnections),
+            (_, > 0) => string.Format(
+                CultureInfo.CurrentCulture, Loc.Current["Games.StartedWithExisting"], result.PreExistingConnections),
+            _ => Loc.Current["Games.Started"],
+        };
 
         // Numbers the moment the session starts, if we know where to measure.
         if (row.Profile.IsMeasurable || TryParseTarget(MeasurementTargetInput, out _, out _))

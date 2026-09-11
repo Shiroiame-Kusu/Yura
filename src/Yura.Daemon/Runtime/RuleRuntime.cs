@@ -26,6 +26,15 @@ public sealed record ApplyOutcome
     /// </summary>
     public int? PreExistingConnections { get; init; }
 
+    /// <summary>
+    /// Connections the daemon aborted so the rule would apply to them too, which it can only
+    /// do by making the application reconnect. Null when it was not asked to abort anything.
+    /// </summary>
+    public int? ResetConnections { get; init; }
+
+    /// <summary>Why connections that should have been aborted were not. Null when all were.</summary>
+    public string? ResetFailure { get; init; }
+
     /// <summary>Kernel-level warnings that did not stop the apply, e.g. a skipped host rule.</summary>
     public IReadOnlyList<string> Warnings { get; init; } = [];
 
@@ -161,6 +170,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     private readonly ProcProcessSource _processes;
     private readonly FlowRegistry _flows;
     private readonly SocketOwnership _ownership;
+    private readonly SocketReset _reset;
     private readonly Action<string> _log;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
@@ -246,6 +256,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         _processes = processes;
         _flows = flows;
         _ownership = ownership;
+        _reset = new SocketReset(log);
         _log = log;
     }
 
@@ -485,7 +496,16 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
 
     // -- rules -----------------------------------------------------------------
 
-    public async Task<ApplyOutcome> ApplyRuleAsync(RoutingRule rule, CancellationToken ct = default)
+    /// <summary>
+    /// Installs a rule and reports what the kernel confirmed.
+    /// </summary>
+    /// <param name="resetExisting">
+    /// Abort the covered processes' open connections whose route this rule changes, so the
+    /// rule governs them too. A socket's cgroup is fixed when it is created, so this is the
+    /// only way a rule can reach a connection that predates it: the application's connection
+    /// fails, it reconnects, and the new socket is created under the rule.
+    /// </param>
+    public async Task<ApplyOutcome> ApplyRuleAsync(RoutingRule rule, bool resetExisting, CancellationToken ct = default)
     {
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
@@ -559,6 +579,11 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             // the connections that will keep their previous route.
             var preExisting = CountExistingSockets(rule, snapshot);
 
+            // Listed before the install too, and for the same reason: the route each of those
+            // sockets is on can only be worked out from the rules as they stand now. Which of
+            // them the new rule actually changes is decided once it is in place.
+            var resetCandidates = resetExisting ? GatherResetCandidates(rule, snapshot) : [];
+
             var previous = _rules.GetValueOrDefault(rule.Id);
             _rules[rule.Id] = rule;
 
@@ -587,6 +612,20 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
                 PreExistingConnections = preExisting,
                 Warnings = exitWarning is null ? outcome.Warnings : [.. outcome.Warnings, exitWarning],
             };
+
+            // Only once the rule is really in the kernel. Aborting a connection before the
+            // rule is installed would hand the application a reconnect that goes out on the
+            // old route, which is worse than not aborting it at all.
+            if (outcome.Succeeded && resetExisting)
+            {
+                var reset = ResetChangedRoutes(resetCandidates);
+                outcome = outcome with
+                {
+                    ResetConnections = reset.Reset + reset.AlreadyGone,
+                    ResetFailure = reset.Failure,
+                };
+            }
+
             if (!outcome.Succeeded)
             {
                 // Do not keep a rule the kernel refused; the list must describe reality.
@@ -1314,6 +1353,132 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             return null;
         }
     }
+
+    // -- making a rule reach connections that predate it -----------------------
+
+    /// <summary>An open socket of a covered process, and the route it is on as things stand.</summary>
+    private readonly record struct ResetCandidate(ProcessSnapshot Process, OwnedSocket Socket, RuleAction Before);
+
+    /// <summary>
+    /// Lists the open sockets of the processes a rule is about to cover, with the route each
+    /// one is on now.
+    /// </summary>
+    /// <remarks>
+    /// Must be called before the rule is installed. Afterwards there is no way to tell what
+    /// route a socket was on, and a socket whose route the rule does not change must not be
+    /// aborted: the reset exists to make a rule effective, not to drop connections.
+    /// </remarks>
+    private List<ResetCandidate> GatherResetCandidates(RoutingRule rule, IReadOnlyList<ProcessSnapshot> snapshot)
+    {
+        var covered = new Dictionary<int, ProcessSnapshot>();
+        foreach (var process in snapshot)
+        {
+            if (CoveredByRule(rule, process))
+            {
+                covered[process.Identity.Pid] = process;
+            }
+        }
+
+        if (covered.Count == 0)
+        {
+            return [];
+        }
+
+        var ordered = RuleEvaluator.Sort(_rules.Values);
+        var candidates = new List<ResetCandidate>();
+        try
+        {
+            foreach (var socket in _ownership.Snapshot())
+            {
+                if (socket.OwnerPid is not { } pid ||
+                    !covered.TryGetValue(pid, out var process) ||
+                    !CanBeReset(socket))
+                {
+                    continue;
+                }
+
+                candidates.Add(new ResetCandidate(process, socket, DecideFor(ordered, process, socket)));
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            // Ownership could not be established. Nothing is aborted, and the caller reports
+            // zero rather than claiming connections were moved.
+            return [];
+        }
+
+        return candidates;
+    }
+
+    /// <summary>Aborts the candidates whose route the installed rule actually changed.</summary>
+    private SocketResetOutcome ResetChangedRoutes(List<ResetCandidate> candidates)
+    {
+        if (candidates.Count == 0)
+        {
+            return SocketResetOutcome.Nothing;
+        }
+
+        var ordered = _state.OrderedRules;
+        var targets = new List<ResetTarget>();
+        foreach (var candidate in candidates)
+        {
+            if (DecideFor(ordered, candidate.Process, candidate.Socket) == candidate.Before)
+            {
+                continue;
+            }
+
+            targets.Add(new ResetTarget(candidate.Socket.Protocol, candidate.Socket.Local, candidate.Socket.Remote));
+        }
+
+        var outcome = _reset.Destroy(targets);
+        if (outcome.Reset > 0)
+        {
+            _log($"reset {outcome.Reset} connection(s) so the rule applies to them; " +
+                 "the application reconnects on the new route");
+        }
+
+        return outcome;
+    }
+
+    /// <summary>
+    /// Whether aborting this socket could achieve anything.
+    /// </summary>
+    /// <remarks>
+    /// A listening socket carries no traffic. A socket with no peer — an unconnected UDP
+    /// socket, which is what a game's own protocol usually uses — has no connection to reset:
+    /// aborting it hands the application an error it never asked for and does not make it
+    /// rebind, so it is left alone and reported as a pre-existing connection instead. Loopback
+    /// is excluded because the classifier returns early on it by design, so no rule would
+    /// route the reconnection anywhere new.
+    /// </remarks>
+    private static bool CanBeReset(OwnedSocket socket) =>
+        socket.State is "ESTABLISHED" or "SYN_SENT" or "SYN_RECV" or "CLOSE_WAIT" or "UDP" &&
+        socket.Remote.Port != 0 &&
+        !IPAddress.IsLoopback(socket.Remote.Address);
+
+    /// <summary>Whether a rule covers a process, by its selector or through its process tree.</summary>
+    private bool CoveredByRule(RoutingRule rule, ProcessSnapshot process) =>
+        rule.Process.MatchesProcess(process) ||
+        (_tree.TryGetValue(rule.Id, out var members) && members.Contains(process.Identity.Pid));
+
+    /// <summary>
+    /// What the rule list does with one open socket.
+    /// </summary>
+    /// <remarks>
+    /// Runs the shared evaluator, which is the same code the per-flow decision uses, so a
+    /// socket is only aborted when the rules really do route it somewhere else. Tree and
+    /// instance membership is supplied the way the kernel classifier would supply it, because
+    /// the evaluator trusts that answer over re-deriving membership from pids.
+    /// </remarks>
+    private RuleAction DecideFor(IReadOnlyList<RoutingRule> ordered, ProcessSnapshot process, OwnedSocket socket) =>
+        RuleEvaluator.Evaluate(ordered, new RoutingRequest
+        {
+            Process = process,
+            DestinationAddress = socket.Remote.Address,
+            DestinationPort = (ushort)socket.Remote.Port,
+            Protocol = socket.Protocol == ProtocolType.Udp ? TransportProtocol.Udp : TransportProtocol.Tcp,
+            ClassifierMatchedRuleIds = ordered.Where(r => CoveredByRule(r, process)).Select(r => r.Id).ToHashSet(),
+        }).Action;
 
     private int AllocateSlotIndex(Guid ruleId)
     {

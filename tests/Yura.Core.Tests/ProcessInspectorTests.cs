@@ -70,7 +70,7 @@ public sealed class ProcessInspectorTests
         rules.Proxies.Add(second);
 
         await page.ProxyThisInstanceCommand.ExecuteAsync(null);
-        var first = daemon.Applied[0];
+        var first = daemon.Applied[0].Rule;
 
         page.SelectedProxy = second;
         await page.ProxyThisInstanceCommand.ExecuteAsync(null);
@@ -79,7 +79,7 @@ public sealed class ProcessInspectorTests
         // kernel kept using the first route while the panel showed the second.
         Assert.Contains(first.Id, daemon.Removed);
         var live = Assert.Single(daemon.Installed);
-        Assert.Equal(daemon.Applied[1].Id, live.Id);
+        Assert.Equal(daemon.Applied[1].Rule.Id, live.Id);
         Assert.Single(rules.Rules);
     }
 
@@ -92,8 +92,88 @@ public sealed class ProcessInspectorTests
         await page.RouteDirectCommand.ExecuteAsync(null);
 
         var live = Assert.Single(daemon.Installed);
-        Assert.Equal(RuleAction.Direct.Instance, daemon.Applied[1].Action);
-        Assert.Equal(daemon.Applied[1].Id, live.Id);
+        Assert.Equal(RuleAction.Direct.Instance, daemon.Applied[1].Rule.Action);
+        Assert.Equal(daemon.Applied[1].Rule.Id, live.Id);
+    }
+
+    // -- the rule reaching connections that are already open --------------------
+
+    [Fact]
+    public async Task Applying_asks_the_daemon_to_reset_open_connections_by_default()
+    {
+        var (page, _, daemon) = New();
+
+        Assert.True(page.ResetExistingConnections);
+        await page.ProxyThisInstanceCommand.ExecuteAsync(null);
+
+        Assert.True(daemon.Applied[0].ResetExisting);
+    }
+
+    [Fact]
+    public async Task Unticking_the_box_leaves_open_connections_where_they_are()
+    {
+        var (page, _, daemon) = New();
+        page.ResetExistingConnections = false;
+
+        await page.ProxyThisInstanceCommand.ExecuteAsync(null);
+
+        Assert.False(daemon.Applied[0].ResetExisting);
+    }
+
+    [Fact]
+    public async Task The_notice_says_the_rule_is_in_force_when_connections_were_reset()
+    {
+        var (page, _, daemon) = New();
+        daemon.NextApplyResult = new RuleApplyResult
+        {
+            Succeeded = true, PreExistingConnections = 4, ResetConnections = 4,
+        };
+
+        await page.ProxyThisInstanceCommand.ExecuteAsync(null);
+
+        var notice = Assert.IsType<AppliedRuleNotice>(page.LastApplied);
+        Assert.True(notice.IsEffectiveNow);
+        Assert.Contains("4", notice.Body);
+        Assert.Contains("test", notice.Body);
+        Assert.Null(notice.Caveat);
+    }
+
+    [Fact]
+    public async Task The_notice_admits_when_open_connections_kept_their_route()
+    {
+        var (page, _, daemon) = New();
+        page.ResetExistingConnections = false;
+        daemon.NextApplyResult = new RuleApplyResult
+        {
+            Succeeded = true, PreExistingConnections = 3, ResetConnections = null,
+        };
+
+        await page.ProxyThisInstanceCommand.ExecuteAsync(null);
+
+        var notice = Assert.IsType<AppliedRuleNotice>(page.LastApplied);
+        Assert.False(notice.IsEffectiveNow);
+        Assert.Contains("3", notice.Body);
+        Assert.Contains("previous route", notice.Body);
+    }
+
+    [Fact]
+    public async Task A_reset_the_kernel_refused_is_shown_as_a_caveat()
+    {
+        var (page, _, daemon) = New();
+        daemon.NextApplyResult = new RuleApplyResult
+        {
+            Succeeded = true,
+            PreExistingConnections = 2,
+            ResetConnections = 0,
+            ResetFailure = "this kernel cannot abort sockets (EOPNOTSUPP)",
+            Warnings = ["Agent exit 'tokyo' is not answering."],
+        };
+
+        await page.ProxyThisInstanceCommand.ExecuteAsync(null);
+
+        var notice = Assert.IsType<AppliedRuleNotice>(page.LastApplied);
+        Assert.Contains("EOPNOTSUPP", notice.Caveat);
+        Assert.Contains("tokyo", notice.Caveat);
     }
 
     [Fact]

@@ -96,6 +96,20 @@
               <StackPanel Spacing="8">
                 <TextBlock Classes="FieldLabel" Text="{loc:Tr Processes.Inspector.Actions}" />
 
+                <!-- Whether the rule reaches what is already connected. Next to the buttons
+                     that install it, because it changes what pressing them does. -->
+                <StackPanel Spacing="2">
+                  <CheckBox IsChecked="{Binding ResetExistingConnections}">
+                    <TextBlock Text="{loc:Tr Processes.Action.ResetExisting}" TextWrapping="Wrap" />
+                  </CheckBox>
+                  <TextBlock Classes="FieldHint" TextWrapping="Wrap"
+                             Text="{loc:Tr Processes.Action.ResetExistingHint}"
+                             IsVisible="{Binding ResetExistingConnections}" />
+                  <TextBlock Classes="FieldHint" TextWrapping="Wrap"
+                             Text="{loc:Tr Processes.Action.ResetExistingOffHint}"
+                             IsVisible="{Binding !ResetExistingConnections}" />
+                </StackPanel>
+
                 <Button Classes="accent" HorizontalAlignment="Stretch"
                         Command="{Binding ProxyThisInstanceCommand}"
                         IsEnabled="{Binding CanApply}"
@@ -167,6 +181,9 @@
                 <StackPanel Spacing="4">
                   <TextBlock FontWeight="SemiBold" Text="{Binding LastApplied.Headline}" TextWrapping="Wrap" />
                   <TextBlock Classes="Caption" Text="{Binding LastApplied.Body}" TextWrapping="Wrap" />
+                  <TextBlock Classes="Caption" Text="{Binding LastApplied.Caveat}" TextWrapping="Wrap"
+                             Foreground="{DynamicResource YuraWarning}"
+                             IsVisible="{Binding LastApplied.Caveat, Converter={x:Static ObjectConverters.IsNotNull}}" />
                 </StackPanel>
               </Border>
 

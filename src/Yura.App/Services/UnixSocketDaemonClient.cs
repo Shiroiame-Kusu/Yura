@@ -96,10 +96,12 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
         return response.Connections.Select(ToRecord).ToArray();
     }
 
-    public async Task<RuleApplyResult> ApplyRuleAsync(RoutingRule rule, CancellationToken cancellationToken = default)
+    public async Task<RuleApplyResult> ApplyRuleAsync(
+        RoutingRule rule, bool resetExisting = false, CancellationToken cancellationToken = default)
     {
         var response = await SendAsync(
-            new IpcRequest { Op = "apply-rule", Rule = RuleDto.From(rule) }, cancellationToken).ConfigureAwait(false);
+            new IpcRequest { Op = "apply-rule", Rule = RuleDto.From(rule), ResetExisting = resetExisting },
+            cancellationToken).ConfigureAwait(false);
         return ToApplyResult(response);
     }
 
@@ -292,6 +294,8 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
         FailureReason = response.Error ?? response.Apply?.FailureReason,
         Diagnostics = response.Diagnostics ?? response.Apply?.Diagnostics,
         PreExistingConnections = response.Apply?.PreExistingConnections,
+        ResetConnections = response.Apply?.ResetConnections,
+        ResetFailure = response.Apply?.ResetFailure,
         Warnings = response.Apply?.Warnings ?? [],
     };
 

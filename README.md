@@ -32,7 +32,7 @@ Yura's answer:
 | Instance identity | PID **plus process start time plus uid**, re-verified before every action |
 | Child processes | Free: a forked child inherits its parent's cgroup |
 | Wine/Proton isolation | Classification is by cgroup, not executable path, so shared runtimes don't collide |
-| Pre-existing connections | Keep their old route, because a socket's cgroup is fixed at creation |
+| Pre-existing connections | A socket's cgroup is fixed at creation, so a rule cannot capture one that predates it. Applying a rule therefore **drops them** by default, and the application reconnects on the new route; untick that and they keep their old route, which Yura reports rather than hides |
 | Process lifecycle | The kernel's **process connector** reports fork, exec and exit; a sweep re-derives from `/proc` as a safety net |
 | Destination host names | Learned from DNS answers passing through the relay, and from TLS SNI / HTTP `Host` |
 | WireGuard exit nodes | A kernel `wireguard` interface per exit, entered only by the daemon's own sockets through a per-tunnel fwmark and routing table; nothing else on the machine is routed through it |

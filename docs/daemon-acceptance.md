@@ -103,6 +103,31 @@ what a user experiences as "the route does nothing":
 - IPv6 from a covered process is refused, and the refusal is counted in the kernel, so the
   ruleset cannot quietly go back to letting it out.
 
+### A rule reaching connections that were already open
+
+The other half of the capture boundary. A socket's cgroup is fixed when it is created, so a
+connection that predates its rule can never be captured — it can only be aborted, after which
+the application opens a new socket that the rule does govern. Eight checks prove that is what
+happens, against a destination in its own network namespace, so it is genuinely reachable
+before the rule exists and genuinely capturable afterwards (a destination on this machine's
+own address would leave over loopback, which the classifier ignores by design):
+
+| Check | Result |
+| --- | --- |
+| The application holds a connection open before any rule exists | Open and alive across repeated observations |
+| The daemon reports what it aborted | `preExistingConnections: 2`, `resetConnections: 2`, no failure |
+| The connection really died, and the application reconnected by itself | `ConnectionAbortedError` at the application, then a new socket |
+| **The replacement connection is on the route** | Proxy A's own log shows it was asked to dial `10.79.1.2:8091` — the destination of the connection that had been direct a second earlier |
+| The destination saw the replacement arrive | A new accepted connection at the far end |
+| New connections are proxied as well | Marker `YURA-VIA-PROXY-A` |
+| Reapplying the same rule aborts nothing | `resetConnections: 0` — the reset is for sockets whose route changes, not for every socket a process holds |
+| And the application keeps the connection it has | Still open across repeated observations |
+
+Requirement 11 above is unchanged and still asserted: a rule applied *without* asking for a
+reset leaves existing connections where they are, and the Connections view reports them as
+`preExistingPreviousRoute` rather than claiming they are proxied. The two behaviours are
+different answers to the same physical limit, and the suite proves both.
+
 ## The exclusion race
 
 Including children is free: a forked child inherits its parent's cgroup. **Excluding** them

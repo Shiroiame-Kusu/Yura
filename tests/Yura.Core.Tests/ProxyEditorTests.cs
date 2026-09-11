@@ -38,8 +38,8 @@ internal sealed class RecordingDaemonClient : IDaemonClient
 {
     public List<(ProxyEndpoint Endpoint, ProxySecrets Secrets)> Probes { get; } = [];
 
-    /// <summary>Every rule the app installed, in order.</summary>
-    public List<RoutingRule> Applied { get; } = [];
+    /// <summary>Every rule the app installed, in order, with the reset flag it asked for.</summary>
+    public List<(RoutingRule Rule, bool ResetExisting)> Applied { get; } = [];
 
     /// <summary>Every rule id the app asked the daemon to take out.</summary>
     public List<Guid> Removed { get; } = [];
@@ -69,9 +69,10 @@ internal sealed class RecordingDaemonClient : IDaemonClient
     public Task<IReadOnlyList<Connections.ConnectionRecord>> GetConnectionsAsync(int? pid = null, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Connections.ConnectionRecord>>([]);
 
-    public Task<RuleApplyResult> ApplyRuleAsync(RoutingRule rule, CancellationToken ct = default)
+    public Task<RuleApplyResult> ApplyRuleAsync(
+        RoutingRule rule, bool resetExisting = false, CancellationToken ct = default)
     {
-        Applied.Add(rule);
+        Applied.Add((rule, resetExisting));
         if (NextApplyResult.Succeeded)
         {
             Installed.RemoveAll(r => r.Id == rule.Id);

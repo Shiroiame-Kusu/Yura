@@ -169,6 +169,15 @@ def main() -> int:
             "games sharing one runtime. Otherwise unused."
         ),
     )
+    parser.add_argument(
+        "--preexisting-reconnect",
+        action="store_true",
+        help=(
+            "Reopen the long-lived connection when it dies, the way a real application "
+            "does. Without this the connection is only watched; with it, the harness can "
+            "check where the replacement connection goes after a rule drops the original."
+        ),
+    )
     args = parser.parse_args()
 
     rec = Recorder(args.out)
@@ -211,18 +220,39 @@ def main() -> int:
             rec.record(event="dns", ok=ok, detail=detail, name=dns_name)
 
         if preexisting is not None:
+            detail = None
             try:
                 # The marker server holds the connection open; a live socket simply has
                 # nothing to read, which is what we assert on.
                 preexisting.recv(1)
                 alive = False  # peer closed
+                detail = "peer closed"
             except TimeoutError:
                 alive = True
-            except OSError:
+            except OSError as exc:
                 alive = False
+                detail = f"{type(exc).__name__}: {exc}"
             # Reported as "ok" because that is the field assertions read, and a
             # still-open pre-rule connection is precisely the success condition.
-            rec.record(event="preexisting_state", ok=alive, alive=alive)
+            rec.record(event="preexisting_state", ok=alive, alive=alive, detail=detail)
+
+            # An application that loses a connection opens another one. That replacement is
+            # a new socket, so it is the first one a rule applied in the meantime can route.
+            if not alive and args.preexisting_reconnect:
+                preexisting.close()
+                preexisting = None
+                target = parse_endpoint(args.preexisting_target)
+                try:
+                    preexisting = socket.create_connection(target, timeout=args.timeout)
+                    preexisting.settimeout(0.2)
+                    rec.record(
+                        event="preexisting_reopen",
+                        ok=True,
+                        target=args.preexisting_target,
+                        local=":".join(str(p) for p in preexisting.getsockname()),
+                    )
+                except OSError as exc:
+                    rec.record(event="preexisting_reopen", ok=False, detail=str(exc))
 
         time.sleep(args.interval)
 

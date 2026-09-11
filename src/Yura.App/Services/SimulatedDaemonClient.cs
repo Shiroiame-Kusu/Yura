@@ -164,16 +164,21 @@ public sealed class SimulatedDaemonClient : IDaemonClient
         return Task.FromResult(pid is { } wanted ? rows.Where(r => r.OwnerPid == wanted).ToArray() : rows);
     }
 
-    public async Task<RuleApplyResult> ApplyRuleAsync(RoutingRule rule, CancellationToken cancellationToken = default)
+    public async Task<RuleApplyResult> ApplyRuleAsync(
+        RoutingRule rule, bool resetExisting = false, CancellationToken cancellationToken = default)
     {
         // A real apply is not instant, and the UI has to look right while it is in flight.
         await Task.Delay(320, cancellationToken).ConfigureAwait(false);
 
+        var preExisting = _random.Next(0, 4);
         return new RuleApplyResult
         {
             Succeeded = true,
             ConfirmedAtUtc = DateTimeOffset.UtcNow,
-            PreExistingConnections = _random.Next(0, 4),
+            PreExistingConnections = preExisting,
+            // The demo has to show the honest shape of both outcomes: with a reset the open
+            // connections are gone, without one they stay on their old route.
+            ResetConnections = resetExisting ? preExisting : null,
         };
     }
 

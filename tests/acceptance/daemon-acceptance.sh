@@ -61,6 +61,16 @@ MARK_AGENT="YURA-VIA-AGENT"
 MARK_UDP_AGENT="YURA-UDP-VIA-AGENT"
 MARK_AGENT_SOCKS="YURA-VIA-AGENT-THEN-SOCKS"
 
+# Making a rule reach a connection that predates it needs a destination that is genuinely
+# reachable before the rule exists and is not on loopback, because the classifier ignores
+# loopback by design. A peer in its own namespace is both.
+RS_NS="yura-resetns"
+RS_VETH_H="yuraacc5"
+RS_VETH_N="yuraacc6"
+RS_HOST_ADDR="10.79.1.1"
+RS_ADDR="10.79.1.2"
+RS_HOLD_PORT=8091
+
 KEEP=0
 [[ "${1:-}" == "--keep" ]] && KEEP=1
 
@@ -168,6 +178,9 @@ cleanup() {
   ip netns del "$AG_NS" 2>/dev/null
   ip link del "$AG_VETH_H" 2>/dev/null
   rm -rf "/etc/netns/${AG_NS}" 2>/dev/null
+  ip netns pids "$RS_NS" 2>/dev/null | xargs -r kill -9 2>/dev/null
+  ip netns del "$RS_NS" 2>/dev/null
+  ip link del "$RS_VETH_H" 2>/dev/null
   for l in $(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | grep '^yura-wg'); do ip link del "$l" 2>/dev/null; done
   for fam in -4 -6; do
     for p in $(ip $fam rule show 2>/dev/null | awk -F: '$1>=7300 && $1<=7555 {print $1}'); do ip $fam rule del priority "$p" 2>/dev/null; done
@@ -1006,6 +1019,100 @@ import json,sys
 a={x['name']:x for x in json.load(sys.stdin)['status']['agents']}
 assert not a['Agent']['connected'], a
 print('agent reported down: ' + (a['Agent']['failure'] or 'no reason'))\""
+
+# ---------------------------------------------------------------------------
+# A rule can only route a connection that is opened after it exists: a socket's cgroup is
+# fixed when the socket is created, and nothing can move it afterwards. So "apply this rule
+# now" has to mean dropping what is already open and letting the application reconnect.
+# These checks are about that, and they are the reason the daemon can abort sockets at all.
+step "A rule reaching connections that were already open"
+
+ip netns add "$RS_NS"
+ip link add "$RS_VETH_H" type veth peer name "$RS_VETH_N"
+ip link set "$RS_VETH_N" netns "$RS_NS"
+ip addr add "${RS_HOST_ADDR}/30" dev "$RS_VETH_H"; ip link set "$RS_VETH_H" up
+ip -n "$RS_NS" addr add "${RS_ADDR}/30" dev "$RS_VETH_N"; ip -n "$RS_NS" link set "$RS_VETH_N" up
+ip netns exec "$RS_NS" python3 "${LIB}/marker_server.py" --listen "$RS_ADDR" \
+  --tcp-port 8090 --hold-port "$RS_HOLD_PORT" --udp-port 9098 \
+  --tcp-marker "unused" --udp-marker "unused" --log "$RUN/marker-reset.jsonl" \
+  > "$RUN/marker-reset.out" 2>&1 & BG+=($!)
+sleep 1
+info "holding destination ${RS_ADDR}:${RS_HOLD_PORT} in netns ${RS_NS}; reachable directly and off loopback"
+
+RESET_APP="$RUN/yura-resetapp"
+cp /usr/bin/python3 "$RESET_APP"; chmod 755 "$RESET_APP"
+as_user "$RESET_APP" "${LIB}/spike_client.py" --label reset \
+  --tcp-target "${UNREACHABLE}:8080" \
+  --preexisting-target "${RS_ADDR}:${RS_HOLD_PORT}" --preexisting-reconnect \
+  --out "$RUN/client-reset.jsonl" --interval 0.4 --timeout 1.5 \
+  > "$RUN/client-reset.out" 2>&1 & BG+=($!)
+RESET_PID="$(await_pid "$RUN/client-reset.jsonl")"; BG+=("$RESET_PID")
+# Long enough for two turns of the client's loop: each one spends its timeout on the
+# unreachable target first, so two observations of the held connection take about four
+# seconds rather than two intervals.
+sleep 5
+
+check "the application has a connection open before any rule exists" bash -c "
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/client-reset.jsonl' --event preexisting_open)
+  s=\$(python3 '$LIB/logquery.py' count '$RUN/client-reset.jsonl' --event preexisting_state --where-contains ok=True)
+  [[ \$n -eq 1 && \$s -ge 2 ]] && echo \"open and alive through \$s checks\""
+
+RULE_RS="eeee8888-0000-4000-8000-000000000088"
+T_RS="$(date +%s.%N)"
+check "the daemon reports aborting the open connection when asked to apply now" bash -c "
+  body='$(instance_rule "$RULE_RS" "resetapp via proxy A" "$RESET_PID" proxy "\"$PROXY_A_ID\"" 130)'
+  merged=\$(python3 -c \"
+import json,sys
+b=json.loads(sys.argv[1]); b['resetExisting']=True
+print(json.dumps(b))\" \"\$body\")
+  '$DAEMON' ctl --socket '$SOCK' apply-rule \"\$merged\" | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)
+assert r['ok'], r
+a=r['apply']
+assert a['preExistingConnections'] >= 1, a
+assert a.get('resetConnections') and a['resetConnections'] >= 1, a
+assert not a.get('resetFailure'), a
+print(f\\\"{a['preExistingConnections']} open, {a['resetConnections']} aborted\\\")\""
+sleep 4
+
+check "the application's connection really died and it opened another one" bash -c "
+  dead=\$(python3 '$LIB/logquery.py' count '$RUN/client-reset.jsonl' --event preexisting_state --since $T_RS --where-contains ok=False)
+  back=\$(python3 '$LIB/logquery.py' count '$RUN/client-reset.jsonl' --event preexisting_reopen --since $T_RS --where-contains ok=True)
+  [[ \$dead -ge 1 && \$back -ge 1 ]] && echo \"dropped, then reconnected \$back time(s)\""
+
+check "the replacement connection goes through the proxy, so the rule is in force now" bash -c "
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/proxy-a.jsonl' --event connect --since $T_RS --where-contains requested=${RS_ADDR}:${RS_HOLD_PORT})
+  [[ \$n -ge 1 ]] && echo \"proxy A dialled ${RS_ADDR}:${RS_HOLD_PORT} for the reconnection\""
+
+check "the destination saw the replacement arrive" bash -c "
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/marker-reset.jsonl' --event hold_accepted --since $T_RS)
+  [[ \$n -ge 1 ]] && echo \"\$n new connection(s) accepted at the destination\""
+
+check "new connections are proxied too, as they were before" lq assert "$RUN/client-reset.jsonl" --event tcp --since "$T_RS" --window 3 --min-count 2 --expect-ok true --expect-contains "$MARK_A"
+
+# Asking again must not cost the application its connections: the reset is for connections
+# whose route the rule changes, not for every connection the process happens to have.
+T_RS2="$(date +%s.%N)"
+check "reapplying the same rule aborts nothing, because nothing changes route" bash -c "
+  body='$(instance_rule "$RULE_RS" "resetapp via proxy A" "$RESET_PID" proxy "\"$PROXY_A_ID\"" 130)'
+  merged=\$(python3 -c \"
+import json,sys
+b=json.loads(sys.argv[1]); b['resetExisting']=True
+print(json.dumps(b))\" \"\$body\")
+  '$DAEMON' ctl --socket '$SOCK' apply-rule \"\$merged\" | python3 -c \"
+import json,sys
+a=json.load(sys.stdin)['apply']
+assert a['resetConnections'] == 0, a
+print('nothing aborted: the route for those sockets is unchanged')\""
+sleep 2
+check "and the application keeps the connection it has" bash -c "
+  dead=\$(python3 '$LIB/logquery.py' count '$RUN/client-reset.jsonl' --event preexisting_state --since $T_RS2 --where-contains ok=False)
+  alive=\$(python3 '$LIB/logquery.py' count '$RUN/client-reset.jsonl' --event preexisting_state --since $T_RS2 --where-contains ok=True)
+  [[ \$dead -eq 0 && \$alive -ge 2 ]] && echo \"still open through \$alive checks\""
+
+ctl remove-rule "{\"ruleId\":\"$RULE_RS\"}" > /dev/null
+kill -9 "$RESET_PID" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 step "Clean shutdown"

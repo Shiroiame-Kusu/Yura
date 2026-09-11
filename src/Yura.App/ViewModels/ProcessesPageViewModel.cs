@@ -106,6 +106,20 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
     [ObservableProperty]
     public partial ProxyEndpoint? SelectedProxy { get; set; }
 
+    /// <summary>
+    /// Whether applying a rule also drops the connections the covered processes already have
+    /// open, so it governs them too.
+    /// </summary>
+    /// <remarks>
+    /// On by default because "apply this rule" almost always means "now". A socket's cgroup is
+    /// fixed when it is created, so a rule can never capture a connection that predates it;
+    /// dropping those is the only way the application ends up on the new route without being
+    /// restarted. It is a checkbox rather than unconditional because the drop is visible —
+    /// a download or a game session breaks off and reconnects — and that is the user's call.
+    /// </remarks>
+    [ObservableProperty]
+    public partial bool ResetExistingConnections { get; set; } = true;
+
     /// <summary>Set after a rule is applied, describing exactly what changed and what did not.</summary>
     [ObservableProperty]
     public partial AppliedRuleNotice? LastApplied { get; set; }
@@ -544,7 +558,9 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
         try
         {
             var rule = _rules.BuildRule(row.Snapshot, scope, action, IncludeChildren);
-            var result = await _daemon.ApplyRuleAsync(rule).ConfigureAwait(true);
+            var result = await _daemon
+                .ApplyRuleAsync(rule, ResetExistingConnections)
+                .ConfigureAwait(true);
 
             if (result.Succeeded)
             {
@@ -563,6 +579,9 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
                 {
                     RouteName = DescribeAction(action),
                     PreExistingConnections = result.PreExistingConnections,
+                    ResetConnections = result.ResetConnections,
+                    ResetFailure = result.ResetFailure,
+                    Warnings = result.Warnings,
                 };
             }
             else
@@ -629,22 +648,69 @@ public enum RuleScopeChoice
 /// What actually changed after a rule was applied.
 /// </summary>
 /// <remarks>
-/// Deliberately separates "new connections will use the proxy" from "existing connections
-/// are on the proxy". Only the first is knowable at apply time.
+/// The distinction this type exists for is between the rule being installed and the
+/// application actually using it. A rule governs a connection only from the moment that
+/// connection is opened, so the two cases read differently: either the connections that were
+/// already open were dropped — and the application is on the new route now — or they were
+/// left alone and it is not, until it reconnects of its own accord.
 /// </remarks>
 public sealed record AppliedRuleNotice
 {
+    private static string Tr(string key) => Loc.Current[key];
+
+    private static string Tr(string key, params object[] arguments) => string.Format(
+        System.Globalization.CultureInfo.CurrentCulture, Loc.Current[key], arguments);
+
     public required string RouteName { get; init; }
 
     /// <summary>Null when the daemon could not count pre-existing connections.</summary>
     public int? PreExistingConnections { get; init; }
 
-    public string Headline => Loc.Current["Processes.Applied.Title"];
+    /// <summary>
+    /// Connections the daemon dropped so the rule reaches them too. Null when it was not
+    /// asked to, which is a different statement from "there were none".
+    /// </summary>
+    public int? ResetConnections { get; init; }
 
-    public string Body => string.Format(
-        System.Globalization.CultureInfo.CurrentCulture,
-        Loc.Current["Processes.Applied.Body"],
-        RouteName);
+    /// <summary>Why connections that should have been dropped were not.</summary>
+    public string? ResetFailure { get; init; }
+
+    /// <summary>What the daemon could not do, though the rule went in.</summary>
+    public IReadOnlyList<string> Warnings { get; init; } = [];
 
     public bool HasPreExisting => PreExistingConnections is > 0;
+
+    /// <summary>True when the rule governs the traffic the application is sending right now.</summary>
+    public bool IsEffectiveNow => ResetConnections is > 0 || PreExistingConnections is 0 or null;
+
+    public string Headline => IsEffectiveNow
+        ? Tr("Processes.Applied.TitleNow")
+        : Tr("Processes.Applied.Title");
+
+    public string Body => ResetConnections switch
+    {
+        > 0 => Tr("Processes.Applied.BodyReset", ResetConnections.Value, RouteName),
+        // Asked for, nothing to drop: every connection this process makes from here is the
+        // rule's, and saying "reset 0" would read as a failure rather than as nothing to do.
+        0 => Tr("Processes.Applied.Body", RouteName),
+        _ => HasPreExisting
+            ? Tr("Processes.Applied.BodyKept", RouteName, PreExistingConnections!.Value)
+            : Tr("Processes.Applied.Body", RouteName),
+    };
+
+    /// <summary>The caveats, as one line, or null when there are none.</summary>
+    public string? Caveat
+    {
+        get
+        {
+            var lines = new List<string>();
+            if (ResetFailure is { Length: > 0 } failure)
+            {
+                lines.Add(Tr("Processes.Applied.ResetFailed", failure));
+            }
+
+            lines.AddRange(Warnings);
+            return lines.Count == 0 ? null : string.Join(" ", lines);
+        }
+    }
 }

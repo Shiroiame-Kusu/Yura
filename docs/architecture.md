@@ -257,9 +257,17 @@ restart go straight to `systemctl`, which asks polkit itself.
 - **Child processes.** A forked child inherits its parent's cgroup, so process-tree rules
   need no extra machinery. *Excluding* them is a race that cannot be won outright — see
   [the exclusion race](daemon-acceptance.md#the-exclusion-race).
-- **Pre-existing connections.** A socket's cgroup is fixed at creation (`sk_cgrp_data`), so
-  sockets opened before a rule was applied keep their original route. This is the correct
-  semantic and the UI reports it truthfully rather than claiming the flow is proxied.
+- **Pre-existing connections.** A socket's cgroup is fixed at creation (`sk_cgrp_data`), so a
+  socket opened before a rule was applied can never be captured by it. There is no way to
+  move such a connection onto a new route in place — its 5-tuple is established, and handing
+  a stream that is already in flight to a proxy is not something TCP allows. Two honest
+  answers exist, and Yura offers both: leave it alone and say so, or **abort it** so the
+  application reconnects under the rule. The second is what "apply now" means, and it is
+  what `SocketReset` does through `NETLINK_SOCK_DIAG`'s `SOCK_DESTROY` — the same mechanism
+  as `ss -K`. Only sockets whose route the new rule actually changes are aborted, decided by
+  running `RuleEvaluator` over the rule list before and after the change, so reapplying a
+  rule costs nothing. Unconnected UDP sockets are left alone: there is no connection to
+  reset, and aborting one hands the application an error without making it rebind.
 - **Process lifecycle.** The kernel's process connector (`NETLINK_CONNECTOR` / `CN_IDX_PROC`)
   reports fork, exec and exit. Exec is what lets a persistent executable rule catch a process
   before its first connection; exit is what expires an instance rule before its pid can be
@@ -335,9 +343,23 @@ Several types exist specifically to stop the UI asserting more than is known:
   covered process, which makes applications fall back to IPv4 within milliseconds, and the
   daemon states it among its startup checks. Capturing IPv6 properly needs an IPv6 rule and
   route, `tproxy ip6`, and an IPv6 listener with `IPV6_RECVORIGDSTADDR` for the UDP path.
-- **Nothing can recapture a connection that escaped.** A socket keeps the cgroup it was born
-  in, so a connection opened before its rule — or in the window above — cannot be moved onto
-  the route. It can only be reported, which is what `PreExistingPreviousRoute` is for.
+- **Nothing can recapture a connection that escaped; it can only be broken.** A socket keeps
+  the cgroup it was born in, so a connection opened before its rule — or in the window above
+  — cannot be moved onto the route. The two things Yura can do about it are report it, which
+  is what `PreExistingPreviousRoute` is for, and abort it so the application opens a new
+  socket that the rule does govern. Aborting is a visible event: a download stops, a game
+  session reconnects, an SSH session dies. That is why it is a checkbox — on by default,
+  because a rule the user just applied almost always means "now" — and why the daemon aborts
+  only the sockets whose route the rule changes rather than everything the process holds.
+- **An agent gives a peer-to-peer game a Strict NAT.** A datagram channel is one destination
+  for its lifetime and the agent connects a socket to it, so a game talking to two peers is two
+  channels and two sockets, and each peer sees a different source port. That is exactly
+  address-and-port-dependent mapping, which is what "Strict" means, and the NAT test reports it
+  rather than describing the agent as an improvement. It is not inherent: one socket per session
+  reused across channels would give endpoint-independent mapping, at the cost of the agent
+  having to demultiplex answers by source address instead of by socket. Until then, a
+  peer-to-peer game is better off direct or behind a SOCKS5 proxy whose association keeps one
+  mapping, and the Games page says which of the two is better for the game in front of you.
 - **`rp_filter` must be relaxed** for the looped-back packets, or they are dropped.
 - **Proxy chains are TCP-only.** Relaying UDP through more than one hop needs every hop to
   support UDP ASSOCIATE and to agree on the relay address, which cannot be verified end to

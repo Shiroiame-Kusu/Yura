@@ -33,6 +33,15 @@ public sealed record RuleApplyResult
     /// </summary>
     public int? PreExistingConnections { get; init; }
 
+    /// <summary>
+    /// Connections the daemon aborted so the rule reaches them too, which it does by making
+    /// the application reconnect. Null when it was not asked to abort any.
+    /// </summary>
+    public int? ResetConnections { get; init; }
+
+    /// <summary>Why connections that should have been aborted were not.</summary>
+    public string? ResetFailure { get; init; }
+
     /// <summary>Things the daemon could not do, that did not stop the rule being installed.</summary>
     public IReadOnlyList<string> Warnings { get; init; } = [];
 }
@@ -143,7 +152,16 @@ public interface IDaemonClient
     Task<IReadOnlyList<ConnectionRecord>> GetConnectionsAsync(
         int? pid = null, CancellationToken cancellationToken = default);
 
-    Task<RuleApplyResult> ApplyRuleAsync(RoutingRule rule, CancellationToken cancellationToken = default);
+    /// <summary>
+    /// Installs a rule in the kernel.
+    /// </summary>
+    /// <param name="resetExisting">
+    /// Also abort the covered processes' open connections whose route this rule changes. A
+    /// socket's cgroup is fixed when it is created, so a rule can otherwise only govern the
+    /// next connection; aborting makes the application reconnect under the rule.
+    /// </param>
+    Task<RuleApplyResult> ApplyRuleAsync(
+        RoutingRule rule, bool resetExisting = false, CancellationToken cancellationToken = default);
 
     Task<RuleApplyResult> RemoveRuleAsync(Guid ruleId, CancellationToken cancellationToken = default);
 
@@ -222,7 +240,8 @@ public sealed class DisconnectedDaemonClient : IDaemonClient
         int? pid = null, CancellationToken cancellationToken = default) =>
         Task.FromResult<IReadOnlyList<ConnectionRecord>>([]);
 
-    public Task<RuleApplyResult> ApplyRuleAsync(RoutingRule rule, CancellationToken cancellationToken = default) =>
+    public Task<RuleApplyResult> ApplyRuleAsync(
+        RoutingRule rule, bool resetExisting = false, CancellationToken cancellationToken = default) =>
         Task.FromResult(Refused());
 
     public Task<RuleApplyResult> RemoveRuleAsync(Guid ruleId, CancellationToken cancellationToken = default) =>
