@@ -33,6 +33,16 @@ public sealed record GameProfile
 
     public string? SteamAppId { get; init; }
 
+    /// <summary>
+    /// Where Steam installed the game, when the manifest named a directory that is there.
+    /// </summary>
+    /// <remarks>
+    /// A fact from the manifest, not a guess at a binary: it is what lets Yura recognise the
+    /// running game without the user pointing at it, which is the whole difficulty with a
+    /// native Linux game that carries no Wine context to identify it by.
+    /// </remarks>
+    public string? InstallDirectory { get; init; }
+
     public required GameSource Source { get; init; }
 
     /// <summary>The route the user chose for this game: a proxy, or a chain.</summary>
@@ -50,6 +60,38 @@ public sealed record GameProfile
 
     /// <summary>True when enough is known to install a rule for this game.</summary>
     public bool IsRoutable => ExecutablePath is { Length: > 0 } || WineTargetExecutable is { Length: > 0 };
+
+    /// <summary>
+    /// Whether an executable path lies inside this game's install directory.
+    /// </summary>
+    /// <remarks>
+    /// Containment is evidence rather than a guess: a binary under
+    /// <c>steamapps/common/&lt;this game&gt;</c> belongs to this game and to nothing else. Windows
+    /// paths from a Wine process are translated first — Proton reports
+    /// <c>Z:\mnt\games\...\game.exe</c> for a game whose files are at <c>/mnt/games/...</c> —
+    /// and the whole remaining path still has to match, so a wrong game cannot be picked up.
+    /// </remarks>
+    public bool MatchesInstalledPath(string? executablePath)
+    {
+        if (InstallDirectory is not { Length: > 0 } directory || executablePath is not { Length: > 0 } path)
+        {
+            return false;
+        }
+
+        if (path.Contains('\\', StringComparison.Ordinal))
+        {
+            path = path.Replace('\\', '/');
+            // "Z:/mnt/games/..." -> "/mnt/games/...". Any drive letter: Proton maps Z: to the
+            // filesystem root, but a prefix can map others.
+            if (path.Length > 2 && char.IsAsciiLetter(path[0]) && path[1] == ':')
+            {
+                path = path[2..];
+            }
+        }
+
+        var prefix = directory.EndsWith('/') ? directory : directory + '/';
+        return path.StartsWith(prefix, StringComparison.Ordinal);
+    }
 
     /// <summary>True when a latency comparison can be run.</summary>
     public bool IsMeasurable => MeasurementHost is { Length: > 0 } && MeasurementPort > 0;

@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using Yura.Core.Agent;
 using Yura.Core.Ipc;
 using Yura.Core.Proxies;
 using Yura.Core.Rules;
@@ -206,6 +207,7 @@ public sealed class IpcServer : IAsyncDisposable
                         ActiveGroups = _runtime.Groups.Count,
                         UptimeSeconds = (long)_uptime.Elapsed.TotalSeconds,
                         ProcessWatcher = _environment.ProcessWatcherState?.Invoke(),
+                        ClassifiedOnExec = _runtime.IncludedOnExec,
                         DnsPolicy = _runtime.Options.DnsPolicy,
                         KernelRelease = _environment.KernelRelease,
                         NftVersion = _environment.NftVersion,
@@ -214,6 +216,18 @@ public sealed class IpcServer : IAsyncDisposable
                         AllowedUids = _allowedUids.ToList(),
                         Checks = _environment.Checks.ToList(),
                         Tunnels = (await _wireguard.StatusAsync(ct).ConfigureAwait(false)).ToList(),
+                        Agents = _runtime.Agents.States.Select(a => new AgentDto
+                        {
+                            ProxyId = a.ProxyId,
+                            Name = a.Name,
+                            Connected = a.Connected,
+                            AgentName = a.AgentName,
+                            AgentVersion = a.AgentVersion,
+                            RoundTripMilliseconds = a.RoundTripMilliseconds,
+                            Udp = a.Udp,
+                            Resolver = a.Resolver?.ToString(),
+                            Failure = a.Failure,
+                        }).ToList(),
                     },
                 };
 
@@ -330,8 +344,18 @@ public sealed class IpcServer : IAsyncDisposable
                     route = hops;
                 }
 
+                var target = new IPEndPoint(address, request.Measure.Port);
                 var measurement = await NetworkMeasurer.MeasureAsync(
-                    new IPEndPoint(address, request.Measure.Port), route, request.Measure.Samples, ct).ConfigureAwait(false);
+                    target, route, request.Measure.Samples, ct).ConfigureAwait(false);
+
+                // A Yura agent will say what the far half of the route costs, which is the only
+                // way to tell a slow agent from a slow connection to a fast one.
+                if (route is [{ } first, ..] && first.IsAgent &&
+                    await _runtime.Agents.GetAsync(first.Endpoint, first.Password, ct).ConfigureAwait(false) is { } session)
+                {
+                    measurement = measurement with { Legs = await SplitAsync(session, target, request.Measure.Samples, ct).ConfigureAwait(false) };
+                }
+
                 return new IpcResponse { Ok = true, Measurement = measurement };
             }
 
@@ -356,6 +380,61 @@ public sealed class IpcServer : IAsyncDisposable
 
             default:
                 return IpcResponse.Failure($"Unknown operation '{request.Op}'.");
+        }
+    }
+
+    /// <summary>
+    /// Asks the agent to measure the target from where it is, beside our own round trip to it.
+    /// </summary>
+    /// <remarks>
+    /// The two halves are measured the same way as the whole — a TCP connect — so they are
+    /// comparable with each other and with the direct figure. They are not expected to add up
+    /// exactly: the routed figure includes the agent's own handshake, and this does not, which
+    /// is the honest way round for a figure the user is being shown as a split.
+    /// </remarks>
+    private static async Task<RouteLegsDto> SplitAsync(
+        AgentSession session, IPEndPoint target, int samples, CancellationToken ct)
+    {
+        double? toAgent = null;
+        try
+        {
+            toAgent = (await session.PingAsync(ct).ConfigureAwait(false)).TotalMilliseconds;
+        }
+        catch (Exception e) when (e is AgentProtocolException or TimeoutException or IOException
+                                     or ObjectDisposedException)
+        {
+        }
+
+        try
+        {
+            var reply = await session.ProbeAsync(
+                AgentAddress.From(target), (byte)Math.Clamp(samples, 1, 10), ct).ConfigureAwait(false);
+
+            // The median, like every other latency figure Yura shows.
+            var sorted = reply.Microseconds.Order().ToArray();
+            double? fromAgent = sorted.Length == 0
+                ? null
+                : sorted.Length % 2 == 1
+                    ? sorted[sorted.Length / 2] / 1000.0
+                    : (sorted[(sorted.Length / 2) - 1] + sorted[sorted.Length / 2]) / 2000.0;
+
+            return new RouteLegsDto
+            {
+                AgentName = session.AgentName,
+                ToAgentMilliseconds = toAgent,
+                FromAgentMilliseconds = fromAgent,
+                Failure = reply.Failure,
+            };
+        }
+        catch (Exception e) when (e is AgentProtocolException or TimeoutException or IOException
+                                     or ObjectDisposedException)
+        {
+            return new RouteLegsDto
+            {
+                AgentName = session.AgentName,
+                ToAgentMilliseconds = toAgent,
+                Failure = e.Message,
+            };
         }
     }
 

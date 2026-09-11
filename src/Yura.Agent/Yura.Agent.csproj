@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Yura.Agent</RootNamespace>
+    <AssemblyName>yura-agent</AssemblyName>
+    <RuntimeIdentifiers>linux-x64;linux-arm64</RuntimeIdentifiers>
+    <!-- Nothing here is localised: the agent's only output is an operator's log. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Self-contained and single-file are applied when publishing, not when building, so the
+         test project can reference this one. See tools/publish-agent.sh. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Yura.Core/Yura.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Yura.Agent.Tests" />
+  </ItemGroup>
+
+</Project>

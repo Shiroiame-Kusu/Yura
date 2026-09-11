@@ -78,6 +78,31 @@ address as the source, which is what an exit node's far end sees.
 | A chain with the exit anywhere but first is refused at apply time | `can only be the first hop` |
 | Shutdown removes the tunnel interfaces and their policy rules | Neither `yura-wg*` nor any `fwmark 0x73…` rule remains |
 
+### Yura agents
+
+The agent is proved the same way as the WireGuard exit, and for the same reason: the marker it
+reaches exists only inside the agent's network namespace, so receiving that marker means the
+agent dialled it. Twenty-two checks cover the connect string, the session, the refusal of a
+stale token, the probe's real datagram round trip, TCP and UDP through the agent, the resolver
+it advertises (on its own loopback, where nothing outside the namespace could answer), the
+split measurement, the policy refusing a private destination, an agent as the first hop of a
+chain and as a later one, and the daemon noticing when the agent goes away.
+
+### The capture boundary
+
+Two checks state where classification works and where it does not, because the difference is
+what a user experiences as "the route does nothing":
+
+- A program started after its rule, with an ordinary start-up, is captured from its first
+  connection — 5 of 5.
+- A program that connects about two milliseconds after `exec` is measured, not asserted: 0 of 8
+  on this machine. The daemon places a process from the kernel's event thread with one readlink
+  and one write, which is as fast as a notification-after-the-fact can be; `curl` is simply
+  faster. The check that does assert something asserts the honest part — that nothing which
+  escaped is reported as routed.
+- IPv6 from a covered process is refused, and the refusal is counted in the kernel, so the
+  ruleset cannot quietly go back to letting it out.
+
 ## The exclusion race
 
 Including children is free: a forked child inherits its parent's cgroup. **Excluding** them
@@ -147,6 +172,34 @@ One apparent bug was not one: slot `s002` looked like it was classifying only in
 Per-rule nftables counters showed it climbing from 7 packets to 31 over the same window — the
 assertion window was simply shorter than the direct instance's timeout cycle. Counters on
 every rule are now permanent for exactly this reason.
+
+### The end of a reply never reaching the client (agent, found by the acceptance suite)
+
+The first agent run relayed requests correctly and every client timed out anyway. The reply
+arrived — the bytes were there — but the *end* of it never did: when a destination closed, the
+agent stopped reading and said nothing to the client, which went on waiting for an end of
+stream that was not coming. Every client that reads to end-of-stream, which is most of them and
+every HTTP client with `Connection: close`, reported a failure while holding the answer.
+
+It was reproduced in seconds once it was stated that way, by a unit test with a destination
+that answers and closes, and fixed by giving each direction a way to say "that is all": a
+socket half close towards the destination, `close_notify` towards the client. The test is now
+the first one in the agent suite.
+
+### A rule's cgroup coming and going (found while investigating a user's report)
+
+A rule's cgroup was created when a process first matched it and deleted when it went empty.
+Because `socket cgroupv2` resolves a path to a cgroup id when the ruleset loads, each cycle
+left the installed rule pointing at an id that no longer existed — matching nothing, with the
+rule visibly present and the counters stuck at zero. A rule's group is now created with the
+rule and kept for its lifetime.
+
+### IPv6 marked but never captured (found by reading the ruleset)
+
+The classifier marked both families; the capture chain and the policy-routing rule were IPv4
+only. An IPv6 flow from a covered process was therefore marked, not captured, and left on the
+ordinary route — unproxied, unreported, and for an exit meant to hide an address, a leak of the
+address it was hiding. It is now refused instead, counted, and stated in the startup checks.
 
 ## What the WireGuard fixture proved before the suite did
 

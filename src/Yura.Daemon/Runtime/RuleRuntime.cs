@@ -56,6 +56,9 @@ public sealed record DeciderState
     /// <summary>Why the WireGuard exits that are not up are not, by proxy id.</summary>
     public IReadOnlyDictionary<Guid, string> TunnelFailures { get; init; } = new Dictionary<Guid, string>();
 
+    /// <summary>The resolver each connected agent offered, by proxy id.</summary>
+    public IReadOnlyDictionary<Guid, IPAddress> AgentResolvers { get; init; } = new Dictionary<Guid, IPAddress>();
+
     public bool HasHostRules { get; init; }
 
     /// <summary>Resolves a rule's action to the hops the dialler needs, or explains why it cannot.</summary>
@@ -154,6 +157,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     private readonly CgroupManager _cgroups;
     private readonly NftablesManager _nftables;
     private readonly WireGuardManager _wireguard;
+    private readonly AgentSessionManager _agents;
     private readonly ProcProcessSource _processes;
     private readonly FlowRegistry _flows;
     private readonly SocketOwnership _ownership;
@@ -202,8 +206,20 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     private volatile IReadOnlyDictionary<string, IReadOnlySet<int>> _fastExcludeMembers =
         new Dictionary<string, IReadOnlySet<int>>();
 
+    /// <summary>
+    /// Executable path to the group a process running it belongs in.
+    /// </summary>
+    /// <remarks>
+    /// Precomputed so the exec fast path is a dictionary lookup and one write. Only rules that
+    /// are identified by their executable path alone are in it: a Wine rule needs argv, and a
+    /// user or instance rule needs <c>/proc</c>, neither of which belongs on that thread.
+    /// Replaced wholesale on each reconcile, so the fast path needs no lock.
+    /// </remarks>
+    private volatile IReadOnlyDictionary<string, string> _fastInclude = new Dictionary<string, string>();
+
     private long _excludedChildren;
     private long _excludeMisses;
+    private long _includedOnExec;
     private readonly CancellationTokenSource _guardStopping = new();
     private Thread? _exclusionGuard;
 
@@ -217,6 +233,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         CgroupManager cgroups,
         NftablesManager nftables,
         WireGuardManager wireguard,
+        AgentSessionManager agents,
         ProcProcessSource processes,
         FlowRegistry flows,
         SocketOwnership ownership,
@@ -225,6 +242,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         _cgroups = cgroups;
         _nftables = nftables;
         _wireguard = wireguard;
+        _agents = agents;
         _processes = processes;
         _flows = flows;
         _ownership = ownership;
@@ -232,6 +250,8 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     }
 
     public DnsCache Dns { get; } = new();
+
+    public AgentSessionManager Agents => _agents;
 
     public IReadOnlyList<RoutingRule> Rules => _state.OrderedRules;
 
@@ -252,6 +272,9 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     /// <summary>Children moved out of a group that excludes descendants, and failures to do so.</summary>
     public (long Excluded, long Failed) ExclusionCounters =>
         (Interlocked.Read(ref _excludedChildren), Interlocked.Read(ref _excludeMisses));
+
+    /// <summary>Processes placed by the exec fast path, before they could open a socket.</summary>
+    public long IncludedOnExec => Interlocked.Read(ref _includedOnExec);
 
     /// <summary>
     /// Watches the cgroups of rules that exclude descendants and evicts anything that is not
@@ -352,6 +375,59 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         return moved;
     }
 
+    /// <summary>
+    /// Places a just-exec'd process in its rule's cgroup, on the kernel's event thread, before
+    /// it can create a socket. Returns true when it did.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is what makes a rule work for a program that connects the instant it starts. The
+    /// ordinary path — queue, lock, read six files under <c>/proc</c>, migrate — takes a few
+    /// milliseconds, and a socket created inside that window keeps the cgroup it was born in
+    /// for its whole life, whatever happens to the process afterwards. Measured on this
+    /// machine: a program that connects within about two milliseconds of <c>exec</c> was never
+    /// captured at all before this existed.
+    /// </para>
+    /// <para>
+    /// One readlink and one write, both on paths that are already resolved. The group is known
+    /// to exist because a rule's group is created when the rule is applied and kept for as long
+    /// as the rule lives. The full handler still runs a moment later; moving a process to the
+    /// same group twice costs nothing, and moving it to a wider group — one covering several
+    /// rules that all match it — is what the slow path is for.
+    /// </para>
+    /// </remarks>
+    public bool TryIncludeOnExecFast(int pid)
+    {
+        var map = _fastInclude;
+        if (map.Count == 0 || pid == 1 || pid == Environment.ProcessId)
+        {
+            return false;
+        }
+
+        string? executable;
+        try
+        {
+            executable = File.ResolveLinkTarget($"/proc/{pid}/exe", returnFinalTarget: false)?.FullName;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+
+        if (executable is null || !map.TryGetValue(executable, out var group))
+        {
+            return false;
+        }
+
+        if (!_cgroups.MoveFast(group, pid))
+        {
+            return false;
+        }
+
+        Interlocked.Increment(ref _includedOnExec);
+        return true;
+    }
+
     // -- configuration ---------------------------------------------------------
 
     public async Task<ApplyOutcome> SetProxiesAsync(
@@ -376,11 +452,15 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
                 _chains[chain.Id] = chain;
             }
 
-            // Tunnels first: the decider snapshot published by the reconcile below must know
-            // which exits are up, and a tunnel that failed is a warning, not a failed apply.
+            // Exits first: the decider snapshot published by the reconcile below must know
+            // which of them are up, and an exit that failed is a warning, not a failed apply.
             var tunnelWarnings = await _wireguard.ReconcileAsync(proxies, ct).ConfigureAwait(false);
+            // Agent sessions are opened here rather than on first use, so a game's first
+            // connection does not wait for a handshake and the UI can say whether the agent is
+            // there before anything is routed through it.
+            var agentWarnings = await _agents.ReconcileAsync(proxies, ct).ConfigureAwait(false);
             var outcome = await ReconcileAsync(ct).ConfigureAwait(false);
-            return outcome with { Warnings = [.. tunnelWarnings, .. outcome.Warnings] };
+            return outcome with { Warnings = [.. tunnelWarnings, .. agentWarnings, .. outcome.Warnings] };
         }
         finally
         {
@@ -530,7 +610,15 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         }
     }
 
-    /// <summary>Why a rule's route cannot carry traffic yet, when its WireGuard exit is down.</summary>
+    /// <summary>
+    /// Why a rule's route may not carry traffic yet, when the exit it names is not up.
+    /// </summary>
+    /// <remarks>
+    /// The two kinds of exit fail differently and are described differently. A WireGuard exit
+    /// that is down refuses every flow, because there is no tunnel to originate from. An agent
+    /// whose session is down still relays TCP — each flow opens its own connection — so the
+    /// warning says what will and will not work rather than implying the rule is dead.
+    /// </remarks>
     private string? DescribeDownExit(RuleAction action)
     {
         var endpointId = action switch
@@ -542,15 +630,27 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             _ => null,
         };
 
-        if (endpointId is not { } id || !_proxies.TryGetValue(id, out var exit) ||
-            exit.Protocol != ProxyProtocol.WireGuard || _wireguard.Tunnels.ContainsKey(id))
+        if (endpointId is not { } id || !_proxies.TryGetValue(id, out var exit))
         {
             return null;
         }
 
-        return _wireguard.Failures.TryGetValue(id, out var why)
-            ? $"WireGuard exit '{exit.Name}' is not up: {why}. Connections under this rule are refused until it is."
-            : $"WireGuard exit '{exit.Name}' is not up. Connections under this rule are refused until it is.";
+        if (exit.Protocol == ProxyProtocol.WireGuard && !_wireguard.Tunnels.ContainsKey(id))
+        {
+            return _wireguard.Failures.TryGetValue(id, out var why)
+                ? $"WireGuard exit '{exit.Name}' is not up: {why}. Connections under this rule are refused until it is."
+                : $"WireGuard exit '{exit.Name}' is not up. Connections under this rule are refused until it is.";
+        }
+
+        if (exit.Protocol == ProxyProtocol.YuraAgent &&
+            _agents.States.FirstOrDefault(a => a.ProxyId == id) is { Connected: false } agent)
+        {
+            return $"Agent exit '{exit.Name}' is not answering" +
+                   $"{(agent.Failure is { } detail ? $": {detail}" : ".")} " +
+                   "TCP connections under this rule will be attempted anyway; UDP cannot be carried until it answers.";
+        }
+
+        return null;
     }
 
     public async Task<ApplyOutcome> RemoveRuleAsync(Guid ruleId, CancellationToken ct = default)
@@ -894,6 +994,29 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         return created;
     }
 
+    /// <summary>
+    /// Makes sure every rule that is classified by cgroup has a group of its own.
+    /// </summary>
+    /// <remarks>
+    /// Without this a rule has no group until something matches it, which means the nftables
+    /// rule naming that group does not exist either — so the first instance of a program has
+    /// to be placed, the group created, and the ruleset reloaded, all before that program's
+    /// first socket. That is a race nothing wins reliably. Creating the group with the rule
+    /// turns it into a write to a file that is already there.
+    /// </remarks>
+    private void EnsureRuleGroups()
+    {
+        foreach (var rule in _rules.Values)
+        {
+            if (!rule.Enabled || rule.Process.Kind == ProcessSelectorKind.Any)
+            {
+                continue;
+            }
+
+            GroupFor(new HashSet<Guid> { rule.Id });
+        }
+    }
+
     private (ProcessGroup Group, bool Created) GroupFor(IReadOnlySet<Guid> ruleIds)
     {
         var key = ProcessGroup.KeyFor(ruleIds);
@@ -923,14 +1046,22 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         return (group, true);
     }
 
-    /// <summary>Retires groups nobody is in. Returns true when the ruleset must be reinstalled.</summary>
+    /// <summary>
+    /// Retires groups whose rules are gone. Returns true when the ruleset must be reinstalled.
+    /// </summary>
+    /// <remarks>
+    /// A group is kept while every rule it belongs to still exists, even with nothing in it.
+    /// Retiring an empty group looks tidier and is a trap: nftables resolved that group's path
+    /// to a cgroup id when the ruleset was loaded, so deleting and recreating the directory
+    /// leaves the installed rule pointing at an id that no longer exists, matching nothing,
+    /// until something happens to reload the ruleset. An empty cgroup costs a directory.
+    /// </remarks>
     private bool PruneEmptyGroups()
     {
         var removed = false;
         foreach (var group in _groupsByName.Values.ToList())
         {
-            var stale = group.RuleIds.Any(id => !_rules.ContainsKey(id));
-            if (_cgroups.ReadMembers(group.Name).Count > 0 && !stale)
+            if (group.RuleIds.All(_rules.ContainsKey))
             {
                 continue;
             }
@@ -978,6 +1109,12 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         }
 
         // 1. Membership: which processes belong in which group, decided from live /proc.
+        //    Every rule's own group is created first, whether or not anything matches it yet:
+        //    the group has to exist before a program starts for the exec fast path to have
+        //    somewhere to put it, and nftables resolves a cgroup path to an id when the
+        //    ruleset is loaded, so a group that comes and goes needs a reload each time and
+        //    silently matches nothing in between.
+        EnsureRuleGroups();
         snapshot ??= _processes.Enumerate();
         RecomputeMembership(snapshot, warnings);
         PruneEmptyGroups();
@@ -1091,6 +1228,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
                 .Select(pid => pid!.Value)
                 .ToHashSet());
         _fastExcludeGroups = excluding.Select(g => g.Name).ToHashSet();
+        _fastInclude = BuildFastInclude();
 
         EnsureExclusionGuard();
 
@@ -1103,8 +1241,59 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             Chains = new Dictionary<Guid, ProxyChain>(_chains),
             Tunnels = _wireguard.Tunnels,
             TunnelFailures = _wireguard.Failures,
+            AgentResolvers = _agents.Resolvers,
             HasHostRules = ordered.Any(r => r.Enabled && r.Destination.Hosts.Count > 0),
         };
+    }
+
+    /// <summary>
+    /// The executable paths the exec fast path can act on, and the group each belongs in.
+    /// </summary>
+    /// <remarks>
+    /// A path is only included when every enabled rule naming it is identified by that path
+    /// alone. A rule that also names a Wine executable, a user, or one instance needs evidence
+    /// the fast path cannot gather in time, so those processes wait for the ordinary handler —
+    /// which is correct, just slower, and they are not the programs that connect in their first
+    /// millisecond.
+    /// </remarks>
+    private IReadOnlyDictionary<string, string> BuildFastInclude()
+    {
+        var byPath = new Dictionary<string, List<RoutingRule>>(StringComparer.Ordinal);
+        foreach (var rule in _rules.Values.Where(r => r.Enabled))
+        {
+            if (rule.Process.ExecutablePath is not { Length: > 0 } path)
+            {
+                continue;
+            }
+
+            (byPath.TryGetValue(path, out var list) ? list : byPath[path] = []).Add(rule);
+        }
+
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (path, rules) in byPath)
+        {
+            // Anything that needs more than the path to decide disqualifies the path itself:
+            // placing a process by a rule that might not actually match it would be worse than
+            // placing it a few milliseconds later.
+            if (rules.Any(r => r.Process.Kind != ProcessSelectorKind.ExecutablePath ||
+                               r.Process.WineTargetExecutable is { Length: > 0 } ||
+                               r.Process.WinePrefix is { Length: > 0 } ||
+                               r.Process.Uid is not null))
+            {
+                continue;
+            }
+
+            var wanted = rules.Select(r => r.Id).ToHashSet();
+            // The group for the full set when it exists — a process matching two rules belongs
+            // in both — otherwise nothing, because the fast path must not create one.
+            var group = _groupsByName.Values.FirstOrDefault(g => g.RuleIds.SetEquals(wanted));
+            if (group is not null && _cgroups.GroupExists(group.Name))
+            {
+                map[path] = group.Name;
+            }
+        }
+
+        return map;
     }
 
     /// <summary>Sockets already open for the processes a rule covers, or null if unknowable.</summary>
@@ -1221,6 +1410,17 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         return pids;
     }
 
+    /// <summary>
+    /// The resolver a route offers of its own, or null when it has none and the application's
+    /// choice stands.
+    /// </summary>
+    private IPAddress? ResolverFor(IReadOnlyList<ProxyHop>? hops, AddressFamily family) => hops switch
+    {
+        [{ Tunnel: { } tunnel }] => tunnel.DnsFor(family),
+        [{ } hop] when hop.IsAgent => _state.AgentResolvers.GetValueOrDefault(hop.Endpoint.Id),
+        _ => null,
+    };
+
     public FlowPlan Decide(RuleSlot slot, IPEndPoint client, IPEndPoint destination, TransportProtocol protocol, string? sniffedHost)
     {
         var state = _state;
@@ -1256,13 +1456,13 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             _ => failure is null ? FlowPlanKind.Proxy : FlowPlanKind.Fail,
         };
 
-        // A lookup from a process on a WireGuard exit goes to the exit's own resolver: the one
+        // A lookup from a process on an exit of our own goes to that exit's resolver: the one
         // the application asked for is usually a LAN or loopback address the far end cannot
-        // reach. Only when the policy sends DNS through the route at all.
+        // reach, and where a name is resolved decides which of a game's servers it names.
+        // Only when the policy sends DNS through the route at all.
         IPEndPoint? dial = null;
         if (kind == FlowPlanKind.Proxy && destination.Port == 53 && _options.DnsPolicy == DnsPolicy.ThroughProxy &&
-            hops is [{ Tunnel: { } tunnel }] && tunnel.DnsFor(destination.AddressFamily) is { } resolver &&
-            !resolver.Equals(destination.Address))
+            ResolverFor(hops, destination.AddressFamily) is { } resolver && !resolver.Equals(destination.Address))
         {
             dial = new IPEndPoint(resolver, 53);
         }
@@ -1309,6 +1509,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             _listeners.Clear();
             await _nftables.RemoveAsync().ConfigureAwait(false);
             await _wireguard.RemoveAllAsync().ConfigureAwait(false);
+            await _agents.DisposeAsync().ConfigureAwait(false);
             _cgroups.RemoveAllGroups();
             _installedSlots = [];
             _state = DeciderState.Empty;

@@ -194,6 +194,62 @@ public sealed class NftablesRulesetTests
     }
 
     [Fact]
+    public void A_captured_flow_is_marked_for_IPv4_only_and_IPv6_is_refused_rather_than_let_out()
+    {
+        // The leak this pins shut: the mark is what re-routes a packet into the listener, and
+        // the rule that does the re-routing is an IPv4 rule. Marking an IPv6 packet changed
+        // nothing about where it went, so it left on the ordinary route while Yura reported
+        // the rule as being in effect — a silent lie, and for an exit meant to hide an address,
+        // a leak of exactly the thing it was hiding.
+        var rule = Rule("game", 10, new RuleAction.Proxy(ProxyA));
+
+        var text = NftablesManager.Build([Slot(1, rule, SlotDisposition.Capture, Group(1, rule))], []);
+
+        Assert.Contains("meta nfproto ipv4", text, StringComparison.Ordinal);
+        Assert.Contains("meta nfproto ipv6", text, StringComparison.Ordinal);
+        // The mark is only ever set on IPv4.
+        foreach (var line in text.Split('\n').Where(l => l.Contains("meta mark set", StringComparison.Ordinal)))
+        {
+            Assert.Contains("meta nfproto ipv4", line, StringComparison.Ordinal);
+        }
+
+        // And IPv6 is refused, with a reset for TCP so the application fails fast and retries
+        // over IPv4 instead of waiting out a timeout.
+        var ipv6 = text.Split('\n').Where(l => l.Contains("meta nfproto ipv6", StringComparison.Ordinal)).ToList();
+        Assert.Contains(ipv6, l => l.Contains("reject with tcp reset", StringComparison.Ordinal));
+        Assert.Contains(ipv6, l => l.TrimEnd().EndsWith("counter reject", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void A_capture_rule_that_names_IPv6_destinations_is_refused_with_the_reason()
+    {
+        // It could only ever have blocked them, so installing it would be a rule that claims
+        // to route and does the opposite.
+        var rule = Rule("v6 game", 11, new RuleAction.Proxy(ProxyA), destination: new DestinationSelector
+        {
+            Networks = [IPNetwork.Parse("2001:db8::/32")],
+        });
+
+        var skipped = new List<string>();
+        var text = NftablesManager.Build([Slot(1, rule, SlotDisposition.Capture, Group(1, rule))], [], null, skipped);
+
+        Assert.Contains("IPv6 destinations cannot be captured", Assert.Single(skipped), StringComparison.Ordinal);
+        Assert.DoesNotContain("meta mark set 0x7101", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_blocked_rule_still_covers_both_families()
+    {
+        // Blocking has no capture to do, so there is nothing it cannot express for IPv6.
+        var rule = Rule("blocked", 12, RuleAction.Block.Instance);
+
+        var text = NftablesManager.Build([Slot(2, rule, SlotDisposition.Block, Group(1, rule))], []);
+
+        Assert.DoesNotContain("meta nfproto", text, StringComparison.Ordinal);
+        Assert.Contains("reject with tcp reset", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void A_host_name_rule_on_a_process_captures_everything_else_about_it_and_leaves_the_name_to_the_listener()
     {
         var rule = Rule("host", 0, RuleAction.Block.Instance, destination: new DestinationSelector

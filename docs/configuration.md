@@ -50,6 +50,24 @@ daemon that has since exited. Both are dropped on save and the omission is teste
 Restored rules come back **unapplied**. A rule that was live in a previous session is not
 live now, and the UI shows it as pending until the daemon confirms it.
 
+## A Yura agent in the file
+
+An agent exit is stored like any other, with one extra object:
+
+```json
+{
+  "id": "…", "name": "Frankfurt agent", "protocol": "yuraAgent",
+  "host": "203.0.113.9", "port": 7311,
+  "passwordRef": "…",
+  "agent": { "fingerprint": "qS3n8uG1…", "agentLabel": "frankfurt-1" }
+}
+```
+
+The fingerprint is the agent's public key and is not a secret — pinning it is the point, and
+being able to compare it by eye against what the agent printed is useful. The token is a
+secret and lives in the secret store under `passwordRef`, exactly like a proxy password or a
+WireGuard private key.
+
 ## Passwords are not in this file
 
 `passwordRef` is a key into the desktop secret service, reached through `secret-tool`, which

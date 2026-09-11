@@ -1,5 +1,7 @@
+using System.Net;
 using Yura.App.Services;
 using Yura.App.ViewModels;
+using Yura.Core.Connections;
 using Yura.Core.Ipc;
 using Yura.Core.Proxies;
 using Yura.Core.Rules;
@@ -101,6 +103,203 @@ public sealed class ProxyEditorTests
         var secrets = new FakeSecretStore();
         var daemon = new RecordingDaemonClient();
         return (new ProxyEditorViewModel(rules, daemon, secrets), rules, secrets, daemon);
+    }
+
+    // -- Yura agents -------------------------------------------------------------
+
+    private const string AgentToken = "3cCq9Yb1n5Xp7tR2uW4kZ6mJ8dL0sF1hV3gB5aN7eQ0";
+
+    private const string AgentKey = "qS3n8uG1xK0pZ7rJ4mW2cV5bT9hY6dL8aF1eR0sX4uY";
+
+    [Fact]
+    public async Task One_paste_of_a_connect_string_is_a_complete_agent_exit()
+    {
+        // The whole setup experience: the agent prints one line, the user pastes it. Four
+        // fields typed by hand include a fingerprint, and a mistyped fingerprint fails in a way
+        // that looks like a network problem.
+        var (editor, rules, secrets, _) = New();
+        editor.BeginAddAgent();
+
+        editor.ImportText = $"yura://{AgentToken}@203.0.113.9:7311?fp={AgentKey}&name=frankfurt-1";
+        editor.ImportFromTextCommand.Execute(null);
+
+        Assert.Equal(ProxyProtocol.YuraAgent, editor.Protocol);
+        Assert.Equal("203.0.113.9", editor.Host);
+        Assert.Equal("7311", editor.Port);
+        Assert.Equal(AgentKey, editor.Fingerprint);
+        // The agent's own label names the exit, so there is nothing left to fill in.
+        Assert.Equal("frankfurt-1", editor.Name);
+        Assert.True(editor.IsValid);
+        // And the token is out of the box it was pasted into.
+        Assert.Equal(string.Empty, editor.ImportText);
+
+        await editor.SaveCommand.ExecuteAsync(null);
+
+        var saved = Assert.Single(rules.Proxies);
+        Assert.Equal(ProxyProtocol.YuraAgent, saved.Protocol);
+        Assert.Equal(AgentKey, saved.Agent?.Fingerprint);
+        Assert.Equal("frankfurt-1", saved.Agent?.AgentLabel);
+        // The token is a secret: it goes to the store, keyed by id, and not into the endpoint.
+        Assert.Equal(AgentToken, secrets.Secrets[saved.Id.ToString()]);
+        Assert.Equal(saved.Id.ToString(), saved.PasswordRef);
+    }
+
+    [Fact]
+    public void A_connect_string_that_will_not_parse_says_why_and_changes_nothing()
+    {
+        var (editor, _, _, _) = New();
+        editor.BeginAddAgent();
+
+        editor.ImportText = "yura://deadbeef@203.0.113.9:7311";
+        editor.ImportFromTextCommand.Execute(null);
+
+        Assert.NotNull(editor.ImportMessage);
+        Assert.Equal(string.Empty, editor.Host);
+        Assert.False(editor.IsValid);
+    }
+
+    [Fact]
+    public void An_agent_without_a_key_fingerprint_cannot_be_saved()
+    {
+        // Without it there is nothing to identify the agent by, and an exit that trusts
+        // whatever answers is not an exit worth having.
+        var (editor, _, _, _) = New();
+        editor.BeginAddAgent();
+        editor.Name = "Frankfurt";
+        editor.Host = "203.0.113.9";
+        editor.Port = "7311";
+        editor.Token = AgentToken;
+
+        Assert.False(editor.IsValid);
+        editor.Fingerprint = AgentKey;
+        Assert.True(editor.IsValid);
+    }
+
+    [Fact]
+    public async Task An_agent_without_a_token_cannot_be_saved()
+    {
+        var (editor, rules, _, _) = New();
+        editor.BeginAddAgent();
+        editor.Name = "Frankfurt";
+        editor.Host = "203.0.113.9";
+        editor.Fingerprint = AgentKey;
+
+        Assert.False(editor.IsValid);
+        // Nothing is said about the token until it has been touched or a save attempted;
+        // flagging an untouched box is noise.
+        Assert.Null(editor.TokenError);
+
+        await editor.SaveCommand.ExecuteAsync(null);
+
+        Assert.Empty(rules.Proxies);
+        Assert.NotNull(editor.TokenError);
+        Assert.True(editor.IsOpen);
+
+        editor.Token = AgentToken;
+        Assert.True(editor.IsValid);
+        Assert.Null(editor.TokenError);
+    }
+
+    [Fact]
+    public void A_stored_token_counts_for_an_agent_that_already_has_one()
+    {
+        var (editor, rules, _, _) = New();
+        var id = Guid.NewGuid();
+        rules.Proxies.Add(new ProxyEndpoint
+        {
+            Id = id,
+            Name = "Frankfurt",
+            Protocol = ProxyProtocol.YuraAgent,
+            Host = "203.0.113.9",
+            Port = 7311,
+            PasswordRef = id.ToString(),
+            Agent = new AgentSettings { Fingerprint = AgentKey },
+        });
+
+        editor.BeginEdit(rules.Proxies[0]);
+
+        // The token is not shown back, and leaving the box empty keeps it.
+        Assert.Equal(string.Empty, editor.Token);
+        Assert.True(editor.IsValid);
+        Assert.Null(editor.TokenError);
+    }
+
+    [Fact]
+    public void A_proxys_saved_password_does_not_count_as_an_agent_token()
+    {
+        // The same trap as a password standing in for a WireGuard private key: the form would
+        // say valid and the daemon would refuse the exit.
+        var (editor, rules, _, _) = New();
+        var id = Guid.NewGuid();
+        rules.Proxies.Add(new ProxyEndpoint
+        {
+            Id = id,
+            Name = "Home",
+            Protocol = ProxyProtocol.Socks5,
+            Host = "127.0.0.1",
+            Port = 1080,
+            PasswordRef = id.ToString(),
+        });
+
+        editor.BeginEdit(rules.Proxies[0]);
+        editor.Protocol = ProxyProtocol.YuraAgent;
+        editor.Fingerprint = AgentKey;
+
+        Assert.False(editor.IsValid);
+        editor.Token = AgentToken;
+        Assert.True(editor.IsValid);
+    }
+
+    [Fact]
+    public async Task Testing_an_agent_sends_the_token_as_its_secret()
+    {
+        var (editor, _, _, daemon) = New();
+        editor.BeginAddAgent();
+        editor.Name = "Frankfurt";
+        editor.Host = "203.0.113.9";
+        editor.Fingerprint = AgentKey;
+        editor.Token = AgentToken;
+
+        await editor.TestCommand.ExecuteAsync(null);
+
+        var (endpoint, secrets) = Assert.Single(daemon.Probes);
+        Assert.Equal(ProxyProtocol.YuraAgent, endpoint.Protocol);
+        Assert.Equal(AgentKey, endpoint.Agent?.Fingerprint);
+        Assert.Equal(AgentToken, secrets.Password);
+    }
+
+    [Fact]
+    public void An_agent_exit_has_no_username_or_password_fields()
+    {
+        var (editor, _, _, _) = New();
+        editor.BeginAddAgent();
+
+        Assert.False(editor.UsesCredentials);
+        Assert.True(editor.IsAgent);
+        // And the default port is the agent's.
+        Assert.Equal("7311", editor.Port);
+    }
+
+    [Fact]
+    public void A_wg_configuration_pasted_into_the_same_box_still_makes_a_WireGuard_exit()
+    {
+        // One box, two kinds of paste: telling them apart is the code's job, not the user's.
+        var (editor, _, _, _) = New();
+        editor.BeginAddAgent();
+
+        editor.ImportText = $"""
+            [Interface]
+            PrivateKey = {PrivateKey}
+            Address = 10.8.0.7/32
+
+            [Peer]
+            PublicKey = {PeerKey}
+            Endpoint = wg.example.net:51820
+            """;
+        editor.ImportFromTextCommand.Execute(null);
+
+        Assert.Equal(ProxyProtocol.WireGuard, editor.Protocol);
+        Assert.Equal("wg.example.net", editor.Host);
     }
 
     [Fact]
@@ -726,36 +925,164 @@ public sealed class ProxiesPageTests
 
         var row = Assert.Single(page.Proxies);
         Assert.True(row.IsWireGuard);
-        Assert.False(row.IsTunnelUp);
-        Assert.False(row.IsTunnelDown);
-        Assert.Contains("unknown", row.TunnelText);
+        Assert.True(row.ShowState);
+        Assert.False(row.IsExitUp);
+        Assert.False(row.IsExitDown);
+        Assert.Contains("unknown", row.StateText);
 
         row.UpdateTunnel(new TunnelStatus(row.Id, "exit", "yura-wg0", true, null,
             DateTimeOffset.UtcNow.AddSeconds(-20), RxBytes: 2048, TxBytes: 1024, Endpoint: "h:51820"));
-        Assert.True(row.IsTunnelUp);
-        Assert.Contains("20 s ago", row.TunnelText);
-        Assert.Contains("1 KB", row.TunnelText);
+        Assert.True(row.IsExitUp);
+        Assert.Contains("20 s ago", row.StateText);
+        Assert.Contains("1 KB", row.StateText);
 
         row.UpdateTunnel(new TunnelStatus(row.Id, "exit", null, false, "the key is wrong", null, 0, 0, null));
-        Assert.False(row.IsTunnelUp);
-        Assert.True(row.IsTunnelDown);
-        Assert.Contains("the key is wrong", row.TunnelText);
+        Assert.False(row.IsExitUp);
+        Assert.True(row.IsExitDown);
+        Assert.Contains("the key is wrong", row.StateText);
 
         // Up but never handshaken is neither: the interface exists, the peer has not answered.
         row.UpdateTunnel(new TunnelStatus(row.Id, "exit", "yura-wg0", true, null, null, 0, 0, "h:51820"));
-        Assert.False(row.IsTunnelUp);
-        Assert.False(row.IsTunnelDown);
-        Assert.Contains("not answered", row.TunnelText);
+        Assert.False(row.IsExitUp);
+        Assert.False(row.IsExitDown);
+        Assert.Contains("not answered", row.StateText);
     }
 
     [Fact]
-    public void A_non_wireguard_row_has_no_tunnel_line_at_all()
+    public void An_agent_row_says_what_the_session_is_doing()
+    {
+        var rules = new RuleStore();
+        rules.Proxies.Add(new ProxyEndpoint
+        {
+            Id = Guid.NewGuid(), Name = "frankfurt", Protocol = ProxyProtocol.YuraAgent, Host = "203.0.113.9",
+            Port = 7311, Agent = new AgentSettings { Fingerprint = "k" },
+        });
+        var page = new ProxiesPageViewModel(rules, new RecordingDaemonClient(), new FakeSecretStore());
+
+        var row = Assert.Single(page.Proxies);
+        Assert.True(row.IsAgent);
+        Assert.True(row.ShowState);
+        Assert.False(row.IsExitUp);
+        Assert.False(row.IsExitDown);
+        Assert.Contains("unknown", row.StateText);
+
+        row.UpdateAgent(new AgentStatus(row.Id, "frankfurt", Connected: true, "frankfurt-1", "0.3.0",
+            RoundTripMilliseconds: 11.4, Udp: true, Resolver: "127.0.0.53", Failure: null));
+        Assert.True(row.IsExitUp);
+        Assert.Contains("frankfurt-1", row.StateText);
+        Assert.Contains("11.4 ms", row.StateText);
+        Assert.Contains("UDP carried", row.StateText);
+
+        // An agent that offers no UDP is up, and says so rather than looking identical.
+        row.UpdateAgent(new AgentStatus(row.Id, "frankfurt", Connected: true, "frankfurt-1", "0.3.0",
+            RoundTripMilliseconds: 11.4, Udp: false, Resolver: null, Failure: null));
+        Assert.True(row.IsExitUp);
+        Assert.Contains("no UDP", row.StateText);
+
+        row.UpdateAgent(new AgentStatus(row.Id, "frankfurt", Connected: false, null, null, null, false, null,
+            "the token was not accepted"));
+        Assert.False(row.IsExitUp);
+        Assert.True(row.IsExitDown);
+        Assert.Contains("the token was not accepted", row.StateText);
+    }
+
+    [Fact]
+    public void A_row_for_an_ordinary_proxy_has_no_state_line_at_all()
     {
         var (page, _, _, _) = New();
 
         var row = page.Proxies[0];
         Assert.False(row.IsWireGuard);
-        Assert.Equal(string.Empty, row.TunnelText);
+        Assert.False(row.IsAgent);
+        Assert.False(row.ShowState);
+        Assert.Equal(string.Empty, row.StateText);
         Assert.Equal("SOCKS5", row.ProtocolDisplay);
+    }
+}
+
+/// <summary>
+/// The sentences the Games page shows about what is actually happening to a game's traffic.
+/// </summary>
+/// <remarks>
+/// These exist because of a real report: the page said a game was routing while its traffic
+/// was going straight out. The state badge only ever meant "a rule is installed and the game
+/// is running", which is not the same claim, and the difference had nowhere to be said.
+/// </remarks>
+public sealed class RoutingEvidenceTests
+{
+    private static ConnectionRecord Row(RouteObservation route, string remote = "203.0.113.9:443") => new()
+    {
+        Id = Guid.NewGuid().ToString(),
+        Local = IPEndPoint.Parse("192.168.1.24:51544"),
+        Remote = IPEndPoint.Parse(remote),
+        Protocol = TransportProtocol.Tcp,
+        State = ConnectionState.Established,
+        Route = route,
+    };
+
+    [Fact]
+    public void Connections_going_through_the_route_are_reported_as_such()
+    {
+        var (text, warning) = GamesPageViewModel.Summarise(
+            [Row(RouteObservation.ConfirmedProxied), Row(RouteObservation.ConfirmedProxied)],
+            "Frankfurt agent", patient: true);
+
+        Assert.Contains("2", text);
+        Assert.Contains("Frankfurt agent", text, StringComparison.Ordinal);
+        // Something is working, so this is information rather than a warning.
+        Assert.False(warning);
+    }
+
+    [Fact]
+    public void A_game_talking_to_a_proxy_on_this_machine_is_named_as_the_reason()
+    {
+        // The case that produced the report: http_proxy was set in the environment, so the
+        // game never left loopback, and loopback is the one thing Yura deliberately ignores.
+        var (text, warning) = GamesPageViewModel.Summarise(
+            [Row(RouteObservation.ConfirmedDirect, "127.0.0.1:8080")], "Frankfurt agent", patient: true);
+
+        Assert.Contains("proxy on this machine", text, StringComparison.Ordinal);
+        Assert.Contains("http_proxy", text, StringComparison.Ordinal);
+        Assert.True(warning);
+    }
+
+    [Fact]
+    public void Connections_older_than_the_route_are_distinguished_from_ones_avoiding_it()
+    {
+        var (text, warning) = GamesPageViewModel.Summarise(
+            [Row(RouteObservation.PreExistingPreviousRoute), Row(RouteObservation.ConfirmedDirect)],
+            "Frankfurt agent", patient: true);
+
+        Assert.Contains("before the route started", text, StringComparison.Ordinal);
+        Assert.Contains("directly", text, StringComparison.Ordinal);
+        Assert.True(warning);
+    }
+
+    [Fact]
+    public void Nothing_captured_yet_is_patient_first_and_then_says_so()
+    {
+        var (waiting, quiet) = GamesPageViewModel.Summarise([], "Frankfurt agent", patient: false);
+        Assert.Contains("Waiting", waiting, StringComparison.Ordinal);
+        Assert.False(quiet);
+
+        var (reported, warning) = GamesPageViewModel.Summarise([], "Frankfurt agent", patient: true);
+        Assert.Contains("Nothing from this game has been captured", reported, StringComparison.Ordinal);
+        // And it names the three things that actually cause it.
+        Assert.Contains("environment", reported, StringComparison.Ordinal);
+        Assert.Contains("IPv6", reported, StringComparison.Ordinal);
+        Assert.True(warning);
+    }
+
+    [Fact]
+    public void Some_routed_and_some_not_reports_both_without_claiming_success()
+    {
+        var (text, warning) = GamesPageViewModel.Summarise(
+            [Row(RouteObservation.ConfirmedProxied), Row(RouteObservation.ConfirmedDirect, "127.0.0.1:8080")],
+            "Frankfurt agent", patient: true);
+
+        Assert.Contains("1 connection(s) are going through", text, StringComparison.Ordinal);
+        Assert.Contains("proxy on this machine", text, StringComparison.Ordinal);
+        // Something is getting through, so it is not a warning — but both halves are stated.
+        Assert.False(warning);
     }
 }

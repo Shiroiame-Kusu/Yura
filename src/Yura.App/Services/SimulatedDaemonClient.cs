@@ -64,12 +64,19 @@ public sealed class SimulatedDaemonClient : IDaemonClient
                 new DaemonCheck("wg tool available (wireguard-tools)", true, "wireguard-tools v1.0.20260223"),
                 new DaemonCheck("Kernel supports WireGuard interfaces", true, null),
                 new DaemonCheck("Kernel process events (netlink connector)", true, null),
+                new DaemonCheck("AES-GCM available (agent datagram channel)", true, null),
             ],
             // Every WireGuard exit the app pushed is reported as up with a recent handshake, so
             // the row states that need a live tunnel can be laid out.
             Tunnels = _proxies.Where(p => p.IsWireGuard).Select((p, i) => new TunnelStatus(
                 p.Id, p.Name, $"yura-wg{i}", true, null, DateTimeOffset.UtcNow.AddSeconds(-42 - 17 * i),
                 RxBytes: 48_211_904 + 1_000_000 * i, TxBytes: 6_402_118, Endpoint: p.Authority)).ToArray(),
+            // Likewise every agent exit: connected, with a round trip and a resolver, so the
+            // rows that need a live session can be laid out.
+            Agents = _proxies.Where(p => p.IsAgent).Select((p, i) => new AgentStatus(
+                p.Id, p.Name, Connected: true, AgentName: p.Agent?.AgentLabel ?? p.Name,
+                AgentVersion: "0.3.0", RoundTripMilliseconds: 11.4 + i, Udp: true,
+                Resolver: "127.0.0.53", Failure: null)).ToArray(),
         });
 
     public Task<IReadOnlyDictionary<int, int>> GetConnectionCountsAsync(CancellationToken cancellationToken = default) =>

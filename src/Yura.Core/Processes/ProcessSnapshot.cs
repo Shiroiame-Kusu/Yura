@@ -30,9 +30,6 @@ public sealed record WineContext
 
     /// <summary>Value of <c>WINEPREFIX</c> for the process, when readable.</summary>
     public string? Prefix { get; init; }
-
-    /// <summary>Steam app id when the process was started by Steam/Proton.</summary>
-    public string? SteamAppId { get; init; }
 }
 
 /// <summary>
@@ -70,6 +67,16 @@ public sealed record ProcessSnapshot
 
     /// <summary>Set when the process was recognised as a Wine or Proton process.</summary>
     public WineContext? Wine { get; init; }
+
+    /// <summary>
+    /// The Steam app id from the process's environment, for anything Steam launched.
+    /// </summary>
+    /// <remarks>
+    /// Not part of <see cref="Wine"/>: Steam sets this for native Linux games too, and those
+    /// have no Wine context at all. Keeping it here is what lets a native game be recognised
+    /// rather than only Proton ones.
+    /// </remarks>
+    public string? SteamAppId { get; init; }
 
     /// <summary>True when the process is a kernel thread (no executable, no network).</summary>
     public bool IsKernelThread => ExecutablePathState == ExecutablePathState.None && ParentPid is 0 or 2;

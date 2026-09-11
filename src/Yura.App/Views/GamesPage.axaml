@@ -15,6 +15,9 @@
       <StackPanel Grid.Column="0" Spacing="2">
         <TextBlock Classes="PageTitle" Text="{loc:Tr Games.Title}" />
         <TextBlock Classes="Subtitle" Text="{loc:Tr Games.Subtitle}" />
+        <!-- Where the list came from. A scan that silently reads one library out of six
+             looks exactly like one that read them all. -->
+        <TextBlock Classes="Caption" Text="{Binding LibrarySummary}" />
       </StackPanel>
       <Button Grid.Column="1" VerticalAlignment="Top" Command="{Binding RescanCommand}"
               Content="{loc:Tr Games.Rescan}" />
@@ -82,6 +85,22 @@
             </StackPanel>
           </Grid>
         </Border>
+
+        <!-- What is actually happening to the game's connections. The state badge says a rule
+             is installed and the game is running; neither is evidence that its traffic is
+             obeying the rule, and this is where the difference is told. -->
+        <Border Classes="Panel" Padding="12"
+                IsVisible="{Binding RoutingEvidenceIsWarning}"
+                Background="{DynamicResource YuraWarningSubtle}"
+                BorderBrush="{DynamicResource YuraWarning}">
+          <StackPanel Orientation="Horizontal" Spacing="10">
+            <icons:SymbolIcon Symbol="Warning" FontSize="18"
+                              Foreground="{DynamicResource YuraWarning}" VerticalAlignment="Center" />
+            <TextBlock Text="{Binding RoutingEvidence}" TextWrapping="Wrap" VerticalAlignment="Center" />
+          </StackPanel>
+        </Border>
+        <TextBlock Classes="FieldHint" Text="{Binding RoutingEvidence}" TextWrapping="Wrap"
+                   IsVisible="{Binding !RoutingEvidenceIsWarning}" />
 
         <!-- Why Start is unavailable, stated beside the control. -->
         <TextBlock Classes="FieldHint" Text="{Binding StartBlockedReason}"
@@ -176,6 +195,10 @@
               <TextBlock Grid.Row="3" Grid.Column="2" Classes="Metric" Text="{Binding RoutedLoss.Display}" />
             </Grid>
 
+            <!-- Where the routed time went, when the route will say. -->
+            <TextBlock Classes="FieldHint" Text="{Binding RouteSplit}" TextWrapping="Wrap"
+                       IsVisible="{Binding HasRouteSplit}" />
+
             <Border Classes="Divider" />
 
             <Grid ColumnDefinitions="*,*">
@@ -188,6 +211,15 @@
                 <TextBlock Classes="Mono Tertiary" Text="{Binding MeasurementMethodDisplay}" VerticalAlignment="Center" />
               </StackPanel>
             </Grid>
+          </StackPanel>
+        </Border>
+
+        <!-- Libraries Steam lists that could not be read: named, because an unmounted drive
+             is the difference between a short list and a complete one. -->
+        <Border Classes="Panel" Padding="16" IsVisible="{Binding HasSkippedLibraries}">
+          <StackPanel Spacing="6">
+            <TextBlock Classes="SectionTitle" Text="{loc:Tr Games.SkippedLibraries}" />
+            <TextBlock Classes="Mono Tertiary" Text="{Binding SkippedLibraries}" TextWrapping="Wrap" />
           </StackPanel>
         </Border>
 

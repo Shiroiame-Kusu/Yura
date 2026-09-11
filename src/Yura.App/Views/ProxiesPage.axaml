@@ -22,6 +22,7 @@
         <Button Command="{Binding AddChainCommand}" IsEnabled="{Binding CanAddChain}"
                 Content="{loc:Tr Chain.Add}" />
         <Button Command="{Binding AddWireGuardCommand}" Content="{loc:Tr Proxy.AddWireGuard}" />
+        <Button Command="{Binding AddAgentCommand}" Content="{loc:Tr Proxy.AddAgent}" />
         <Button Classes="accent" Command="{Binding AddProxyCommand}" Content="{loc:Tr Proxy.Editor.TitleNew}" />
       </StackPanel>
     </Grid>
@@ -50,13 +51,14 @@
                       <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
                       <TextBlock Classes="Mono Tertiary" Text="{Binding Authority}"
                                  TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Authority}" />
-                      <!-- The tunnel line says what the kernel reports, not what we hope. -->
-                      <TextBlock Classes="Caption" Text="{Binding TunnelText}" TextWrapping="Wrap"
-                                 IsVisible="{Binding IsWireGuard}" />
+                      <!-- For an exit Yura runs both ends of, what it is actually doing:
+                           the kernel's own account of a tunnel, or the agent's session. -->
+                      <TextBlock Classes="Caption" Text="{Binding StateText}" TextWrapping="Wrap"
+                                 IsVisible="{Binding ShowState}" />
                     </StackPanel>
                     <Border Grid.Column="1" Classes="Badge" VerticalAlignment="Top" Margin="8,2,0,0"
-                            Classes.Success="{Binding IsTunnelUp}"
-                            Classes.Danger="{Binding IsTunnelDown}">
+                            Classes.Success="{Binding IsExitUp}"
+                            Classes.Danger="{Binding IsExitDown}">
                       <TextBlock Text="{Binding ProtocolDisplay}" />
                     </Border>
                   </Grid>

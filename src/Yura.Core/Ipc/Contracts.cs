@@ -112,6 +112,13 @@ public sealed class StatusDto
     /// <summary>"netlink" when process events are delivered by the kernel, otherwise why not.</summary>
     public string? ProcessWatcher { get; init; }
 
+    /// <summary>
+    /// Processes placed in their rule's cgroup by the exec fast path, before they could open a
+    /// socket. A socket's cgroup is fixed when it is created, so this is the count of programs
+    /// whose first connection was classified in time rather than escaping the rule.
+    /// </summary>
+    public long ClassifiedOnExec { get; init; }
+
     public DnsPolicy DnsPolicy { get; init; }
 
     public string? KernelRelease { get; init; }
@@ -129,6 +136,38 @@ public sealed class StatusDto
 
     /// <summary>Every WireGuard exit the daemon was given, up or not, with what the kernel reports.</summary>
     public List<TunnelDto> Tunnels { get; init; } = [];
+
+    /// <summary>Every Yura agent exit the daemon was given, connected or not.</summary>
+    public List<AgentDto> Agents { get; init; } = [];
+}
+
+/// <summary>
+/// The state of one Yura agent exit. Never carries the token.
+/// </summary>
+public sealed class AgentDto
+{
+    public required Guid ProxyId { get; init; }
+
+    public required string Name { get; init; }
+
+    /// <summary>True when the control session is up. TCP flows work without it; UDP does not.</summary>
+    public required bool Connected { get; init; }
+
+    /// <summary>What the agent calls itself, which need not be what the exit is named here.</summary>
+    public string? AgentName { get; init; }
+
+    public string? AgentVersion { get; init; }
+
+    /// <summary>Round trip to the agent from the last ping on the control connection.</summary>
+    public double? RoundTripMilliseconds { get; init; }
+
+    /// <summary>Whether the agent offered the datagram channel and it was set up.</summary>
+    public bool Udp { get; init; }
+
+    /// <summary>The resolver the agent offered, used for lookups from processes on this exit.</summary>
+    public string? Resolver { get; init; }
+
+    public string? Failure { get; init; }
 }
 
 /// <summary>The state of one WireGuard exit as the kernel reports it. Never carries a key.</summary>
@@ -241,7 +280,9 @@ public sealed class SampleSetDto
     public List<double> RoundTripsMilliseconds { get; init; } = [];
 }
 
-public sealed class MeasurementDto
+// A record rather than a class: the split legs are added after the samples are taken, by the
+// one caller that can find them out, and copying is how that is done without a settable field.
+public sealed record MeasurementDto
 {
     /// <summary>The literal address both sides were measured against.</summary>
     public required string Target { get; init; }
@@ -253,7 +294,33 @@ public sealed class MeasurementDto
 
     public SampleSetDto? Routed { get; init; }
 
+    /// <summary>Where the routed time went, when the route can say. Null when it cannot.</summary>
+    public RouteLegsDto? Legs { get; init; }
+
     public required DateTimeOffset MeasuredAtUtc { get; init; }
+}
+
+/// <summary>
+/// The routed figure split in two: this machine to the agent, and the agent onwards.
+/// </summary>
+/// <remarks>
+/// Only a Yura agent can report this, because only it will measure a destination from where
+/// it is standing. It is the difference between knowing a route is faster and knowing why —
+/// and it is what tells a user whether a better agent would help, or whether their own
+/// connection to it is the problem.
+/// </remarks>
+public sealed class RouteLegsDto
+{
+    public required string AgentName { get; init; }
+
+    /// <summary>Round trip from here to the agent, on its control connection.</summary>
+    public double? ToAgentMilliseconds { get; init; }
+
+    /// <summary>Round trip from the agent to the target, measured by the agent.</summary>
+    public double? FromAgentMilliseconds { get; init; }
+
+    /// <summary>Why the agent could not measure it, when it could not.</summary>
+    public string? Failure { get; init; }
 }
 
 public sealed class ProxyDto
@@ -283,6 +350,9 @@ public sealed class ProxyDto
 
     public WireGuardDto? WireGuard { get; init; }
 
+    /// <summary>The agent's pinned key. Not a secret — it is a public key — so it travels plainly.</summary>
+    public AgentDetailsDto? Agent { get; init; }
+
     public static ProxyDto From(ProxyEndpoint endpoint, ProxySecrets secrets) => new()
     {
         Id = endpoint.Id,
@@ -295,6 +365,9 @@ public sealed class ProxyDto
         PresharedKey = secrets.PresharedKey,
         AllowInvalidCertificate = endpoint.AllowInvalidCertificate,
         WireGuard = endpoint.WireGuard is { } wg ? WireGuardDto.From(wg) : null,
+        Agent = endpoint.Agent is { } agent
+            ? new AgentDetailsDto { Fingerprint = agent.Fingerprint, AgentLabel = agent.AgentLabel }
+            : null,
     };
 
     public ProxyEndpoint ToEndpoint() => new()
@@ -307,9 +380,20 @@ public sealed class ProxyDto
         Username = Username,
         AllowInvalidCertificate = AllowInvalidCertificate,
         WireGuard = WireGuard?.ToSettings(),
+        Agent = Agent is { } agent
+            ? new AgentSettings { Fingerprint = agent.Fingerprint, AgentLabel = agent.AgentLabel }
+            : null,
     };
 
     public ProxySecrets ToSecrets() => new(Password, PresharedKey);
+}
+
+/// <summary>What identifies a Yura agent: its pinned public key, and what it calls itself.</summary>
+public sealed class AgentDetailsDto
+{
+    public required string Fingerprint { get; init; }
+
+    public string? AgentLabel { get; init; }
 }
 
 /// <summary>The non-secret WireGuard settings, flat for the wire.</summary>

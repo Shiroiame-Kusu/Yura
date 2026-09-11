@@ -30,6 +30,12 @@ public sealed class PersistedProxy
     /// <summary>Only for WireGuard exits. Holds no key: those are referenced, like the password.</summary>
     public PersistedWireGuard? WireGuard { get; init; }
 
+    /// <summary>
+    /// Only for Yura agent exits. Holds the agent's public key fingerprint, which is not a
+    /// secret — pinning it is the point — while the token is referenced like a password.
+    /// </summary>
+    public PersistedAgent? Agent { get; init; }
+
     public static PersistedProxy From(ProxyEndpoint endpoint) => new()
     {
         Id = endpoint.Id,
@@ -41,6 +47,9 @@ public sealed class PersistedProxy
         PasswordRef = endpoint.PasswordRef,
         AllowInvalidCertificate = endpoint.AllowInvalidCertificate,
         WireGuard = endpoint.WireGuard is { } wg ? PersistedWireGuard.From(wg) : null,
+        Agent = endpoint.Agent is { } agent
+            ? new PersistedAgent { Fingerprint = agent.Fingerprint, AgentLabel = agent.AgentLabel }
+            : null,
     };
 
     public ProxyEndpoint ToEndpoint() => new()
@@ -54,7 +63,18 @@ public sealed class PersistedProxy
         PasswordRef = PasswordRef,
         AllowInvalidCertificate = AllowInvalidCertificate,
         WireGuard = WireGuard?.ToSettings(),
+        Agent = Agent is { } agent
+            ? new AgentSettings { Fingerprint = agent.Fingerprint, AgentLabel = agent.AgentLabel }
+            : null,
     };
+}
+
+/// <summary>What identifies a Yura agent, as written to disk.</summary>
+public sealed class PersistedAgent
+{
+    public required string Fingerprint { get; init; }
+
+    public string? AgentLabel { get; init; }
 }
 
 /// <summary>The non-secret WireGuard settings as written to disk.</summary>
@@ -129,6 +149,12 @@ public sealed class PersistedGame
 
     public string? SteamAppId { get; init; }
 
+    /// <summary>
+    /// Saved so a profile can recognise its process before the first rescan of the session,
+    /// and re-read from the manifest on every scan because a game can be moved.
+    /// </summary>
+    public string? InstallDirectory { get; init; }
+
     public GameSource Source { get; init; }
 
     public Guid? RouteId { get; init; }
@@ -146,6 +172,7 @@ public sealed class PersistedGame
         ExecutablePath = game.ExecutablePath,
         WineTargetExecutable = game.WineTargetExecutable,
         SteamAppId = game.SteamAppId,
+        InstallDirectory = game.InstallDirectory,
         Source = game.Source,
         RouteId = game.RouteId,
         RouteIsChain = game.RouteIsChain,
@@ -160,6 +187,7 @@ public sealed class PersistedGame
         ExecutablePath = ExecutablePath,
         WineTargetExecutable = WineTargetExecutable,
         SteamAppId = SteamAppId,
+        InstallDirectory = InstallDirectory,
         Source = Source,
         RouteId = RouteId,
         RouteIsChain = RouteIsChain,

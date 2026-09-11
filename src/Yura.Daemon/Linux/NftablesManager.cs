@@ -164,12 +164,25 @@ public sealed class NftablesManager
                     sb.Append(CultureInfo.InvariantCulture, $"    {match} th dport 53 counter accept\n");
                 }
 
+                // IPv4 only, and explicitly so. The capture chain below can hand a marked
+                // packet to a listener with 'tproxy ip', and the policy-routing rule that
+                // loops it back is an IPv4 rule; neither has an IPv6 counterpart yet. Marking
+                // an IPv6 packet anyway would change nothing about where it goes, so it would
+                // leave on the ordinary route while Yura reported the rule as being in effect.
                 // 'accept' ends evaluation so a broader rule further down cannot overwrite
                 // the mark; the route hook still re-routes because the mark changed.
                 // 'counter' on every slot rule is deliberate: per-rule packet counts are the
                 // first thing to look at when a rule "does nothing", and they cost nothing.
                 sb.Append(CultureInfo.InvariantCulture,
-                    $"    {match} meta mark set 0x{slot.Mark:x} counter accept\n");
+                    $"    meta nfproto ipv4 {match} meta mark set 0x{slot.Mark:x} counter accept\n");
+
+                // And what cannot be captured is refused rather than let out unrouted: a
+                // connection that quietly avoids the route is worse than one that fails, and
+                // an application that meets a closed door on IPv6 tries IPv4 a moment later.
+                sb.Append(CultureInfo.InvariantCulture,
+                    $"    meta nfproto ipv6 {match} meta l4proto tcp counter reject with tcp reset\n");
+                sb.Append(CultureInfo.InvariantCulture,
+                    $"    meta nfproto ipv6 {match} counter reject\n");
                 break;
             case SlotDisposition.Block:
                 sb.Append(CultureInfo.InvariantCulture,
@@ -220,6 +233,12 @@ public sealed class NftablesManager
             if (v4.Count > 0 && v6.Count > 0)
             {
                 reason = "a single rule cannot mix IPv4 and IPv6 destinations";
+                return false;
+            }
+
+            if (v6.Count > 0 && slot.Disposition == SlotDisposition.Capture)
+            {
+                reason = "IPv6 destinations cannot be captured yet, so this rule could not route them";
                 return false;
             }
 

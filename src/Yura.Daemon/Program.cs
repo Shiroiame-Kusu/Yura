@@ -129,7 +129,20 @@ internal static class Program
             await wireguard.CleanupLeftoversAsync().ConfigureAwait(false);
         }
 
-        await using var runtime = new RuleRuntime(cgroups, nftables, wireguard, processes, flows, ownership, Log);
+        // Agent exits need nothing installed on this machine: the sessions are opened when the
+        // app pushes its proxy list, and an agent that cannot be reached is a warning on that
+        // push rather than a startup failure.
+        var agents = new AgentSessionManager(Log);
+        checks.Add(new CheckDto
+        {
+            Name = "AES-GCM available (agent datagram channel)",
+            Passed = Yura.Core.Agent.AgentDatagramCrypto.IsSupported,
+            Detail = Yura.Core.Agent.AgentDatagramCrypto.IsSupported
+                ? null
+                : "UDP through a Yura agent will be refused; TCP is unaffected",
+        });
+
+        await using var runtime = new RuleRuntime(cgroups, nftables, wireguard, agents, processes, flows, ownership, Log);
 
         var routingOk = await routing.InstallAsync().ConfigureAwait(false);
         checks.Add(new CheckDto { Name = "Policy routing installed", Passed = routingOk, Detail = routingOk ? $"fwmark 0x{PolicyRouting.MarkBase:x}/0x{PolicyRouting.MarkMask:x} -> table {PolicyRouting.RoutingTable}" : "see daemon log" });
@@ -155,13 +168,28 @@ internal static class Program
         await nftables.ApplyAsync(empty).ConfigureAwait(false);
         checks.Add(new CheckDto { Name = "rp_filter relaxed on lo and all", Passed = ReadTrimmed("/proc/sys/net/ipv4/conf/lo/rp_filter") == "0" && ReadTrimmed("/proc/sys/net/ipv4/conf/all/rp_filter") == "0" });
 
+        // Said out loud because the alternative is a silent leak. TPROXY hands a marked packet
+        // to a listener with 'tproxy ip', and the policy-routing rule that loops it back is an
+        // IPv4 rule; there is no IPv6 counterpart yet. A covered process's IPv6 connections are
+        // therefore refused rather than sent out past the route, and applications fall back to
+        // IPv4 within a few milliseconds.
+        checks.Add(new CheckDto
+        {
+            Name = "Address families captured",
+            Passed = true,
+            Detail = "IPv4. IPv6 from a covered process is refused rather than routed, so nothing leaves past its rule.",
+        });
+
         using var shutdown = new CancellationTokenSource();
 
         // Process events from the kernel, with the sweep below as the fallback either way.
         using var watcher = new ProcessEventWatcher(Log)
         {
-            // Excluding a child is the one decision that cannot wait for the event queue.
+            // Neither of these can wait for the event queue: a socket's cgroup is fixed when
+            // it is created, so a process placed — or evicted — a few milliseconds late has
+            // already opened connections on the wrong route, and they stay there.
             OnForkFastPath = runtime.TryExcludeChildFast,
+            OnExecFastPath = runtime.TryIncludeOnExecFast,
         };
         var watching = !noWatcher && watcher.Start();
         if (!watching)

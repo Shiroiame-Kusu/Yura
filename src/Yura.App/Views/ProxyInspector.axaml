@@ -30,21 +30,26 @@
 
           <TextBlock Classes="FieldHint" Text="{loc:Tr Proxy.WireGuard.Hint}" Margin="0"
                      IsVisible="{Binding IsWireGuard}" />
+          <TextBlock Classes="FieldHint" Text="{loc:Tr Proxy.Agent.Hint}" Margin="0" TextWrapping="Wrap"
+                     IsVisible="{Binding IsAgent}" />
 
-          <!-- Import: the way almost every WireGuard exit will be entered. -->
-          <Expander Header="{loc:Tr Proxy.WireGuard.Import}" IsExpanded="{Binding ShowImport}"
-                    IsVisible="{Binding IsWireGuard}">
+          <!-- Paste: how almost every WireGuard exit and every agent will be entered. One box
+               for both, because the user's action is the same and telling a connect string from
+               a .conf is the code's job. -->
+          <Expander Header="{loc:Tr Proxy.Import}" IsExpanded="{Binding ShowImport}"
+                    IsVisible="{Binding ShowImport}">
             <StackPanel Spacing="8" Margin="0,6,0,0">
-              <TextBlock Classes="FieldHint" Margin="0" Text="{loc:Tr Proxy.WireGuard.ImportHint}" />
+              <TextBlock Classes="FieldHint" Margin="0" Text="{loc:Tr Proxy.ImportHint}" TextWrapping="Wrap" />
               <TextBox Text="{Binding ImportText}" AcceptsReturn="True" TextWrapping="NoWrap" Height="120"
                        Classes="Mono" FontSize="12"
-                       PlaceholderText="[Interface]&#x0a;PrivateKey = …&#x0a;Address = …&#x0a;[Peer]&#x0a;PublicKey = …&#x0a;Endpoint = …"
-                       AutomationProperties.Name="{loc:Tr Proxy.WireGuard.Import}" />
+                       PlaceholderText="yura://…@host:7311?fp=…&#x0a;&#x0a;— or —&#x0a;&#x0a;[Interface]&#x0a;PrivateKey = …"
+                       AutomationProperties.Name="{loc:Tr Proxy.Import}" />
               <Grid ColumnDefinitions="*,8,*">
                 <Button Grid.Column="0" HorizontalAlignment="Stretch" Command="{Binding ImportFromTextCommand}"
                         Content="{loc:Tr Proxy.WireGuard.ImportApply}" />
                 <Button Grid.Column="2" HorizontalAlignment="Stretch" Command="{Binding ImportFromFileCommand}"
-                        Content="{loc:Tr Proxy.WireGuard.ImportFile}" />
+                        Content="{loc:Tr Proxy.WireGuard.ImportFile}"
+                        IsVisible="{Binding IsWireGuard}" />
               </Grid>
               <TextBlock Classes="FieldHint" Margin="0" Text="{Binding ImportMessage}" TextWrapping="Wrap"
                          IsVisible="{Binding ImportMessage, Converter={x:Static ObjectConverters.IsNotNull}}" />
@@ -113,6 +118,27 @@
           <StackPanel Spacing="2" IsVisible="{Binding IsHttps}">
             <CheckBox IsChecked="{Binding AllowInvalidCertificate}" Content="{loc:Tr Proxy.AllowInvalidCertificate}" />
             <TextBlock Classes="FieldHint" Margin="28,0,0,0" Text="{loc:Tr Proxy.AllowInvalidCertificateHint}" />
+          </StackPanel>
+
+          <!-- Agent: the pinned key, and the token that authorises this client. -->
+          <StackPanel Spacing="14" IsVisible="{Binding IsAgent}">
+            <StackPanel>
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Agent.Fingerprint}" />
+              <TextBox Text="{Binding Fingerprint}" Classes="Mono"
+                       PlaceholderText="{loc:Tr Proxy.Agent.FingerprintPlaceholder}"
+                       Classes.Invalid="{Binding HasFingerprintError}"
+                       AutomationProperties.Name="{loc:Tr Proxy.Agent.Fingerprint}" />
+              <TextBlock Classes="FieldError" Text="{Binding FingerprintError}" IsVisible="{Binding HasFingerprintError}" />
+              <TextBlock Classes="FieldHint" Text="{loc:Tr Proxy.Agent.FingerprintHint}" TextWrapping="Wrap" />
+            </StackPanel>
+            <StackPanel>
+              <TextBlock Classes="FieldLabel" Text="{loc:Tr Proxy.Agent.Token}" />
+              <TextBox Text="{Binding Token}" PasswordChar="•" Classes="Mono"
+                       PlaceholderText="{Binding TokenPlaceholder}"
+                       Classes.Invalid="{Binding HasTokenError}"
+                       AutomationProperties.Name="{loc:Tr Proxy.Agent.Token}" />
+              <TextBlock Classes="FieldError" Text="{Binding TokenError}" IsVisible="{Binding HasTokenError}" />
+            </StackPanel>
           </StackPanel>
 
           <!-- WireGuard -->

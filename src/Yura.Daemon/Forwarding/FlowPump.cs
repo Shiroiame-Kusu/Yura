@@ -43,7 +43,7 @@ internal static class FlowPump
         }
         finally
         {
-            upstream.ShutdownSend();
+            await upstream.ShutdownSendAsync().ConfigureAwait(false);
         }
     }
 

@@ -259,6 +259,31 @@ public sealed class CgroupManager
     }
 
     /// <summary>
+    /// Writes a pid into an existing group and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// For the exec fast path, which runs on the kernel's event thread and is racing the
+    /// process's first socket: a socket's cgroup is fixed when it is created, so anything this
+    /// does not finish in time is a connection that leaves on the wrong route. One write, no
+    /// directory creation, no <c>/proc</c> reads, no log line. The ordinary path runs a moment
+    /// later and records everything properly.
+    /// </remarks>
+    public bool MoveFast(string groupName, int pid)
+    {
+        try
+        {
+            File.WriteAllText($"{PathFor(groupName)}/cgroup.procs", pid.ToString(CultureInfo.InvariantCulture));
+            return true;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            // ESRCH is the ordinary case: a program that lived for a millisecond. Nothing to
+            // report, and the ordinary path will find it gone too.
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Moves a process back to where it was before Yura touched it, falling back to the
     /// root cgroup if that place no longer exists.
     /// </summary>

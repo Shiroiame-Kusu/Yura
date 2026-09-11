@@ -26,6 +26,25 @@ public sealed record TunnelRow(TunnelStatus Status)
         : Status.Failure ?? Loc.Current["Common.Unknown"];
 }
 
+/// <summary>One Yura agent exit as the daemon reports it.</summary>
+public sealed record AgentRow(AgentStatus Status)
+{
+    public string Name => Status.Name;
+
+    public bool Up => Status.Connected;
+
+    public string StateDisplay => Loc.Current[Status.Connected ? "Diagnostics.Ok" : "Diagnostics.Failed"];
+
+    /// <summary>The agent, its distance, what it carries and what it resolves with, in one line.</summary>
+    public string Summary => Status.Connected
+        ? string.Create(CultureInfo.InvariantCulture,
+            $"{Status.AgentName ?? Status.Name} {Status.AgentVersion}; " +
+            $"round trip {(Status.RoundTripMilliseconds is { } ms ? $"{ms:0.#} ms" : "not measured")}; " +
+            $"{(Status.Udp ? "udp carried" : "no udp")}" +
+            $"{(Status.Resolver is { Length: > 0 } dns ? $"; dns {dns}" : string.Empty)}")
+        : Status.Failure ?? Loc.Current["Common.Unknown"];
+}
+
 /// <summary>One environment check the daemon ran, with its outcome.</summary>
 public sealed record CheckRow(string Name, bool Passed, string? Detail)
 {
@@ -64,6 +83,10 @@ public sealed partial class DiagnosticsPageViewModel : ObservableObject, IDispos
     public ObservableCollection<TunnelRow> Tunnels { get; } = [];
 
     public bool HasTunnels => Tunnels.Count > 0;
+
+    public ObservableCollection<AgentRow> Agents { get; } = [];
+
+    public bool HasAgents => Agents.Count > 0;
 
     public ObservableCollection<string> Log { get; } = [];
 
@@ -159,6 +182,12 @@ public sealed partial class DiagnosticsPageViewModel : ObservableObject, IDispos
                 Tunnels.Add(new TunnelRow(tunnel));
             }
 
+            Agents.Clear();
+            foreach (var agent in Status?.Agents ?? [])
+            {
+                Agents.Add(new AgentRow(agent));
+            }
+
             var log = await _daemon.GetLogAsync(200).ConfigureAwait(true);
             Log.Clear();
             foreach (var line in log)
@@ -230,6 +259,16 @@ public sealed partial class DiagnosticsPageViewModel : ObservableObject, IDispos
             }
         }
 
+        if (Agents.Count > 0)
+        {
+            report.AppendLine();
+            report.AppendLine("## Yura agents");
+            foreach (var agent in Agents)
+            {
+                report.AppendLine(CultureInfo.InvariantCulture, $"{agent.Name}: {agent.Summary}");
+            }
+        }
+
         if (Ruleset is { Length: > 0 })
         {
             report.AppendLine();
@@ -267,6 +306,7 @@ public sealed partial class DiagnosticsPageViewModel : ObservableObject, IDispos
         OnPropertyChanged(nameof(AllowedUidsDisplay));
         OnPropertyChanged(nameof(HasFailedChecks));
         OnPropertyChanged(nameof(HasTunnels));
+        OnPropertyChanged(nameof(HasAgents));
     }
 
     public void Dispose() => _timer.Stop();

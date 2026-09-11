@@ -4,6 +4,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using Yura.Core.Agent;
 using Yura.Core.Proxies;
 using Yura.Daemon.Linux;
 
@@ -19,6 +20,27 @@ public sealed class ProxyHandshakeException(string message) : Exception(message)
 public sealed record ProxyHop(ProxyEndpoint Endpoint, string? Password, WireGuardTunnel? Tunnel = null)
 {
     public bool IsTunnel => Tunnel is not null;
+
+    public bool IsAgent => Endpoint.Protocol == ProxyProtocol.YuraAgent;
+}
+
+/// <summary>How the end of the application's data can be signalled towards the destination.</summary>
+public enum UpstreamHalfClose
+{
+    /// <summary>A plain socket: shut down the sending half.</summary>
+    Socket,
+
+    /// <summary>
+    /// A TLS 1.3 connection to something that will pass the signal on — a Yura agent, which
+    /// half-closes the destination when it sees <c>close_notify</c> and keeps answering.
+    /// </summary>
+    Tls,
+
+    /// <summary>
+    /// Nothing can be signalled. A proxy reached over TLS is the case: ending the TLS session
+    /// would end the tunnel in both directions, so the far end is left to close on its own.
+    /// </summary>
+    None,
 }
 
 /// <summary>
@@ -27,36 +49,55 @@ public sealed record ProxyHop(ProxyEndpoint Endpoint, string? Password, WireGuar
 /// </summary>
 public sealed class UpstreamLeg : IAsyncDisposable
 {
-    public UpstreamLeg(Socket socket, Stream stream, bool isTls)
+    public UpstreamLeg(Socket socket, Stream stream, UpstreamHalfClose halfClose)
     {
         Socket = socket;
         Stream = stream;
-        IsTls = isTls;
+        HalfClose = halfClose;
     }
 
     public Socket Socket { get; }
 
     public Stream Stream { get; }
 
-    public bool IsTls { get; }
+    public UpstreamHalfClose HalfClose { get; }
 
     /// <summary>
-    /// Signals EOF towards the destination. A plain socket can half-close; a TLS stream
-    /// cannot without ending the session, so the far side is left to close on its own.
+    /// Signals EOF towards the destination, by whichever means this leg has.
     /// </summary>
-    public void ShutdownSend()
+    /// <remarks>
+    /// It matters for any protocol where one side says everything and then waits: without it
+    /// the destination waits for more that will never come. Which means are available depends
+    /// on what is between here and there, so the leg records that when it is built rather than
+    /// guessing here.
+    /// </remarks>
+    public async ValueTask ShutdownSendAsync()
     {
-        if (IsTls)
+        switch (HalfClose)
         {
-            return;
-        }
+            case UpstreamHalfClose.Socket:
+                try
+                {
+                    Socket.Shutdown(SocketShutdown.Send);
+                }
+                catch (Exception e) when (e is SocketException or ObjectDisposedException)
+                {
+                }
 
-        try
-        {
-            Socket.Shutdown(SocketShutdown.Send);
-        }
-        catch (Exception e) when (e is SocketException or ObjectDisposedException)
-        {
+                break;
+
+            case UpstreamHalfClose.Tls when Stream is SslStream tls:
+                try
+                {
+                    // close_notify only: the connection stays open for the other direction.
+                    await tls.ShutdownAsync().ConfigureAwait(false);
+                }
+                catch (Exception e) when (e is IOException or ObjectDisposedException
+                                             or InvalidOperationException or SocketException)
+                {
+                }
+
+                break;
         }
     }
 
@@ -129,7 +170,7 @@ public static class ProxyDialer
         }
 
         Stream stream = new NetworkStream(socket, ownsSocket: false);
-        var isTls = false;
+        var halfClose = UpstreamHalfClose.Socket;
 
         try
         {
@@ -142,10 +183,19 @@ public static class ProxyDialer
                         $"'{hop.Endpoint.Name}' is a WireGuard exit and can only be the first hop of a chain.");
                 }
 
-                if (hop.Endpoint.Protocol == ProxyProtocol.Https)
+                switch (hop.Endpoint.Protocol)
                 {
-                    stream = await WrapTlsAsync(stream, hop.Endpoint, ct).ConfigureAwait(false);
-                    isTls = true;
+                    case ProxyProtocol.Https:
+                        stream = await WrapTlsAsync(stream, hop.Endpoint, ct).ConfigureAwait(false);
+                        halfClose = UpstreamHalfClose.None;
+                        break;
+
+                    case ProxyProtocol.YuraAgent:
+                        // The agent authenticates over whatever stream reaches it, so an agent
+                        // is a hop like any other rather than a special first one.
+                        stream = await AgentHandshakeAsync(stream, hop, ct).ConfigureAwait(false);
+                        halfClose = UpstreamHalfClose.Tls;
+                        break;
                 }
 
                 var (targetHost, targetPort) = i + 1 < hops.Count
@@ -162,7 +212,53 @@ public static class ProxyDialer
             throw;
         }
 
-        return new UpstreamLeg(socket, stream, isTls);
+        return new UpstreamLeg(socket, stream, halfClose);
+    }
+
+    /// <summary>The options for talking to one agent, from the endpoint and the token.</summary>
+    /// <remarks>
+    /// The token and the pinned key are the whole of an agent exit's security, so a missing one
+    /// is refused here with something the user can act on rather than becoming a handshake
+    /// failure further in.
+    /// </remarks>
+    public static AgentClientOptions AgentOptionsFor(ProxyHop hop, Action<Socket>? configureSocket = null)
+    {
+        if (hop.Endpoint.Agent is not { } settings || settings.Fingerprint.Length == 0)
+        {
+            throw new ProxyHandshakeException(
+                $"Agent exit '{hop.Endpoint.Name}' has no key fingerprint. Add it again from the agent's connect string.");
+        }
+
+        if (hop.Password is not { Length: > 0 } token)
+        {
+            throw new ProxyHandshakeException(
+                $"Agent exit '{hop.Endpoint.Name}' has no token. Add it again from the agent's connect string.");
+        }
+
+        return new AgentClientOptions
+        {
+            Host = hop.Endpoint.Host,
+            Port = hop.Endpoint.Port,
+            Token = token,
+            Fingerprint = settings.Fingerprint,
+            Label = $"yura-daemon/{typeof(ProxyDialer).Assembly.GetName().Version?.ToString(3) ?? "0"}",
+            ConfigureSocket = configureSocket,
+        };
+    }
+
+    private static async Task<Stream> AgentHandshakeAsync(Stream inner, ProxyHop hop, CancellationToken ct)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(HandshakeTimeout);
+        try
+        {
+            return await AgentClient.HandshakeAsync(
+                inner, AgentOptionsFor(hop), AgentRole.Stream, timeout.Token).ConfigureAwait(false);
+        }
+        catch (AgentProtocolException e)
+        {
+            throw new ProxyHandshakeException($"Agent exit '{hop.Endpoint.Name}': {e.Message}");
+        }
     }
 
     /// <summary>A plain connection to the destination, still bypass-marked so it is not re-captured.</summary>
@@ -183,7 +279,7 @@ public static class ProxyDialer
             throw;
         }
 
-        return new UpstreamLeg(socket, new NetworkStream(socket, ownsSocket: false), isTls: false);
+        return new UpstreamLeg(socket, new NetworkStream(socket, ownsSocket: false), UpstreamHalfClose.Socket);
     }
 
     /// <summary>
@@ -293,6 +389,22 @@ public static class ProxyDialer
             case ProxyProtocol.Https:
                 await HttpConnectAsync(stream, hop.Endpoint.Username, hop.Password, targetHost, targetPort, timeout.Token)
                     .ConfigureAwait(false);
+                break;
+            case ProxyProtocol.YuraAgent:
+                try
+                {
+                    await AgentClient.JoinAsync(stream, new AgentAddress(targetHost, (ushort)targetPort), timeout.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (AgentRefusedException e)
+                {
+                    throw new ProxyHandshakeException(e.Message);
+                }
+                catch (AgentProtocolException e)
+                {
+                    throw new ProxyHandshakeException($"Agent exit '{hop.Endpoint.Name}': {e.Message}");
+                }
+
                 break;
             default:
                 throw new ProxyHandshakeException($"{hop.Endpoint.Protocol} is not a supported proxy protocol.");

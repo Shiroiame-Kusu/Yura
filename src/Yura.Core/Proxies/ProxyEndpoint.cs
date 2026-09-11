@@ -23,6 +23,13 @@ public enum ProxyProtocol
     /// machine never sees the tunnel and nothing else is routed through it.
     /// </summary>
     WireGuard,
+
+    /// <summary>
+    /// A Yura agent: Yura's own server-side relay, reached over TLS with a pinned key and a
+    /// shared token. The one exit kind Yura provides both halves of, which is what lets it
+    /// carry UDP as a first-class transport and report the latency from the agent onwards.
+    /// </summary>
+    YuraAgent,
 }
 
 /// <summary>
@@ -102,6 +109,24 @@ public sealed record WireGuardSettings
     public string? PresharedKeyRef { get; init; }
 }
 
+/// <summary>
+/// The non-secret half of a Yura agent exit.
+/// </summary>
+/// <remarks>
+/// The token is a secret and lives in the secret store, referenced like a proxy password. The
+/// fingerprint is not a secret — it is the agent's public key, and pinning it is what removes
+/// the need for a certificate authority — so it belongs in the configuration file, where the
+/// user can compare it against what the agent printed.
+/// </remarks>
+public sealed record AgentSettings
+{
+    /// <summary>SHA-256 of the agent's SubjectPublicKeyInfo, base64url.</summary>
+    public required string Fingerprint { get; init; }
+
+    /// <summary>What the agent called itself, kept for display when it differs from the exit's name.</summary>
+    public string? AgentLabel { get; init; }
+}
+
 /// <summary>An exit the user has added. Credentials are referenced, never stored inline.</summary>
 public sealed record ProxyEndpoint
 {
@@ -137,16 +162,27 @@ public sealed record ProxyEndpoint
     /// <summary>Present exactly when <see cref="Protocol"/> is <see cref="ProxyProtocol.WireGuard"/>.</summary>
     public WireGuardSettings? WireGuard { get; init; }
 
+    /// <summary>Present exactly when <see cref="Protocol"/> is <see cref="ProxyProtocol.YuraAgent"/>.</summary>
+    public AgentSettings? Agent { get; init; }
+
     /// <summary>Last measured state. Null until a probe has been run.</summary>
     public ProxyProbeResult? LastProbe { get; init; }
 
     public bool IsWireGuard => Protocol == ProxyProtocol.WireGuard;
+
+    public bool IsAgent => Protocol == ProxyProtocol.YuraAgent;
 
     /// <summary>
     /// UDP support as currently known. HTTP proxies are structurally incapable of relaying
     /// UDP, and a WireGuard tunnel carries IP and so cannot tell one transport from another;
     /// those are the two cases we may assert without probing.
     /// </summary>
+    /// <remarks>
+    /// An agent is deliberately not one of them. Its protocol always has a datagram channel,
+    /// but the agent can be run with UDP off and the path to it can block UDP while passing
+    /// TCP, so the honest answer comes from the probe — which establishes it with a real
+    /// datagram round trip — and is "not measured" until then.
+    /// </remarks>
     public CapabilityState UdpSupport => Protocol switch
     {
         ProxyProtocol.Http or ProxyProtocol.Https => CapabilityState.Unsupported,
@@ -168,6 +204,7 @@ public sealed record ProxyEndpoint
         ProxyProtocol.Http => "HTTP",
         ProxyProtocol.Https => "HTTPS",
         ProxyProtocol.WireGuard => "WireGuard",
+        ProxyProtocol.YuraAgent => "Yura agent",
         _ => Protocol.ToString(),
     };
 

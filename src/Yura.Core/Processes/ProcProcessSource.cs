@@ -83,6 +83,7 @@ public sealed class ProcProcessSource
         var (exePath, pathState) = ResolveExecutable(root);
         var commandLine = ReadCommandLine(root);
         var comm = ReadTextOrNull($"{root}/comm")?.Trim() ?? stat.Comm;
+        var environment = ReadEnvironment(root);
 
         return new ProcessSnapshot
         {
@@ -100,7 +101,8 @@ public sealed class ProcProcessSource
             UserName = ResolveUserName(uid),
             CommandLine = commandLine,
             CgroupPath = ReadCgroupPath(root),
-            Wine = DetectWine(root, commandLine, exePath),
+            Wine = DetectWine(commandLine, exePath, environment),
+            SteamAppId = environment.SteamAppId,
             ConnectionCount = null, // Filled in by the daemon, which owns socket ownership.
         };
     }
@@ -252,7 +254,8 @@ public sealed class ProcProcessSource
     /// run the same handful of runtime binaries. Rules keyed on the runtime path alone would
     /// capture unrelated games, which the specification explicitly forbids.
     /// </remarks>
-    private static WineContext? DetectWine(string root, IReadOnlyList<string> commandLine, string? exePath)
+    private static WineContext? DetectWine(
+        IReadOnlyList<string> commandLine, string? exePath, ProcessEnvironment environment)
     {
         var looksLikeWine =
             (exePath is not null && WineRuntimeNames.Contains(Path.GetFileName(exePath), StringComparer.Ordinal)) ||
@@ -264,31 +267,7 @@ public sealed class ProcProcessSource
         }
 
         var target = commandLine.FirstOrDefault(a => a.EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
-
-        string? prefix = null;
-        string? steamAppId = null;
-
-        // /proc/[pid]/environ is readable only for our own processes. That is fine: the
-        // fields it provides are refinements, and their absence is recorded as "unknown"
-        // rather than guessed.
-        var environ = ReadTextOrNull($"{root}/environ");
-        if (environ is not null)
-        {
-            foreach (var entry in environ.Split('\0', StringSplitOptions.RemoveEmptyEntries))
-            {
-                if (entry.StartsWith("WINEPREFIX=", StringComparison.Ordinal))
-                {
-                    prefix = entry["WINEPREFIX=".Length..];
-                }
-                else if (entry.StartsWith("SteamAppId=", StringComparison.Ordinal) ||
-                         entry.StartsWith("SteamGameId=", StringComparison.Ordinal))
-                {
-                    steamAppId ??= entry[(entry.IndexOf('=', StringComparison.Ordinal) + 1)..];
-                }
-            }
-        }
-
-        if (target is null && prefix is null && steamAppId is null)
+        if (target is null && environment.WinePrefix is null)
         {
             return null;
         }
@@ -296,9 +275,55 @@ public sealed class ProcProcessSource
         return new WineContext
         {
             TargetExecutable = target,
-            Prefix = prefix,
-            SteamAppId = steamAppId,
+            Prefix = environment.WinePrefix,
         };
+    }
+
+    // -- environment ---------------------------------------------------------
+
+    /// <summary>The few environment variables that identify what a process is running.</summary>
+    private readonly record struct ProcessEnvironment(string? WinePrefix, string? SteamAppId);
+
+    /// <summary>
+    /// Reads the environment of one process, for the two variables that identify a game.
+    /// </summary>
+    /// <remarks>
+    /// <c>/proc/[pid]/environ</c> is readable only for our own processes, which is exactly the
+    /// set that matters: a game the user launched runs as the user. Everything else reads as
+    /// unknown rather than being guessed at. Read for every process rather than only
+    /// Wine-looking ones, because Steam sets <c>SteamAppId</c> for native Linux games as well,
+    /// and those look like any other binary.
+    /// </remarks>
+    private static ProcessEnvironment ReadEnvironment(string root)
+    {
+        var environ = ReadTextOrNull($"{root}/environ");
+        if (environ is null)
+        {
+            return default;
+        }
+
+        string? prefix = null;
+        string? steamAppId = null;
+        foreach (var entry in environ.Split('\0', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (entry.StartsWith("WINEPREFIX=", StringComparison.Ordinal))
+            {
+                prefix = entry["WINEPREFIX=".Length..];
+            }
+            else if (entry.StartsWith("SteamAppId=", StringComparison.Ordinal) ||
+                     entry.StartsWith("SteamGameId=", StringComparison.Ordinal))
+            {
+                // Steam sets both; SteamAppId is the one that names the game, and a zero from
+                // SteamGameId for a non-game process must not be taken for an app id.
+                var value = entry[(entry.IndexOf('=', StringComparison.Ordinal) + 1)..];
+                if (value is { Length: > 0 } && value != "0")
+                {
+                    steamAppId ??= value;
+                }
+            }
+        }
+
+        return new ProcessEnvironment(prefix, steamAppId);
     }
 
     // -- users ---------------------------------------------------------------

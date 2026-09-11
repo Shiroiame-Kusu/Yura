@@ -42,6 +42,25 @@ MARK_WG="YURA-VIA-WIREGUARD"
 MARK_UDP_WG="YURA-UDP-VIA-WIREGUARD"
 MARK_WG_SOCKS="YURA-VIA-WG-THEN-SOCKS"
 
+# The Yura agent lives in a namespace of its own too, for the same reason: the marker it
+# reaches exists nowhere else, so receiving that marker proves the flow went through it.
+AGENT="${ROOT}/src/Yura.Agent/bin/Debug/net10.0/yura-agent"
+AG_NS="yura-agentns"
+AG_VETH_H="yuraacc3"
+AG_VETH_N="yuraacc4"
+AG_HOST_ADDR="10.78.1.1"
+AG_ADDR="10.78.1.2"
+AG_PORT=7311
+AG_ID="eeee5000-0000-4000-8000-000000000050"
+AG_BAD_ID="eeee5000-0000-4000-8000-000000000051"
+AG_SOCKS_ID="dddd5000-0000-4000-8000-0000000000d5"
+AG_CHAIN_ID="cccc5000-0000-4000-8000-0000000000c5"
+AG_CHAIN_MID_ID="cccc5000-0000-4000-8000-0000000000c6"
+AG_RESOLVER="127.0.0.53"
+MARK_AGENT="YURA-VIA-AGENT"
+MARK_UDP_AGENT="YURA-UDP-VIA-AGENT"
+MARK_AGENT_SOCKS="YURA-VIA-AGENT-THEN-SOCKS"
+
 KEEP=0
 [[ "${1:-}" == "--keep" ]] && KEEP=1
 
@@ -145,6 +164,10 @@ cleanup() {
   ip netns pids "$WG_NS" 2>/dev/null | xargs -r kill -9 2>/dev/null
   ip netns del "$WG_NS" 2>/dev/null
   ip link del "$WG_VETH_H" 2>/dev/null
+  ip netns pids "$AG_NS" 2>/dev/null | xargs -r kill -9 2>/dev/null
+  ip netns del "$AG_NS" 2>/dev/null
+  ip link del "$AG_VETH_H" 2>/dev/null
+  rm -rf "/etc/netns/${AG_NS}" 2>/dev/null
   for l in $(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | grep '^yura-wg'); do ip link del "$l" 2>/dev/null; done
   for fam in -4 -6; do
     for p in $(ip $fam rule show 2>/dev/null | awk -F: '$1>=7300 && $1<=7555 {print $1}'); do ip $fam rule del priority "$p" 2>/dev/null; done
@@ -166,6 +189,7 @@ trap cleanup EXIT
 step "Preflight"
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
 [[ -x "$DAEMON" ]] || { echo "daemon not built: $DAEMON (run: dotnet build src/Yura.Daemon)" >&2; exit 1; }
+[[ -x "$AGENT" ]] || { echo "agent not built: $AGENT (run: dotnet build src/Yura.Agent)" >&2; exit 1; }
 for t in nft ip python3 setpriv wg; do command -v "$t" >/dev/null || { echo "missing $t" >&2; exit 1; }; done
 if systemctl is-active --quiet yura-daemon 2>/dev/null; then
   echo "the installed yura-daemon service is running and owns $SOCK; stop it first: sudo systemctl stop yura-daemon" >&2
@@ -553,6 +577,101 @@ for needle in ('chain classify','chain capture','ip rule show','process groups')
 print('ruleset, routing and group membership all reported')\""
 
 # ---------------------------------------------------------------------------
+step "A program that connects the instant it starts, and what cannot be captured"
+# Two things a rule has to get right before any of the above matters. A socket's cgroup is
+# fixed when it is created, so a program must be classified before it opens one — and whatever
+# Yura cannot capture must not quietly leave anyway.
+FAST_APP="$RUN/yura-fastconnect"
+cp /usr/bin/curl "$FAST_APP"
+SLOW_APP="$RUN/yura-slowconnect"
+cp /usr/bin/python3 "$SLOW_APP"
+RULE_F="aaaa9999-0000-4000-8000-000000000099"
+RULE_S="aaaa9999-0000-4000-8000-00000000009a"
+check "daemon applies a rule for a program that is not running yet" ctl apply-rule \
+  "$(exe_rule "$RULE_F" "fast connector via A" "$FAST_APP" proxy "\"$PROXY_A_ID\"" 130)"
+check "the rule's cgroup exists before the program does, so there is somewhere to put it" bash -c "
+  ls -d /sys/fs/cgroup/yura/*/ >/dev/null 2>&1 && echo \"groups: \$(ls -d /sys/fs/cgroup/yura/*/ | xargs -n1 basename | tr '\n' ' ')\""
+
+# The one that works: a program whose own start-up takes longer than the kernel's event takes
+# to arrive. Almost everything is in this class, games included.
+check "daemon applies a rule for an ordinary program" ctl apply-rule \
+  "$(exe_rule "$RULE_S" "slow connector via A" "$SLOW_APP" proxy "\"$PROXY_A_ID\"" 131)"
+cat > "$RUN/connect-once.py" <<'PY'
+import socket, sys
+s = socket.socket(); s.settimeout(3)
+try:
+    s.connect((sys.argv[1], int(sys.argv[2])))
+    s.sendall(b"GET /?slow=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    print(s.recv(4096).decode("latin-1", "replace"))
+except OSError as e:
+    print("failed:", e)
+finally:
+    s.close()
+PY
+for i in 1 2 3 4 5; do "$SLOW_APP" "$RUN/connect-once.py" "$UNREACHABLE" 8080 >> "$RUN/slow.out" 2>&1; done
+check "a program started after its rule is captured from its first connection" bash -c "
+  n=\$(grep -c '$MARK_A' '$RUN/slow.out')
+  [[ \$n -ge 4 ]] && echo \"\$n of 5 first connections went through proxy A\""
+check "the daemon counts the processes it classified at exec, so the mechanism is visible" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' status | python3 -c \"
+import json,sys
+n=json.load(sys.stdin)['status']['classifiedOnExec']
+assert n >= 1, n
+print(f'{n} process(es) were placed in a cgroup at exec, before they could open a socket')\""
+
+# And the one that does not: curl connects about two milliseconds after exec, which is inside
+# the window the kernel's notification needs. Measured rather than asserted, because closing
+# it needs the kernel to decide at socket creation — see docs/daemon-acceptance.md.
+T_F="$(date +%s.%N)"
+for i in 1 2 3 4 5 6 7 8; do
+  # It is expected to fail about as often as it succeeds; that is the measurement.
+  "$FAST_APP" -4 -s -o /dev/null --max-time 4 "http://${UNREACHABLE}:8080/?fast=$i" >/dev/null 2>&1 || true
+done
+FAST_SEEN=$(python3 -c "
+import json
+print(sum(1 for l in open('$RUN/marker-a.jsonl') if 'fast=' in (json.loads(l).get('request') or '')))")
+info "a program that connects ~2 ms after exec: ${FAST_SEEN} of 8 captured (see docs: needs a socket-creation hook)"
+check "whatever escaped is visible as not routed rather than reported as proxied" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' list-flows | python3 -c \"
+import json,sys
+fl=[f for f in json.load(sys.stdin)['flows'] if f.get('ruleId')=='$RULE_F']
+assert all(f['route'] in ('confirmedProxied','pending','confirmedDirect') for f in fl), fl
+print(f'{len(fl)} flow(s) recorded for it, none claiming a route it did not take')\""
+
+# IPv6 has no capture path yet: the listener takes 'tproxy ip' and the rule that loops a marked
+# packet back is an IPv4 rule. Marking IPv6 would change nothing about where it went, so it is
+# refused instead, and an application falls back to IPv4 — which is captured.
+# nodad, and a moment to settle: an address still being duplicate-checked cannot be a source.
+ip -6 addr add 2001:db8:acc::1/64 dev "$DUMMY_IF" nodad 2>/dev/null
+ip -6 route replace 2001:db8:acc::/64 dev "$DUMMY_IF" 2>/dev/null
+sleep 0.5
+cat > "$RUN/connect6.py" <<'PY'
+import socket, time
+time.sleep(0.3)   # long enough to be classified, as any real program is
+s = socket.socket(socket.AF_INET6); s.settimeout(2)
+try:
+    s.connect(("2001:db8:acc::2", 8080)); print("connected")
+except OSError as e:
+    print("refused:", e)
+finally:
+    s.close()
+PY
+check "IPv6 from a covered process is refused rather than sent out past its route" bash -c "
+  '$SLOW_APP' '$RUN/connect6.py' > '$RUN/v6.out' 2>&1
+  n=\$(nft list table inet yura | grep 'nfproto ipv6' | grep -oE 'packets [0-9]+' | awk '{s+=\$2} END {print s+0}')
+  [[ \$n -ge 1 ]] && echo \"\$n IPv6 packet(s) refused (\$(tr -d '\n' < '$RUN/v6.out')), so none left unrouted\""
+check "and the daemon says so among its checks, rather than leaving it to be discovered" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' status | python3 -c \"
+import json,sys
+c={x['name']:x for x in json.load(sys.stdin)['status']['checks']}
+a=c['Address families captured']
+assert 'IPv4' in a['detail'] and 'refused' in a['detail'], a
+print(a['detail'])\""
+ip -6 addr del 2001:db8:acc::1/64 dev "$DUMMY_IF" 2>/dev/null
+ctl remove-rule "{\"ruleId\":\"$RULE_F\"}" > /dev/null
+ctl remove-rule "{\"ruleId\":\"$RULE_S\"}" > /dev/null
+
+# ---------------------------------------------------------------------------
 step "WireGuard exit: a peer that exists only inside a network namespace"
 # The marker destination is an address that exists only inside the peer's namespace, and
 # the only path from the host into that namespace is the encrypted tunnel. Receiving the
@@ -699,6 +818,191 @@ print(r['error'])\"" || true
 ctl remove-rule "{\"ruleId\":\"$RULE_WGC\"}" > /dev/null
 ctl remove-rule "{\"ruleId\":\"$RULE_WG\"}" > /dev/null
 kill -9 "$CHAIN_WG_PID" "$WG_PID" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+step "Yura agent: a relay that is the only way to reach what it reaches"
+# Same proof as the WireGuard exit, and for the same reason. The marker destination exists
+# only inside the agent's namespace, so receiving the marker means the agent dialled it. The
+# agent's resolver is on its own loopback, which nothing outside the namespace can reach at
+# all, so an answered name lookup proves the resolver it advertised was actually used.
+ip netns add "$AG_NS"
+ip link add "$AG_VETH_H" type veth peer name "$AG_VETH_N"
+ip link set "$AG_VETH_N" netns "$AG_NS"
+ip addr add "${AG_HOST_ADDR}/30" dev "$AG_VETH_H"; ip link set "$AG_VETH_H" up
+ip -n "$AG_NS" addr add "${AG_ADDR}/30" dev "$AG_VETH_N"; ip -n "$AG_NS" link set "$AG_VETH_N" up
+ip -n "$AG_NS" link set lo up
+ip -n "$AG_NS" addr add "${UNREACHABLE}/32" dev lo
+# ip netns exec bind-mounts this over /etc/resolv.conf, which is where the agent reads the
+# resolver it offers its clients from.
+mkdir -p "/etc/netns/${AG_NS}"; printf 'nameserver %s\n' "$AG_RESOLVER" > "/etc/netns/${AG_NS}/resolv.conf"
+
+ip netns exec "$AG_NS" python3 "${LIB}/marker_server.py" --listen "$UNREACHABLE" --tcp-port 8080 --hold-port 8081 --udp-port 9090 \
+  --tcp-marker "$MARK_AGENT" --udp-marker "$MARK_UDP_AGENT" --log "$RUN/marker-agent.jsonl" > "$RUN/marker-agent.out" 2>&1 & BG+=($!)
+ip netns exec "$AG_NS" python3 "${LIB}/dns_server.py" --listen "$AG_RESOLVER" --port 53 --answer "$UNREACHABLE" \
+  --log "$RUN/dns-agent.jsonl" > "$RUN/dns-agent.out" 2>&1 & BG+=($!)
+# A SOCKS5 proxy reachable only through the agent, for the chain test.
+ip netns exec "$AG_NS" python3 "${LIB}/socks5_proxy.py" --listen "$UNREACHABLE" --port 11086 --log "$RUN/proxy-agent.jsonl" \
+  --rewrite "${UNREACHABLE}:8080=${UNREACHABLE}:8087" > "$RUN/proxy-agent.out" 2>&1 & BG+=($!)
+ip netns exec "$AG_NS" python3 "${LIB}/marker_server.py" --listen "$UNREACHABLE" --tcp-port 8087 --hold-port 8088 --udp-port 9097 \
+  --tcp-marker "$MARK_AGENT_SOCKS" --udp-marker unused --log "$RUN/marker-agent-socks.jsonl" > "$RUN/marker-agent-socks.out" 2>&1 & BG+=($!)
+
+AG_STATE="$RUN/agent-state"
+AG_CONNECT="$("$AGENT" init --state "$AG_STATE" --name acceptance-agent --host "$AG_ADDR" --port "$AG_PORT" | grep -o 'yura://[^[:space:]]*')"
+AG_TOKEN="$(python3 -c "import sys;s=sys.argv[1];print(s[len('yura://'):s.index('@')])" "$AG_CONNECT")"
+AG_FP="$(python3 -c "import sys;s=sys.argv[1];print(s.split('fp=')[1].split('&')[0])" "$AG_CONNECT")"
+# The default policy: the marker is in a documentation range and allowed; the resolver is on
+# loopback and allowed only because the agent offered it.
+ip netns exec "$AG_NS" "$AGENT" run --state "$AG_STATE" --listen "$AG_ADDR" --port "$AG_PORT" \
+  > "$RUN/agent.out" 2>&1 & AG_PID=$!; BG+=("$AG_PID")
+for _ in $(seq 1 40); do grep -q 'ready' "$RUN/agent.out" 2>/dev/null && break; sleep 0.25; done
+info "agent in netns ${AG_NS} at ${AG_ADDR}:${AG_PORT}; resolver ${AG_RESOLVER}; ${UNREACHABLE} exists only inside"
+
+agent_proxy_json() {  # id name token fingerprint
+  python3 -c "
+import json,sys
+print(json.dumps({'id':sys.argv[1],'name':sys.argv[2],'protocol':'yuraAgent','host':'$AG_ADDR','port':$AG_PORT,
+  'password':sys.argv[3],'agent':{'fingerprint':sys.argv[4]}}))" "$1" "$2" "$3" "$4"
+}
+AG_JSON="$(agent_proxy_json "$AG_ID" "Agent" "$AG_TOKEN" "$AG_FP")"
+AG_BAD_JSON="$(agent_proxy_json "$AG_BAD_ID" "Agent with a stale token" "$(python3 -c "print('A'*43)")" "$AG_FP")"
+AG_SOCKS_JSON="{\"id\":\"$AG_SOCKS_ID\",\"name\":\"SOCKS behind the agent\",\"protocol\":\"socks5\",\"host\":\"$UNREACHABLE\",\"port\":11086}"
+
+check "the agent prints one connect string that carries everything" bash -c "
+  python3 -c \"
+import sys
+s='$AG_CONNECT'
+assert s.startswith('yura://') and '@$AG_ADDR:$AG_PORT' in s and 'fp=' in s, s
+assert len('$AG_TOKEN') >= 43 and len('$AG_FP') >= 43, ('$AG_TOKEN','$AG_FP')
+print('connect string parsed: ' + s.replace('$AG_TOKEN','…'))\""
+check "daemon accepts the agent and says which one it could not reach" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' set-proxies '{\"proxies\":[$PROXY_A_JSON,$AG_JSON,$AG_BAD_JSON,$AG_SOCKS_JSON],\"chains\":[{\"id\":\"$AG_CHAIN_ID\",\"name\":\"agent then SOCKS\",\"hops\":[\"$AG_ID\",\"$AG_SOCKS_ID\"]},{\"id\":\"$AG_CHAIN_MID_ID\",\"name\":\"SOCKS then agent\",\"hops\":[\"$PROXY_A_ID\",\"$AG_ID\"]}]}' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)
+assert r['ok'], r
+w=r['apply']['warnings']
+bad=[x for x in w if 'stale token' in x]
+assert bad, w
+assert not any(\\\"'Agent'\\\" in x for x in w), w
+print('warned: ' + bad[0])\""
+check "status reports the agent, its distance and its resolver, and no token" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' status | python3 -c \"
+import json,sys
+raw=sys.stdin.read(); s=json.loads(raw)['status']
+a={x['name']:x for x in s['agents']}
+assert a['Agent']['connected'], a
+assert a['Agent']['agentName']=='acceptance-agent', a
+assert a['Agent']['udp'], a
+assert a['Agent']['resolver']=='$AG_RESOLVER', a
+assert a['Agent']['roundTripMilliseconds'] is not None, a
+assert not a['Agent with a stale token']['connected'], a
+assert 'token' in a['Agent with a stale token']['failure'].lower(), a
+assert '$AG_TOKEN' not in raw, 'the token leaked into status'
+print(f\\\"{a['Agent']['agentName']} {a['Agent']['agentVersion']} at {a['Agent']['roundTripMilliseconds']:.1f} ms, dns {a['Agent']['resolver']}\\\")\""
+check "the token never reaches either log" bash -c "
+  ! grep -q -- '$AG_TOKEN' '$RUN/daemon.log' && ! grep -q -- '$AG_TOKEN' '$RUN/agent.out' && echo 'no token in the daemon or agent log'"
+check "probing the agent proves the datagram path with a real round trip" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' probe-proxy '{\"proxy\":$AG_JSON}' | python3 -c \"
+import json,sys
+p=json.load(sys.stdin)['probe']
+assert p['reachable'], p
+assert p['udp']=='supported', p
+assert 'datagram round trip' in p['diagnostics'], p
+print(f\\\"handshake in {p['handshakeMilliseconds']:.0f} ms; {p['diagnostics']}\\\")\""
+check "probing with a token the agent does not know is refused, not merely slow" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' probe-proxy '{\"proxy\":$AG_BAD_JSON}' | python3 -c \"
+import json,sys
+p=json.load(sys.stdin)['probe']
+assert not p['reachable'], p
+assert 'token' in p['failureReason'].lower(), p
+print(p['failureReason'])\""
+
+AG_APP="$RUN/yura-agentapp"
+cp /usr/bin/python3 "$AG_APP"; chmod 755 "$AG_APP"
+AG_APP_PID="$(start_client_as "$AG_APP" agent --udp-target "${UNREACHABLE}:9090" --dns-query "game.example.net@${UNREACHABLE}:53")"; BG+=("$AG_APP_PID")
+RULE_AG="eeee5555-0000-4000-8000-000000000055"
+check "daemon applies a rule routing a process through the agent" ctl apply-rule "$(exe_rule "$RULE_AG" "agentapp via agent" "$AG_APP" proxy "\"$AG_ID\"" 121)"
+T_AG="$(date +%s.%N)"
+sleep 6
+check "TCP from the process arrives through the agent" lq assert "$RUN/client-agent.jsonl" --event tcp --since "$T_AG" --window 3 --min-count 2 --expect-ok true --expect-contains "$MARK_AGENT"
+check "UDP from the process arrives through the agent's datagram channel" lq assert "$RUN/client-agent.jsonl" --event udp --since "$T_AG" --window 3 --min-count 2 --expect-ok true --expect-contains "$MARK_UDP_AGENT"
+check "the far end sees the agent as the source, not this machine" bash -c "
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/marker-agent.jsonl' --event tcp_request --since $T_AG)
+  m=\$(python3 '$LIB/logquery.py' count '$RUN/marker-agent.jsonl' --event tcp_request --since $T_AG --where-contains client=$AG_HOST_ADDR)
+  [[ \$n -ge 2 && \$m -eq 0 ]] && echo \"\$n requests arrived, none of them from this machine's own address\""
+check "the datagrams arrive from inside the namespace too, not from this machine" bash -c "
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/marker-agent.jsonl' --event udp_request --since $T_AG)
+  m=\$(python3 '$LIB/logquery.py' count '$RUN/marker-agent.jsonl' --event udp_request --since $T_AG --where-contains client=$AG_HOST_ADDR)
+  [[ \$n -ge 2 && \$m -eq 0 ]] && echo \"\$n datagrams arrived, none of them from this machine's own address\""
+check "name lookups go to the resolver the agent offered, which nothing else can reach" bash -c "
+  ok=\$(python3 '$LIB/logquery.py' count '$RUN/client-agent.jsonl' --event dns --since $T_AG)
+  q=\$(python3 '$LIB/logquery.py' count '$RUN/dns-agent.jsonl' --event query --since $T_AG)
+  [[ \$ok -ge 2 && \$q -ge 2 ]] && echo \"\$ok answers received; \$q queries reached ${AG_RESOLVER}:53 inside the namespace\""
+check "the daemon reports the flows as confirmed through the agent" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' list-flows | python3 -c \"
+import json,sys
+fl=[f for f in json.load(sys.stdin)['flows'] if f.get('ruleId')=='$RULE_AG' and f['route']=='confirmedProxied']
+assert len(fl)>=3, len(fl)
+assert all(f['proxyName']=='Agent' for f in fl), fl[0]
+print(f'{len(fl)} confirmed flows via the agent, transports {sorted(set(f[\\\"protocol\\\"] for f in fl))}')\""
+check "a measurement through the agent reports both halves of the route" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' measure '{\"measure\":{\"host\":\"$UNREACHABLE\",\"port\":8080,\"proxyId\":\"$AG_ID\",\"samples\":3}}' | python3 -c \"
+import json,sys
+m=json.load(sys.stdin)['measurement']
+legs=m['legs']
+assert legs['agentName']=='acceptance-agent', legs
+assert legs['toAgentMilliseconds'] is not None and legs['fromAgentMilliseconds'] is not None, legs
+assert m['routed']['successes']>=1, m['routed']
+print(f\\\"routed {m['routed']['latencyMilliseconds']:.1f} ms = {legs['toAgentMilliseconds']:.1f} ms to the agent + {legs['fromAgentMilliseconds']:.1f} ms beyond it\\\")\""
+check "the agent refuses a private destination, and the refusal reaches the app" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' measure '{\"measure\":{\"host\":\"10.78.1.2\",\"port\":9,\"proxyId\":\"$AG_ID\",\"samples\":1}}' 2>/dev/null | python3 -c \"
+import json,sys
+m=json.load(sys.stdin)['measurement']
+assert m['routed']['successes']==0, m['routed']
+print('refused: ' + (m['legs']['failure'] or m['routed']['failureReason']))\""
+check "the agent's own stats account for what it carried" bash -c "
+  grep -q 'tcp to ${UNREACHABLE}:8080 open' '$RUN/agent.out' && echo 'the agent logged the flows it opened'"
+
+# Chains: an agent as the first hop, and as a later one — which a WireGuard exit cannot be.
+AG_CHAIN_APP="$RUN/yura-agentchainapp"
+cp /usr/bin/python3 "$AG_CHAIN_APP"; chmod 755 "$AG_CHAIN_APP"
+AG_CHAIN_PID="$(start_client_as "$AG_CHAIN_APP" agentchain)"; BG+=("$AG_CHAIN_PID")
+RULE_AGC="eeee6666-0000-4000-8000-000000000066"
+check "daemon applies a rule through the chain 'agent then SOCKS'" ctl apply-rule "$(exe_rule "$RULE_AGC" "chained through the agent" "$AG_CHAIN_APP" chain "\"$AG_CHAIN_ID\"" 122)"
+T_AGC="$(date +%s.%N)"
+sleep 6
+check "traffic reaches the proxy behind the agent and comes back with its marker" lq assert "$RUN/client-agentchain.jsonl" --event tcp --since "$T_AGC" --window 3 --min-count 2 --expect-ok true --expect-contains "$MARK_AGENT_SOCKS"
+check "the proxy behind the agent saw the agent dial it" bash -c "
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/proxy-agent.jsonl' --event connect --since $T_AGC)
+  [[ \$n -ge 2 ]] && echo \"\$n CONNECTs at the SOCKS proxy inside the namespace\""
+ctl remove-rule "{\"ruleId\":\"$RULE_AGC\"}" > /dev/null
+kill -9 "$AG_CHAIN_PID" 2>/dev/null || true
+
+AG_MID_APP="$RUN/yura-agentmidapp"
+cp /usr/bin/python3 "$AG_MID_APP"; chmod 755 "$AG_MID_APP"
+AG_MID_PID="$(start_client_as "$AG_MID_APP" agentmid)"; BG+=("$AG_MID_PID")
+RULE_AGM="eeee7777-0000-4000-8000-000000000077"
+check "an agent can be a later hop of a chain, which a WireGuard exit cannot" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' apply-rule '$(exe_rule "$RULE_AGM" "socks then agent" "$AG_MID_APP" chain "\"$AG_CHAIN_MID_ID\"" 123)' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)
+assert r['ok'], r
+print('applied: SOCKS then agent')\""
+T_AGM="$(date +%s.%N)"
+sleep 5
+check "and the flow arrives, having been authenticated over the first hop's connection" lq assert "$RUN/client-agentmid.jsonl" --event tcp --since "$T_AGM" --window 3 --min-count 2 --expect-ok true --expect-contains "$MARK_AGENT"
+ctl remove-rule "{\"ruleId\":\"$RULE_AGM\"}" > /dev/null
+ctl remove-rule "{\"ruleId\":\"$RULE_AG\"}" > /dev/null
+kill -9 "$AG_MID_PID" "$AG_APP_PID" 2>/dev/null || true
+
+# The agent going away is a state the daemon has to notice rather than discover mid-flow.
+kill -TERM "$AG_PID" 2>/dev/null || true
+sleep 2
+check "the daemon notices when the agent goes away" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' status | python3 -c \"
+import json,sys
+a={x['name']:x for x in json.load(sys.stdin)['status']['agents']}
+assert not a['Agent']['connected'], a
+print('agent reported down: ' + (a['Agent']['failure'] or 'no reason'))\""
 
 # ---------------------------------------------------------------------------
 step "Clean shutdown"

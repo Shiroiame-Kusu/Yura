@@ -61,6 +61,7 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
             ActiveGroups = status.ActiveGroups,
             Uptime = TimeSpan.FromSeconds(status.UptimeSeconds),
             ProcessWatcher = status.ProcessWatcher,
+            ClassifiedOnExec = status.ClassifiedOnExec,
             DnsPolicy = status.DnsPolicy,
             KernelRelease = status.KernelRelease,
             NftVersion = status.NftVersion,
@@ -70,6 +71,9 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
             Checks = status.Checks.Select(c => new DaemonCheck(c.Name, c.Passed, c.Detail)).ToArray(),
             Tunnels = status.Tunnels.Select(t => new TunnelStatus(
                 t.ProxyId, t.Name, t.Interface, t.Up, t.Failure, t.LatestHandshakeUtc, t.RxBytes, t.TxBytes, t.Endpoint)).ToArray(),
+            Agents = status.Agents.Select(a => new AgentStatus(
+                a.ProxyId, a.Name, a.Connected, a.AgentName, a.AgentVersion, a.RoundTripMilliseconds, a.Udp,
+                a.Resolver, a.Failure)).ToArray(),
         };
     }
 

@@ -3,8 +3,10 @@ using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
+using Yura.Core.Agent;
 using Yura.Core.Ipc;
 using Yura.Core.Proxies;
+using Yura.Daemon.Linux;
 
 namespace Yura.Daemon.Forwarding;
 
@@ -26,6 +28,11 @@ public static class ProxyProbe
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(Timeout);
         var token = timeout.Token;
+
+        if (endpoint.Protocol == ProxyProtocol.YuraAgent)
+        {
+            return await ProbeAgentAsync(endpoint, password, token).ConfigureAwait(false);
+        }
 
         IPAddress address;
         try
@@ -149,6 +156,81 @@ public static class ProxyProbe
             {
                 stream.Dispose();
             }
+        }
+    }
+
+    /// <summary>
+    /// Tests a Yura agent the way the forwarder uses it: a session of its own, then a datagram
+    /// round trip through it.
+    /// </summary>
+    /// <remarks>
+    /// A fresh session rather than the shared one, so what is reported is what a connection
+    /// made now would find — including a token that has been rotated at the agent since the
+    /// running session was established. UDP is established by a real datagram going to the
+    /// agent and coming back, never inferred from the protocol supporting it.
+    /// </remarks>
+    private static async Task<ProbeResultDto> ProbeAgentAsync(
+        ProxyEndpoint endpoint, string? token, CancellationToken ct)
+    {
+        AgentClientOptions options;
+        try
+        {
+            options = ProxyDialer.AgentOptionsFor(
+                new ProxyHop(endpoint, token), socket => socket.SetMark(PolicyRouting.BypassMark));
+        }
+        catch (ProxyHandshakeException e)
+        {
+            return new ProbeResultDto { Reachable = false, FailureReason = e.Message };
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
+            await using var session = await AgentSession.ConnectAsync(options, ct).ConfigureAwait(false);
+            var handshake = stopwatch.Elapsed.TotalMilliseconds;
+
+            var offered = session.Welcome.Available.HasFlag(AgentProtocol.Features.Udp);
+            var echo = offered ? await session.EchoAsync(ct).ConfigureAwait(false) : null;
+            var resolver = session.Welcome.Resolver is { Length: > 0 } text ? $", dns {text}" : string.Empty;
+
+            return new ProbeResultDto
+            {
+                Reachable = true,
+                HandshakeMilliseconds = handshake,
+                Udp = echo is not null ? CapabilityState.Supported : CapabilityState.Unsupported,
+                Diagnostics = $"Agent '{session.AgentName}' version {session.Welcome.AgentVersion}{resolver}. " +
+                              (echo is { } elapsed
+                                  ? $"A datagram round trip took {elapsed.TotalMilliseconds:0.#} ms."
+                                  : offered
+                                      ? "The agent offers UDP but no datagram came back, so something between here " +
+                                        "and it is dropping UDP."
+                                      : "The agent was started without UDP relaying."),
+            };
+        }
+        catch (AgentRefusedException e)
+        {
+            return new ProbeResultDto { Reachable = false, FailureReason = e.Message };
+        }
+        catch (AgentProtocolException e)
+        {
+            return new ProbeResultDto { Reachable = false, FailureReason = e.Message };
+        }
+        catch (Exception e) when (e is SocketException or IOException)
+        {
+            return new ProbeResultDto
+            {
+                Reachable = false,
+                FailureReason = $"Nothing is listening at {endpoint.Authority}, or it is blocked.",
+                Diagnostics = e.Message,
+            };
+        }
+        catch (OperationCanceledException)
+        {
+            return new ProbeResultDto
+            {
+                Reachable = false,
+                FailureReason = $"The agent at {endpoint.Authority} did not answer in time.",
+            };
         }
     }
 }

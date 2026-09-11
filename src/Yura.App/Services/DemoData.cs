@@ -76,10 +76,28 @@ internal static class DemoData
             },
         };
 
+        // A Yura agent: the token is in the secret store, so the endpoint carries only the
+        // pinned public key — exactly as a real one does.
+        var agent = new ProxyEndpoint
+        {
+            Id = Guid.Parse("aaaaaaaa-0000-4000-8000-000000000005"),
+            Name = "Frankfurt agent",
+            Protocol = ProxyProtocol.YuraAgent,
+            Host = "203.0.113.9",
+            Port = 7311,
+            PasswordRef = "aaaaaaaa-0000-4000-8000-000000000005",
+            Agent = new AgentSettings
+            {
+                Fingerprint = "qS3n8uG1xK0pZ7rJ4mW2cV5bT9hY6dL8aF1eR0sX4uY",
+                AgentLabel = "frankfurt-1",
+            },
+        };
+
         shell.Rules.Proxies.Add(socks);
         shell.Rules.Proxies.Add(v6);
         shell.Rules.Proxies.Add(http);
         shell.Rules.Proxies.Add(wireguard);
+        shell.Rules.Proxies.Add(agent);
 
         shell.Rules.Chains.Add(new ProxyChain
         {

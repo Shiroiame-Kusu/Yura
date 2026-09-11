@@ -7,11 +7,19 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Yura.App.Localization;
 using Yura.App.Services;
+using Yura.Core.Agent;
 using Yura.Core.Proxies;
 
 namespace Yura.App.ViewModels;
 
-/// <summary>One proxy in the list, with the live tunnel state when it is a WireGuard exit.</summary>
+/// <summary>
+/// One proxy in the list, with the live state of the exit when Yura runs one.
+/// </summary>
+/// <remarks>
+/// A WireGuard exit and a Yura agent are the two kinds Yura is on both ends of, so they are
+/// the two that can say more than "configured": whether the peer has answered, whether the
+/// session is up. An ordinary proxy has nothing to report until a flow uses it.
+/// </remarks>
 public sealed partial class ProxyRowViewModel : ObservableObject
 {
     public ProxyRowViewModel(ProxyEndpoint endpoint) => Endpoint = endpoint;
@@ -23,6 +31,10 @@ public sealed partial class ProxyRowViewModel : ObservableObject
     [ObservableProperty]
     public partial TunnelStatus? Tunnel { get; set; }
 
+    /// <summary>Null until the daemon has answered; an agent row then says what it knows.</summary>
+    [ObservableProperty]
+    public partial AgentStatus? Agent { get; set; }
+
     public Guid Id => Endpoint.Id;
 
     public string Name => Endpoint.Name;
@@ -33,12 +45,46 @@ public sealed partial class ProxyRowViewModel : ObservableObject
 
     public bool IsWireGuard => Endpoint.IsWireGuard;
 
-    public bool IsTunnelUp => Tunnel?.Up == true && Tunnel.LatestHandshakeUtc is not null;
+    public bool IsAgent => Endpoint.IsAgent;
 
-    public bool IsTunnelDown => Tunnel is { Up: false };
+    /// <summary>True for the exits that have a live state worth a line of their own.</summary>
+    public bool ShowState => IsWireGuard || IsAgent;
+
+    public bool IsExitUp => IsAgent
+        ? Agent is { Connected: true }
+        : Tunnel?.Up == true && Tunnel.LatestHandshakeUtc is not null;
+
+    public bool IsExitDown => IsAgent ? Agent is { Connected: false } : Tunnel is { Up: false };
+
+    /// <summary>The exit in one line: what it last did, or why it cannot.</summary>
+    public string StateText => IsAgent ? AgentText : TunnelText;
+
+    /// <summary>The agent session in one line.</summary>
+    private string AgentText
+    {
+        get
+        {
+            if (Agent is null)
+            {
+                return Loc.Current["Proxy.Agent.Unknown"];
+            }
+
+            if (!Agent.Connected)
+            {
+                return string.Format(CultureInfo.CurrentCulture, Loc.Current["Proxy.Agent.Down"], Agent.Failure);
+            }
+
+            var round = Agent.RoundTripMilliseconds is { } ms
+                ? string.Create(CultureInfo.CurrentCulture, $"{ms:0.#} ms")
+                : Loc.Current["Common.NotMeasured"];
+            return string.Format(CultureInfo.CurrentCulture, Loc.Current["Proxy.Agent.Up"],
+                Agent.AgentName ?? Agent.Name, round,
+                Loc.Current[Agent.Udp ? "Proxy.Agent.UdpYes" : "Proxy.Agent.UdpNo"]);
+        }
+    }
 
     /// <summary>The tunnel in one line: when the peer last answered, or why it cannot.</summary>
-    public string TunnelText
+    private string TunnelText
     {
         get
         {
@@ -82,9 +128,20 @@ public sealed partial class ProxyRowViewModel : ObservableObject
     public void UpdateTunnel(TunnelStatus? status)
     {
         Tunnel = status;
-        OnPropertyChanged(nameof(IsTunnelUp));
-        OnPropertyChanged(nameof(IsTunnelDown));
-        OnPropertyChanged(nameof(TunnelText));
+        RaiseState();
+    }
+
+    public void UpdateAgent(AgentStatus? status)
+    {
+        Agent = status;
+        RaiseState();
+    }
+
+    private void RaiseState()
+    {
+        OnPropertyChanged(nameof(IsExitUp));
+        OnPropertyChanged(nameof(IsExitDown));
+        OnPropertyChanged(nameof(StateText));
     }
 
     public void RaiseAll()
@@ -93,9 +150,9 @@ public sealed partial class ProxyRowViewModel : ObservableObject
         OnPropertyChanged(nameof(Authority));
         OnPropertyChanged(nameof(ProtocolDisplay));
         OnPropertyChanged(nameof(IsWireGuard));
-        OnPropertyChanged(nameof(IsTunnelUp));
-        OnPropertyChanged(nameof(IsTunnelDown));
-        OnPropertyChanged(nameof(TunnelText));
+        OnPropertyChanged(nameof(IsAgent));
+        OnPropertyChanged(nameof(ShowState));
+        RaiseState();
     }
 
     private static string FormatBytes(long bytes) => bytes switch
@@ -344,6 +401,13 @@ public sealed partial class ProxiesPageViewModel : ObservableObject, IDisposable
     }
 
     [RelayCommand]
+    private void AddAgent()
+    {
+        ClearSelection();
+        Editor.BeginAddAgent();
+    }
+
+    [RelayCommand]
     private void AddChain()
     {
         ClearSelection();
@@ -363,7 +427,7 @@ public sealed partial class ProxiesPageViewModel : ObservableObject, IDisposable
 
     private async Task RefreshTunnelsAsync()
     {
-        if (_tunnelRefreshInFlight || !Proxies.Any(p => p.IsWireGuard))
+        if (_tunnelRefreshInFlight || !Proxies.Any(p => p.ShowState))
         {
             return;
         }
@@ -373,19 +437,28 @@ public sealed partial class ProxiesPageViewModel : ObservableObject, IDisposable
         {
             if (_daemon.State != DaemonState.Connected)
             {
+                // Nothing is known rather than everything being down: the difference is what
+                // the row says, and guessing would be a claim about the exit.
                 foreach (var row in Proxies)
                 {
                     row.UpdateTunnel(null);
+                    row.UpdateAgent(null);
                 }
 
                 return;
             }
 
             var status = await _daemon.GetStatusAsync().ConfigureAwait(true);
-            var byId = (status?.Tunnels ?? []).ToDictionary(t => t.ProxyId);
+            var tunnels = (status?.Tunnels ?? []).ToDictionary(t => t.ProxyId);
+            var agents = (status?.Agents ?? []).ToDictionary(a => a.ProxyId);
             foreach (var row in Proxies.Where(r => r.IsWireGuard))
             {
-                row.UpdateTunnel(byId.GetValueOrDefault(row.Id));
+                row.UpdateTunnel(tunnels.GetValueOrDefault(row.Id));
+            }
+
+            foreach (var row in Proxies.Where(r => r.IsAgent))
+            {
+                row.UpdateAgent(agents.GetValueOrDefault(row.Id));
             }
         }
         finally
@@ -516,15 +589,16 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
     private bool _presharedAlreadyStored;
 
     /// <summary>
-    /// True when the endpoint being edited was already a WireGuard exit.
+    /// The protocol the endpoint had when the form opened.
     /// </summary>
     /// <remarks>
-    /// A saved secret only counts as a private key when it actually is one. Switching a SOCKS5
-    /// proxy to WireGuard would otherwise pass validation with the proxy's password standing in
-    /// for a key, and the daemon would then refuse the exit — the form saying valid while the
-    /// daemon says no is the worst of both.
+    /// A saved secret only counts when it is the right kind of secret. Switching a SOCKS5 proxy
+    /// to WireGuard would otherwise pass validation with the proxy's password standing in for a
+    /// private key, and to an agent with it standing in for a token; the daemon would then
+    /// refuse the exit, and a form that says valid while the daemon says no is the worst of
+    /// both.
     /// </remarks>
-    private bool _editingWasWireGuard;
+    private ProxyProtocol _editingProtocol = ProxyProtocol.Socks5;
 
     public ProxyEditorViewModel(RuleStore rules, IDaemonClient daemon, ISecretStore secrets)
     {
@@ -560,21 +634,45 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         : Loc.Current["Proxy.PrivateKeyPlaceholder"];
 
     /// <summary>True when a private key is already in the secret store for this exit.</summary>
-    private bool HasStoredPrivateKey => _passwordAlreadyStored && _editingWasWireGuard;
+    private bool HasStoredPrivateKey => _passwordAlreadyStored && SecretKindOf(_editingProtocol) == SecretKind.PrivateKey;
+
+    /// <summary>True when a token is already in the secret store for this exit.</summary>
+    private bool HasStoredToken => _passwordAlreadyStored && SecretKindOf(_editingProtocol) == SecretKind.Token;
+
+    /// <summary>What the one stored secret is, which is not the same thing for every protocol.</summary>
+    private enum SecretKind
+    {
+        Password,
+        PrivateKey,
+        Token,
+    }
+
+    private static SecretKind SecretKindOf(ProxyProtocol protocol) => protocol switch
+    {
+        ProxyProtocol.WireGuard => SecretKind.PrivateKey,
+        ProxyProtocol.YuraAgent => SecretKind.Token,
+        _ => SecretKind.Password,
+    };
 
     public string PresharedKeyPlaceholder => _presharedAlreadyStored
         ? Loc.Current["Proxy.SecretSaved"]
         : Loc.Current["Proxy.Optional"];
 
     public IReadOnlyList<ProxyProtocol> Protocols { get; } =
-        [ProxyProtocol.Socks5, ProxyProtocol.Http, ProxyProtocol.Https, ProxyProtocol.WireGuard];
+        [ProxyProtocol.Socks5, ProxyProtocol.Http, ProxyProtocol.Https, ProxyProtocol.WireGuard, ProxyProtocol.YuraAgent];
 
     [ObservableProperty]
     public partial bool IsOpen { get; set; }
 
-    public string Title => _isNew
-        ? Loc.Current[IsWireGuard ? "Proxy.Editor.TitleNewWireGuard" : "Proxy.Editor.TitleNew"]
-        : Loc.Current[IsWireGuard ? "Proxy.Editor.TitleEditWireGuard" : "Proxy.Editor.TitleEdit"];
+    public string Title => (_isNew, Protocol) switch
+    {
+        (true, ProxyProtocol.WireGuard) => Loc.Current["Proxy.Editor.TitleNewWireGuard"],
+        (true, ProxyProtocol.YuraAgent) => Loc.Current["Proxy.Editor.TitleNewAgent"],
+        (true, _) => Loc.Current["Proxy.Editor.TitleNew"],
+        (false, ProxyProtocol.WireGuard) => Loc.Current["Proxy.Editor.TitleEditWireGuard"],
+        (false, ProxyProtocol.YuraAgent) => Loc.Current["Proxy.Editor.TitleEditAgent"],
+        _ => Loc.Current["Proxy.Editor.TitleEdit"],
+    };
 
     [ObservableProperty]
     public partial string Name { get; set; } = string.Empty;
@@ -600,17 +698,38 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
     [ObservableProperty]
     public partial bool ShowAdvanced { get; set; }
 
+    // -- agent -------------------------------------------------------------------
+
+    public bool IsAgent => Protocol == ProxyProtocol.YuraAgent;
+
+    /// <summary>The agent's pinned public key, as printed beside its connect string.</summary>
+    [ObservableProperty]
+    public partial string Fingerprint { get; set; } = string.Empty;
+
+    /// <summary>The shared token. A secret: it goes to the secret store, never to the config file.</summary>
+    [ObservableProperty]
+    public partial string Token { get; set; } = string.Empty;
+
+    /// <summary>What the agent called itself, kept for display when the exit is named otherwise.</summary>
+    [ObservableProperty]
+    public partial string AgentLabel { get; set; } = string.Empty;
+
+    public string TokenPlaceholder => HasStoredToken
+        ? Loc.Current["Proxy.SecretSaved"]
+        : Loc.Current["Proxy.TokenPlaceholder"];
+
     // -- WireGuard ---------------------------------------------------------------
 
     public bool IsWireGuard => Protocol == ProxyProtocol.WireGuard;
 
     public bool IsHttps => Protocol == ProxyProtocol.Https;
 
-    public bool UsesCredentials => !IsWireGuard;
+    public bool UsesCredentials => !IsWireGuard && !IsAgent;
 
-    public string HostLabel => Loc.Current[IsWireGuard ? "Proxy.Endpoint" : "Proxy.Host"];
+    public string HostLabel => Loc.Current[IsWireGuard ? "Proxy.Endpoint" : IsAgent ? "Proxy.Agent.Address" : "Proxy.Host"];
 
-    public string HostPlaceholder => Loc.Current[IsWireGuard ? "Proxy.EndpointPlaceholder" : "Proxy.HostPlaceholder"];
+    public string HostPlaceholder =>
+        Loc.Current[IsWireGuard ? "Proxy.EndpointPlaceholder" : IsAgent ? "Proxy.Agent.AddressPlaceholder" : "Proxy.HostPlaceholder"];
 
     [ObservableProperty]
     public partial string PrivateKey { get; set; } = string.Empty;
@@ -785,6 +904,34 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         : int.TryParse(Keepalive.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var k) && k is >= 0 and <= 65535 ? null
         : Loc.Current["Proxy.Validation.Keepalive"];
 
+    public string? FingerprintError =>
+        !IsAgent || !_touched.Contains(nameof(Fingerprint)) ? null
+        : AgentConnection.IsValidFingerprint(Fingerprint) ? null
+        : Loc.Current["Proxy.Validation.Fingerprint"];
+
+    public string? TokenError
+    {
+        get
+        {
+            if (!IsAgent || !_touched.Contains(nameof(Token)))
+            {
+                return null;
+            }
+
+            if (Token.Trim().Length == 0)
+            {
+                // An empty box on an exit that already has one means "keep it".
+                return HasStoredToken ? null : Loc.Current["Proxy.Validation.TokenRequired"];
+            }
+
+            return AgentConnection.IsValidToken(Token) ? null : Loc.Current["Proxy.Validation.Token"];
+        }
+    }
+
+    public bool HasFingerprintError => FingerprintError is not null;
+
+    public bool HasTokenError => TokenError is not null;
+
     public bool HasNameError => NameError is not null;
 
     public bool HasHostError => HostError is not null;
@@ -815,7 +962,12 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         Host.Trim().Length > 0 &&
         (IPAddress.TryParse(Host.Trim(), out _) || Uri.CheckHostName(Host.Trim()) != UriHostNameType.Unknown) &&
         ushort.TryParse(Port.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var port) && port > 0 &&
-        (!IsWireGuard || IsWireGuardValid);
+        (!IsWireGuard || IsWireGuardValid) &&
+        (!IsAgent || IsAgentValid);
+
+    private bool IsAgentValid =>
+        AgentConnection.IsValidFingerprint(Fingerprint) &&
+        (AgentConnection.IsValidToken(Token) || (Token.Trim().Length == 0 && HasStoredToken));
 
     private bool IsWireGuardValid =>
         (WireGuardConfig.IsValidKey(PrivateKey) || (PrivateKey.Trim().Length == 0 && HasStoredPrivateKey)) &&
@@ -878,8 +1030,9 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         AllowInvalidCertificate = false;
         _passwordAlreadyStored = false;
         _presharedAlreadyStored = false;
-        _editingWasWireGuard = false;
+        _editingProtocol = ProxyProtocol.Socks5;
         ResetWireGuardFields();
+        ResetAgentFields();
         ShowAdvanced = false;
         ShowImport = false;
         IsConfirmingRemove = false;
@@ -901,6 +1054,23 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         RaiseEverything();
     }
 
+    /// <summary>
+    /// Opens the form ready for a Yura agent, straight to the box its connect string goes in.
+    /// </summary>
+    /// <remarks>
+    /// Adding an agent is one paste, which is the whole point of the connect string: four
+    /// fields typed by hand include a fingerprint, and a mistyped fingerprint fails in a way
+    /// that looks like a network problem.
+    /// </remarks>
+    public void BeginAddAgent()
+    {
+        BeginAdd();
+        Protocol = ProxyProtocol.YuraAgent;
+        ShowImport = true;
+        _touched.Clear();
+        RaiseEverything();
+    }
+
     public void BeginEdit(ProxyEndpoint endpoint)
     {
         _editingId = endpoint.Id;
@@ -914,8 +1084,15 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         Password = string.Empty; // Never round-trips through the UI.
         AllowInvalidCertificate = endpoint.AllowInvalidCertificate;
         _passwordAlreadyStored = endpoint.PasswordRef is not null;
-        _editingWasWireGuard = endpoint.IsWireGuard;
+        _editingProtocol = endpoint.Protocol;
         ResetWireGuardFields();
+        ResetAgentFields();
+        if (endpoint.Agent is { } agent)
+        {
+            Fingerprint = agent.Fingerprint;
+            AgentLabel = agent.AgentLabel ?? string.Empty;
+        }
+
         if (endpoint.WireGuard is { } wg)
         {
             PeerPublicKey = wg.PeerPublicKey;
@@ -934,6 +1111,13 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         ClearTest();
         IsOpen = true;
         RaiseEverything();
+    }
+
+    private void ResetAgentFields()
+    {
+        Fingerprint = string.Empty;
+        Token = string.Empty;
+        AgentLabel = string.Empty;
     }
 
     private void ResetWireGuardFields()
@@ -981,9 +1165,22 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         }
     }
 
-    /// <summary>Fills the form from a wg-quick configuration. Fields the file does not set are left alone.</summary>
+    /// <summary>
+    /// Fills the form from what was pasted: an agent's connect string, or a wg-quick
+    /// configuration. Fields the input does not set are left alone.
+    /// </summary>
+    /// <remarks>
+    /// One box for both, because the user's action is the same one — paste what the other end
+    /// gave me — and telling the two apart is a job for the code rather than for them.
+    /// </remarks>
     public void ApplyImport(string text)
     {
+        if (text.TrimStart().StartsWith(AgentConnection.Scheme, StringComparison.OrdinalIgnoreCase))
+        {
+            ApplyAgentConnectString(text);
+            return;
+        }
+
         var import = WireGuardConfig.Parse(text);
         if (!import.Recognised)
         {
@@ -1080,6 +1277,42 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         RaiseEverything();
     }
 
+    /// <summary>Fills the form from an agent's connect string, or says what is wrong with it.</summary>
+    private void ApplyAgentConnectString(string text)
+    {
+        if (!AgentConnection.TryParse(text, out var connection, out var problem))
+        {
+            ImportMessage = problem;
+            return;
+        }
+
+        Protocol = ProxyProtocol.YuraAgent;
+        Host = connection.Host;
+        Port = connection.Port.ToString(CultureInfo.InvariantCulture);
+        Fingerprint = connection.Fingerprint;
+        Token = connection.Token;
+        AgentLabel = connection.Name ?? string.Empty;
+
+        // The agent's own label is a sensible name, and the user can change it; an unnamed
+        // exit is the one thing this form cannot save.
+        if (Name.Trim().Length == 0 && connection.Name is { Length: > 0 } name)
+        {
+            Name = name;
+        }
+
+        foreach (var field in new[] { nameof(Name), nameof(Host), nameof(Port), nameof(Fingerprint), nameof(Token) })
+        {
+            _touched.Add(field);
+        }
+
+        ImportMessage = string.Format(CultureInfo.CurrentCulture, Loc.Current["Proxy.Agent.Imported"],
+            connection.Authority, connection.FingerprintDisplay);
+        // The token must not linger in a text box after it has been taken out of it.
+        ImportText = string.Empty;
+        RaiseValidation();
+        RaiseEverything();
+    }
+
     // -- actions -----------------------------------------------------------------
 
     [RelayCommand]
@@ -1113,7 +1346,8 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
 
             TestSucceeded = result.Reachable;
             TestResultText = result.Reachable
-                ? string.Format(CultureInfo.CurrentCulture, Loc.Current[IsWireGuard ? "Proxy.TestPassedTunnel" : "Proxy.TestPassed"],
+                ? string.Format(CultureInfo.CurrentCulture,
+                    Loc.Current[IsWireGuard ? "Proxy.TestPassedTunnel" : IsAgent ? "Proxy.TestPassedAgent" : "Proxy.TestPassed"],
                     result.HandshakeLatency?.TotalMilliseconds.ToString("0", CultureInfo.CurrentCulture) ?? "?")
                 : result.FailureReason ?? Loc.Current["Proxy.TestFailed"];
             TestDiagnostics = result.Diagnostics;
@@ -1132,7 +1366,7 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
     /// <summary>What was typed, or what is saved when nothing was typed.</summary>
     private async Task<ProxySecrets> CollectSecretsAsync(ProxyEndpoint endpoint, CancellationToken ct)
     {
-        var primary = IsWireGuard ? PrivateKey : Password;
+        var primary = PrimarySecret;
         var password = !string.IsNullOrEmpty(primary)
             ? primary.Trim()
             : await _secrets.GetAsync(endpoint.Id.ToString(), ct).ConfigureAwait(true);
@@ -1141,7 +1375,7 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         {
             preshared = !string.IsNullOrEmpty(PresharedKey)
                 ? PresharedKey.Trim()
-                : _presharedAlreadyStored && _editingWasWireGuard
+                : _presharedAlreadyStored && _editingProtocol == ProxyProtocol.WireGuard
                     ? await _secrets.GetAsync(PresharedReference(endpoint.Id), ct).ConfigureAwait(true)
                     : null;
         }
@@ -1150,6 +1384,16 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
     }
 
     public static string PresharedReference(Guid id) => $"{id}:psk";
+
+    /// <summary>
+    /// The one secret this endpoint has, whatever it is called for its protocol.
+    /// </summary>
+    private string PrimarySecret => Protocol switch
+    {
+        ProxyProtocol.WireGuard => PrivateKey,
+        ProxyProtocol.YuraAgent => Token,
+        _ => Password,
+    };
 
     [RelayCommand]
     private async Task SaveAsync()
@@ -1166,7 +1410,7 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
 
         // Secrets go to the secret store, never into the configuration file. An empty box on
         // an existing proxy means "keep what is saved", not "clear it".
-        var primary = IsWireGuard ? PrivateKey : Password;
+        var primary = PrimarySecret;
         if (!string.IsNullOrEmpty(primary))
         {
             await _secrets.SetAsync(endpoint.Id.ToString(), primary.Trim()).ConfigureAwait(true);
@@ -1190,6 +1434,7 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         PrivateKey = string.Empty;
         PresharedKey = string.Empty;
         Password = string.Empty;
+        Token = string.Empty;
         IsOpen = false;
         Saved?.Invoke(this, EventArgs.Empty);
     }
@@ -1245,7 +1490,20 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
             }
             : null;
 
-        var hasPrimarySecret = IsWireGuard ? PrivateKey.Length > 0 || HasStoredPrivateKey : Password.Length > 0;
+        var agent = IsAgent
+            ? new AgentSettings
+            {
+                Fingerprint = Fingerprint.Trim(),
+                AgentLabel = AgentLabel.Trim() is { Length: > 0 } label ? label : null,
+            }
+            : null;
+
+        var hasPrimarySecret = Protocol switch
+        {
+            ProxyProtocol.WireGuard => PrivateKey.Length > 0 || HasStoredPrivateKey,
+            ProxyProtocol.YuraAgent => Token.Length > 0 || HasStoredToken,
+            _ => Password.Length > 0,
+        };
         return new ProxyEndpoint
         {
             Id = _editingId,
@@ -1253,11 +1511,12 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
             Protocol = Protocol,
             Host = Host.Trim(),
             Port = ushort.TryParse(Port.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var p) ? p : (ushort)0,
-            Username = IsWireGuard || string.IsNullOrWhiteSpace(Username) ? null : Username.Trim(),
+            Username = !UsesCredentials || string.IsNullOrWhiteSpace(Username) ? null : Username.Trim(),
             AllowInvalidCertificate = IsHttps && AllowInvalidCertificate,
             // Keyed on the id, not the name: renaming a proxy must not orphan its secret.
             PasswordRef = !hasPrimarySecret && !_passwordAlreadyStored ? null : _editingId.ToString(),
             WireGuard = wireGuard,
+            Agent = agent,
         };
     }
 
@@ -1270,7 +1529,7 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
 
     private void MarkAllTouched()
     {
-        foreach (var field in new[] { nameof(Name), nameof(Host), nameof(Port), nameof(PrivateKey), nameof(PeerPublicKey), nameof(PresharedKey), nameof(Addresses), nameof(DnsServers), nameof(AllowedIps), nameof(Mtu), nameof(Keepalive) })
+        foreach (var field in new[] { nameof(Name), nameof(Host), nameof(Port), nameof(PrivateKey), nameof(PeerPublicKey), nameof(PresharedKey), nameof(Addresses), nameof(DnsServers), nameof(AllowedIps), nameof(Mtu), nameof(Keepalive), nameof(Fingerprint), nameof(Token) })
         {
             _touched.Add(field);
         }
@@ -1292,7 +1551,9 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
                      nameof(PresharedKeyError), nameof(AddressesError), nameof(DnsError), nameof(AllowedIpsError), nameof(MtuError),
                      nameof(KeepaliveError), nameof(HasNameError), nameof(HasHostError), nameof(HasPortError), nameof(HasPrivateKeyError),
                      nameof(HasPeerPublicKeyError), nameof(HasPresharedKeyError), nameof(HasAddressesError), nameof(HasDnsError),
-                     nameof(HasAllowedIpsError), nameof(HasMtuError), nameof(HasKeepaliveError), nameof(IsValid), nameof(CanSave), nameof(CanTest),
+                     nameof(HasAllowedIpsError), nameof(HasMtuError), nameof(HasKeepaliveError), nameof(FingerprintError),
+                     nameof(TokenError), nameof(HasFingerprintError), nameof(HasTokenError),
+                     nameof(IsValid), nameof(CanSave), nameof(CanTest),
                  })
         {
             OnPropertyChanged(name);
@@ -1303,9 +1564,9 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
     {
         foreach (var name in new[]
                  {
-                     nameof(Title), nameof(IsWireGuard), nameof(IsHttps), nameof(UsesCredentials), nameof(HostLabel), nameof(HostPlaceholder),
-                     nameof(PasswordPlaceholder), nameof(PrivateKeyPlaceholder), nameof(PresharedKeyPlaceholder), nameof(SecretStoreDescription),
-                     nameof(CanRemove),
+                     nameof(Title), nameof(IsWireGuard), nameof(IsAgent), nameof(IsHttps), nameof(UsesCredentials), nameof(HostLabel),
+                     nameof(HostPlaceholder), nameof(PasswordPlaceholder), nameof(PrivateKeyPlaceholder), nameof(PresharedKeyPlaceholder),
+                     nameof(TokenPlaceholder), nameof(SecretStoreDescription), nameof(CanRemove),
                  })
         {
             OnPropertyChanged(name);
@@ -1338,15 +1599,20 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
 
     partial void OnKeepaliveChanged(string value) => Touch(nameof(Keepalive));
 
+    partial void OnFingerprintChanged(string value) => Touch(nameof(Fingerprint));
+
+    partial void OnTokenChanged(string value) => Touch(nameof(Token));
+
     partial void OnProtocolChanged(ProxyProtocol value)
     {
         // Default ports follow the protocol until the user overrides them.
-        if (!_touched.Contains(nameof(Port)) || Port is "1080" or "8080" or "3128" or "51820")
+        if (!_touched.Contains(nameof(Port)) || Port is "1080" or "8080" or "3128" or "51820" or "7311")
         {
             Port = value switch
             {
                 ProxyProtocol.Socks5 => "1080",
                 ProxyProtocol.WireGuard => "51820",
+                ProxyProtocol.YuraAgent => "7311",
                 _ => "8080",
             };
             _touched.Remove(nameof(Port));

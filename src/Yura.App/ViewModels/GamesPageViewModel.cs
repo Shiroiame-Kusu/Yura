@@ -5,6 +5,8 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Yura.App.Localization;
 using Yura.App.Services;
+using System.Net;
+using Yura.Core.Connections;
 using Yura.Core.Games;
 using Yura.Core.Ipc;
 using Yura.Core.Processes;
@@ -122,8 +124,14 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         _sessionTimer.Tick += (_, _) => OnPropertyChanged(nameof(SessionDurationDisplay));
 
         // While a session is starting, this is what turns "waiting for game" into "routing".
+        // It is also where the evidence comes from: a rule being installed says nothing about
+        // whether the game's traffic is obeying it.
         _attachTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
-        _attachTimer.Tick += (_, _) => RefreshRunning();
+        _attachTimer.Tick += (_, _) =>
+        {
+            RefreshRunning();
+            _ = RefreshEvidenceAsync();
+        };
     }
 
     public ObservableCollection<GameRowViewModel> Games { get; } = [];
@@ -214,8 +222,9 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     /// Merges saved profiles with what is installed and what is running.
     /// </summary>
     /// <remarks>
-    /// Saved profiles win over discovery, because they carry the route and the path the user
-    /// chose. Discovery only adds games the configuration has never seen.
+    /// Saved profiles win over discovery for everything the user chose — the route, the paths,
+    /// the measurement target. Discovery contributes the facts it owns: the name Steam uses
+    /// and where the game is installed, both of which can change under a saved profile.
     /// </remarks>
     public void LoadProfiles(IEnumerable<GameProfile> saved)
     {
@@ -224,11 +233,7 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             _rows[profile.Id] = new GameRowViewModel(profile);
         }
 
-        foreach (var discovered in SteamLibrary.Discover())
-        {
-            _rows.TryAdd(discovered.Id, new GameRowViewModel(discovered));
-        }
-
+        Merge(SteamLibrary.Scan());
         Rebuild();
         RefreshRunning();
     }
@@ -236,14 +241,7 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private void Rescan()
     {
-        var added = 0;
-        foreach (var discovered in SteamLibrary.Discover())
-        {
-            if (_rows.TryAdd(discovered.Id, new GameRowViewModel(discovered)))
-            {
-                added++;
-            }
-        }
+        var added = Merge(SteamLibrary.Scan());
 
         Rebuild();
         RefreshRunning();
@@ -251,6 +249,71 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             ? Loc.Current["Games.RescanNoneNew"]
             : string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.RescanFound"], added);
     }
+
+    /// <summary>Folds a scan into the list, and keeps the account of it for display.</summary>
+    /// <returns>How many games the list had never seen.</returns>
+    private int Merge(SteamScan scan)
+    {
+        var added = 0;
+        foreach (var discovered in scan.Games)
+        {
+            if (!_rows.TryGetValue(discovered.Id, out var row))
+            {
+                _rows[discovered.Id] = new GameRowViewModel(discovered);
+                added++;
+                continue;
+            }
+
+            // A game that was moved to another drive, or renamed by its publisher, is the same
+            // game with the same route. Refreshing these is what keeps a saved profile able to
+            // recognise its own process after the library changed under it.
+            row.Update(row.Profile with
+            {
+                Name = row.Profile.Source == GameSource.Steam ? discovered.Name : row.Profile.Name,
+                InstallDirectory = discovered.InstallDirectory,
+                SteamAppId = row.Profile.SteamAppId ?? discovered.SteamAppId,
+            }, row.Running);
+        }
+
+        _scan = scan;
+        OnPropertyChanged(nameof(LibrarySummary));
+        OnPropertyChanged(nameof(SkippedLibraries));
+        OnPropertyChanged(nameof(HasSkippedLibraries));
+        return added;
+    }
+
+    private SteamScan _scan = SteamScan.Empty;
+
+    /// <summary>
+    /// How many games came from how many libraries.
+    /// </summary>
+    /// <remarks>
+    /// Stated in the page because a scan that reads one library out of six looks exactly like
+    /// one that read them all. Yura shipped with that bug; a visible count is what makes it
+    /// impossible to ship again unnoticed.
+    /// </remarks>
+    public string LibrarySummary => _scan.Libraries.Count == 0
+        ? Loc.Current["Games.NoLibraries"]
+        : string.Format(
+            CultureInfo.CurrentCulture,
+            Loc.Current["Games.LibrarySummary"],
+            _scan.Libraries.Sum(l => l.Games),
+            _scan.Libraries.Count);
+
+    public bool HasSkippedLibraries => _scan.Skipped.Count > 0;
+
+    /// <summary>Libraries Steam lists that could not be read, each with the reason.</summary>
+    public string SkippedLibraries => string.Join(
+        Environment.NewLine,
+        _scan.Skipped.Select(s => $"{s.Path} — {SkipReasonText(s)}"));
+
+    private static string SkipReasonText(SkippedLibrary skipped) => skipped.Reason switch
+    {
+        SkipReason.NotPresent => Loc.Current["Games.Skip.NotPresent"],
+        SkipReason.NoSteamApps => Loc.Current["Games.Skip.NoSteamApps"],
+        SkipReason.PermissionDenied => Loc.Current["Games.Skip.PermissionDenied"],
+        _ => skipped.Detail ?? Loc.Current["Games.Skip.Unreadable"],
+    };
 
     /// <summary>
     /// Adds a game from a running process, which is also how a profile learns what to match.
@@ -268,7 +331,7 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             Name = process.DisplayName,
             ExecutablePath = process.ExecutablePath,
             WineTargetExecutable = process.Wine?.TargetExecutable,
-            SteamAppId = process.Wine?.SteamAppId,
+            SteamAppId = process.SteamAppId,
             Source = GameSource.Manual,
         };
 
@@ -292,7 +355,7 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         {
             ExecutablePath = process.ExecutablePath,
             WineTargetExecutable = process.Wine?.TargetExecutable ?? row.Profile.WineTargetExecutable,
-            SteamAppId = process.Wine?.SteamAppId ?? row.Profile.SteamAppId,
+            SteamAppId = process.SteamAppId ?? row.Profile.SteamAppId,
         }, process);
 
         ProfilesChanged?.Invoke(this, EventArgs.Empty);
@@ -343,8 +406,15 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Finds the running process for each profile, by Wine target, executable path, or Steam id.
+    /// Finds the running process for each profile: by Wine target, executable path, Steam app
+    /// id, or a binary living inside the game's own install directory.
     /// </summary>
+    /// <remarks>
+    /// The last of those is what makes a freshly discovered game work without the user
+    /// attaching it by hand. It is evidence rather than a guess — the executable is under
+    /// <c>steamapps/common/&lt;this game&gt;</c> and so belongs to this game and nothing else —
+    /// which is the standard the rest of the Games page is held to.
+    /// </remarks>
     private void RefreshRunning()
     {
         var snapshot = _processes.Enumerate();
@@ -359,7 +429,9 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
                 (profile.ExecutablePath is { Length: > 0 } path &&
                  string.Equals(p.ExecutablePath, path, StringComparison.Ordinal)) ||
                 (profile.SteamAppId is { Length: > 0 } appId &&
-                 string.Equals(p.Wine?.SteamAppId, appId, StringComparison.Ordinal)));
+                 string.Equals(p.SteamAppId, appId, StringComparison.Ordinal)) ||
+                profile.MatchesInstalledPath(p.ExecutablePath) ||
+                profile.MatchesInstalledPath(p.Wine?.TargetExecutable));
 
             if (!ReferenceEquals(row.Running, match))
             {
@@ -383,6 +455,117 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         {
             State = BoostState.WaitingForGame;
         }
+    }
+
+    // -- evidence -------------------------------------------------------------
+
+    /// <summary>
+    /// What is actually happening to the game's connections, as opposed to what was asked for.
+    /// </summary>
+    /// <remarks>
+    /// The session state says a rule is installed and the game is running. Neither is evidence
+    /// that the game's traffic is going through the route, and the difference is not academic:
+    /// a connection the game opened in its first millisecond, a proxy set in the system
+    /// environment that sends everything to loopback, or an IPv6 destination, all produce a
+    /// page that says "Routing" over traffic that is not. This is the line that tells the
+    /// truth instead, and it comes from the daemon's own account of each connection.
+    /// </remarks>
+    [ObservableProperty]
+    public partial string? RoutingEvidence { get; set; }
+
+    /// <summary>True when nothing is being carried and it has been long enough to say so.</summary>
+    [ObservableProperty]
+    public partial bool RoutingEvidenceIsWarning { get; set; }
+
+    public bool HasRoutingEvidence => RoutingEvidence is not null;
+
+    private DateTimeOffset? _routingSince;
+    private bool _evidenceInFlight;
+
+    private async Task RefreshEvidenceAsync()
+    {
+        if (_evidenceInFlight || SelectedGame?.Running is not { } process || !IsRunning ||
+            _daemon.State != DaemonState.Connected)
+        {
+            return;
+        }
+
+        _evidenceInFlight = true;
+        try
+        {
+            var rows = await _daemon.GetConnectionsAsync(process.Identity.Pid).ConfigureAwait(true);
+            Describe(rows);
+        }
+        finally
+        {
+            _evidenceInFlight = false;
+        }
+    }
+
+    /// <summary>Turns the daemon's per-connection account into one sentence, or two.</summary>
+    private void Describe(IReadOnlyList<ConnectionRecord> rows)
+    {
+        _routingSince ??= DateTimeOffset.UtcNow;
+        var patient = DateTimeOffset.UtcNow - _routingSince.Value > TimeSpan.FromSeconds(15);
+        var (text, warning) = Summarise(rows, RouteName, patient);
+        RoutingEvidence = text;
+        RoutingEvidenceIsWarning = warning;
+        OnPropertyChanged(nameof(HasRoutingEvidence));
+    }
+
+    /// <summary>
+    /// What the daemon's account of these connections means, in words.
+    /// </summary>
+    /// <remarks>
+    /// Static and pure so the sentences can be tested directly: they are the part of this page
+    /// a user will act on when a route appears to do nothing, and the three causes they name —
+    /// a proxy in the environment, connections older than the rule, nothing captured at all —
+    /// are each a different thing to go and fix.
+    /// </remarks>
+    /// <param name="patient">True once enough time has passed that silence is worth reporting.</param>
+    public static (string? Text, bool IsWarning) Summarise(
+        IReadOnlyList<ConnectionRecord> rows, string routeName, bool patient)
+    {
+        var routed = rows.Count(r => r.Route == RouteObservation.ConfirmedProxied);
+        var preExisting = rows.Count(r => r.Route == RouteObservation.PreExistingPreviousRoute);
+        var loopback = rows.Count(r => IPAddress.IsLoopback(r.Remote.Address));
+        var direct = rows.Count(r => r.Route == RouteObservation.ConfirmedDirect &&
+                                     !IPAddress.IsLoopback(r.Remote.Address));
+
+        var parts = new List<string>();
+        if (routed > 0)
+        {
+            parts.Add(string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Evidence.Routed"],
+                routed, routeName));
+        }
+
+        if (loopback > 0)
+        {
+            // The commonest way for a route to do nothing: a proxy set in the environment, so
+            // the game talks to something on this machine and never leaves it on its own.
+            parts.Add(string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Evidence.LocalProxy"], loopback));
+        }
+
+        if (preExisting > 0)
+        {
+            parts.Add(string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Evidence.PreExisting"], preExisting));
+        }
+
+        if (direct > 0)
+        {
+            parts.Add(string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Evidence.Direct"], direct));
+        }
+
+        if (parts.Count > 0)
+        {
+            return (string.Join(" ", parts), routed == 0);
+        }
+
+        // Nothing at all. Worth saying plainly once it has been long enough that the game has
+        // certainly tried to connect.
+        return patient
+            ? (Loc.Current["Games.Evidence.None"] + " " + Loc.Current["Games.Evidence.NoneHint"], true)
+            : (Loc.Current["Games.Evidence.Waiting"], false);
     }
 
     // -- measurements ---------------------------------------------------------
@@ -415,6 +598,20 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     /// <summary>How the figures were obtained, so they are not mistaken for ICMP ping.</summary>
     [ObservableProperty]
     public partial string? MeasurementMethod { get; set; }
+
+    /// <summary>
+    /// Where the routed time went, when the route can say: this far to the exit, that much
+    /// further to the game.
+    /// </summary>
+    /// <remarks>
+    /// Only a Yura agent reports it, because only it will measure the destination from where it
+    /// is standing. It answers the question the two columns raise but cannot settle — whether a
+    /// better agent would help, or whether the problem is this machine's own connection to it.
+    /// </remarks>
+    [ObservableProperty]
+    public partial string? RouteSplit { get; set; }
+
+    public bool HasRouteSplit => RouteSplit is not null;
 
     [ObservableProperty]
     public partial DateTimeOffset? LastMeasurementUtc { get; set; }
@@ -524,9 +721,11 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         LastMeasurementUtc = null;
         MeasurementTarget = null;
         MeasurementMethod = null;
+        RouteSplit = null;
         OnPropertyChanged(nameof(LastMeasurementDisplay));
         OnPropertyChanged(nameof(MeasurementTargetDisplay));
         OnPropertyChanged(nameof(MeasurementMethodDisplay));
+        OnPropertyChanged(nameof(HasRouteSplit));
     }
 
     /// <summary>Design-review hook: puts the page into a running session with a start time.</summary>
@@ -609,6 +808,7 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         MeasurementTarget = measurement.Target;
         MeasurementMethod = measurement.Method;
         LastMeasurementUtc = measurement.MeasuredAtUtc;
+        RouteSplit = Describe(measurement.Legs);
 
         DirectLatency = new Metric(measurement.Direct.LatencyMilliseconds, "ms");
         DirectJitter = new Metric(measurement.Direct.JitterMilliseconds, "ms");
@@ -636,6 +836,28 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(LastMeasurementDisplay));
         OnPropertyChanged(nameof(MeasurementTargetDisplay));
         OnPropertyChanged(nameof(MeasurementMethodDisplay));
+    }
+
+    /// <summary>The two halves of an agent route in one sentence, or null when unknown.</summary>
+    private static string? Describe(RouteLegsDto? legs)
+    {
+        if (legs is null)
+        {
+            return null;
+        }
+
+        var toAgent = legs.ToAgentMilliseconds is { } to
+            ? string.Create(CultureInfo.CurrentCulture, $"{to:0.#} ms")
+            : Loc.Current["Common.NotMeasured"];
+
+        if (legs.FromAgentMilliseconds is { } from)
+        {
+            return string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.RouteSplit"],
+                legs.AgentName, toAgent, string.Create(CultureInfo.CurrentCulture, $"{from:0.#} ms"));
+        }
+
+        return string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.RouteSplitPartial"],
+            legs.AgentName, toAgent, legs.Failure ?? Loc.Current["Common.Unknown"]);
     }
 
     private static bool TryParseTarget(string text, out string host, out ushort port)
@@ -670,6 +892,9 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
 
         FailureReason = null;
         State = BoostState.Starting;
+        RoutingEvidence = null;
+        RoutingEvidenceIsWarning = false;
+        _routingSince = null;
         _sessionStartedAt = DateTimeOffset.UtcNow;
         _sessionTimer.Start();
         _attachTimer.Start();
@@ -808,6 +1033,10 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         _sessionTimer.Stop();
         _attachTimer.Stop();
         _sessionStartedAt = null;
+        _routingSince = null;
+        RoutingEvidence = null;
+        RoutingEvidenceIsWarning = false;
+        OnPropertyChanged(nameof(HasRoutingEvidence));
         State = BoostState.Ready;
         StatusMessage = Loc.Current["Games.Stopped"];
         ClearMeasurements();

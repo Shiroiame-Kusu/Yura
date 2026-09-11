@@ -53,6 +53,9 @@ public sealed record DaemonStatus
     /// <summary>"netlink" when process events come from the kernel, otherwise why they do not.</summary>
     public string? ProcessWatcher { get; init; }
 
+    /// <summary>Processes classified at exec, before they could open a socket.</summary>
+    public long ClassifiedOnExec { get; init; }
+
     public DnsPolicy DnsPolicy { get; init; }
 
     public string? KernelRelease { get; init; }
@@ -69,6 +72,9 @@ public sealed record DaemonStatus
 
     /// <summary>Every WireGuard exit the daemon knows, whether or not it came up.</summary>
     public IReadOnlyList<TunnelStatus> Tunnels { get; init; } = [];
+
+    /// <summary>Every Yura agent exit the daemon knows, whether or not it is connected.</summary>
+    public IReadOnlyList<AgentStatus> Agents { get; init; } = [];
 }
 
 public sealed record DaemonCheck(string Name, bool Passed, string? Detail);
@@ -84,6 +90,24 @@ public sealed record TunnelStatus(
     long RxBytes,
     long TxBytes,
     string? Endpoint);
+
+/// <summary>
+/// What the daemon reports about one Yura agent exit. Never carries the token.
+/// </summary>
+/// <param name="Connected">
+/// The control session. TCP flows do not need it — each opens its own connection — so an
+/// agent that is not connected is degraded rather than unusable, and the UI says which.
+/// </param>
+public sealed record AgentStatus(
+    Guid ProxyId,
+    string Name,
+    bool Connected,
+    string? AgentName,
+    string? AgentVersion,
+    double? RoundTripMilliseconds,
+    bool Udp,
+    string? Resolver,
+    string? Failure);
 
 /// <summary>
 /// The unprivileged app's only channel to the privileged daemon.

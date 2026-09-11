@@ -61,6 +61,12 @@ public interface IRouteDecider
     /// <summary>DNS answers seen by the relay feed this, so later flows have a name to match.</summary>
     DnsCache Dns { get; }
 
+    /// <summary>
+    /// The live sessions with Yura agents. UDP through an agent needs one, because the session
+    /// is where the datagram channel's key comes from.
+    /// </summary>
+    AgentSessionManager Agents { get; }
+
     /// <summary>Decides the route for one captured flow.</summary>
     FlowPlan Decide(RuleSlot slot, IPEndPoint client, IPEndPoint destination, TransportProtocol protocol, string? sniffedHost);
 }

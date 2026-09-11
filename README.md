@@ -44,9 +44,11 @@ That last row is a feature, not a limitation: it is exactly the semantic the UI 
 ```
 src/Yura.Core          domain model: process identity, rules, proxies, connections, IPC
 src/Yura.Daemon        privileged daemon: cgroups, nftables, TPROXY forwarder, IPC server
+src/Yura.Agent         the server-side relay: Yura's own exit, for a machine near the game
 src/Yura.App           Avalonia 12 + FluentAvalonia desktop application (unprivileged)
-tests/Yura.Core.Tests  unit tests for the rule system and /proc reader
+tests/Yura.Core.Tests  unit tests for the rule system, /proc reader and agent protocol
 tests/Yura.Daemon.Tests unit tests for the nftables ruleset builder
+tests/Yura.Agent.Tests  end-to-end tests of the agent: real server, real client, real sockets
 tests/acceptance/      the daemon acceptance suite, driven through the real IPC socket
 spikes/                the routing spike: proves running-process routing end to end
 tools/                 screenshot harness, contrast checker, string-table checker
@@ -159,12 +161,43 @@ yura-daemon ctl log
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-83 checks against a controlled network on a dummy interface, where each marker payload is
-reachable only through one specific proxy — or, for the WireGuard exit, only inside a network
-namespace that the tunnel is the sole way into. **83 passed, 0 failed.** All eleven mandatory
-acceptance tests are covered, including child exclusion, rule precedence in the kernel, and
-Wine/Proton isolation. See [docs/daemon-acceptance.md](docs/daemon-acceptance.md) for the
-evidence behind each one and for the limits that remain.
+113 checks against a controlled network on a dummy interface, where each marker payload is
+reachable only through one specific proxy — or, for a WireGuard exit and a Yura agent, only
+inside a network namespace that the tunnel or the agent is the sole way into. **113 passed, 0
+failed.** All eleven mandatory acceptance tests are covered, including child exclusion, rule
+precedence in the kernel, and Wine/Proton isolation. See
+[docs/daemon-acceptance.md](docs/daemon-acceptance.md) for the evidence behind each one and for
+the limits that remain — including the one that decides whether a rule appears to work at all:
+a program that opens a socket within about two milliseconds of starting is not captured, and
+Yura reports that rather than claiming otherwise.
+
+## Run an agent on a server
+
+An agent is Yura's own relay: put it on a machine near the game's servers and selected games
+leave from there instead of from your own connection, over UDP as well as TCP.
+
+```bash
+tools/publish-agent.sh linux-x64          # one self-contained file; no .NET on the server
+scp artifacts/yura-agent-linux-x64/yura-agent user@server:
+ssh user@server 'sudo ./yura-agent install'
+```
+
+`install` writes a hardened systemd unit, starts it, and prints one connect string. Paste that
+into Yura → Proxies → **Add agent**; the token in it goes to the secret store and the key
+fingerprint — which is what identifies the agent, instead of a certificate authority — goes to
+the configuration file. Open the port it names, TCP **and** UDP: the datagram channel is what
+carries a game's traffic.
+
+```bash
+./yura-agent show       # print the connect string again
+./yura-agent rotate     # replace the token, invalidating every client
+./yura-agent unit       # print the unit install would write, without installing
+sudo ./yura-agent uninstall [--purge]
+```
+
+By default the agent refuses private, loopback and link-local destinations, so a client holding
+the token cannot use it to reach the server's own network. `--allow`, `--deny`, `--ports` and
+`--allow-private` change that deliberately.
 
 ## Configuration
 
@@ -210,10 +243,10 @@ is unreferenced.
 - All seven pages: Processes, Games, Connections, Proxies, Rules, Diagnostics, Settings
 - Design system, both themes, both languages, 960×640 to 1280×800, 100–200% scaling —
   see [docs/ux-verification.md](docs/ux-verification.md)
-- **Routing spike passing 12/12** and the **daemon acceptance suite passing 83/83**: a running
-  process migrated into a cgroup live, classified by nftables, captured by TPROXY and
-  forwarded to a SOCKS5 proxy or through a WireGuard tunnel — TCP and UDP, per instance, with
-  the process still running as its original user
+- **Routing spike passing 12/12** and the **daemon acceptance suite passing 113/113**: a
+  running process migrated into a cgroup live, classified by nftables, captured by TPROXY and
+  forwarded to a SOCKS5 proxy, through a WireGuard tunnel, or through a Yura agent — TCP and
+  UDP, per instance, with the process still running as its original user
 - The privileged daemon: cgroup manager, nftables ruleset builder, transparent TCP and UDP
   forwarder, SOCKS5 / HTTP CONNECT / HTTPS clients, WireGuard exits on kernel interfaces,
   proxy chains (with a WireGuard exit as the first hop), socket-ownership attribution, kernel
@@ -221,13 +254,23 @@ is unreferenced.
   measurement, and a peer-credential-authorised IPC server
 - WireGuard exits imported from a wg-quick `.conf`, probed by a real handshake and a DNS
   answer through the tunnel, with the peer's handshake time and transfer shown live
+- **Yura agents**: a server-side relay with its own protocol — TLS 1.3 with a pinned public
+  key, a shared token, an AES-GCM datagram channel for UDP, latency measured from the agent's
+  own vantage point, and the resolver it offers used for lookups on that exit. Added by
+  pasting one connect string, deployable as one self-contained file with one command
+- **Honest reporting of what is actually routed**: the Games page reads the daemon's account of
+  each of the game's connections and says how many are going through the route, how many are
+  going to a proxy on this machine, and how many predate the rule — because a rule being
+  installed was never evidence that traffic obeys it
 - A systemd service installed from Settings through polkit, with the unit and the script
   shown before anything runs as root, and start / stop / restart / uninstall from the same
   page
-- 162 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+- 266 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
   wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and
-  tunnel manager, the systemd unit generator, the Steam library reader, the rule store, the
-  proxy and chain editors, and the configuration file
+  tunnel manager, the agent protocol end to end against a real agent, the connect string, the
+  datagram sealing and its replay window, the systemd unit generators, the Steam library
+  reader and its KeyValues parser, the rule store, the proxy, agent and chain editors, the
+  routing-evidence sentences, and the configuration file
 - Configuration under `~/.config/Yura`, with passwords and keys in the desktop secret service
   and persistent rules reapplied to the daemon on every connection
 

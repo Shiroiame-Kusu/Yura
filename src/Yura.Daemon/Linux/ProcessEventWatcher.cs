@@ -80,6 +80,18 @@ public sealed class ProcessEventWatcher : IDisposable
     /// </remarks>
     public Func<int, int, bool>? OnForkFastPath { get; set; }
 
+    /// <summary>
+    /// Called on the receive thread for every <c>exec</c>, before the event is queued.
+    /// </summary>
+    /// <remarks>
+    /// The mirror image of <see cref="OnForkFastPath"/>, and needed for the same reason: a
+    /// program that connects in the first millisecond of its life — curl does, and so do
+    /// launchers and updaters — opens its socket before any work done on the other side of a
+    /// queue and a lock can place it. The socket's cgroup is fixed at that moment, so a
+    /// connection missed here is a connection that leaves on the wrong route for good.
+    /// </remarks>
+    public Func<int, bool>? OnExecFastPath { get; set; }
+
     public bool IsRunning { get; private set; }
 
     /// <summary>Why the watcher is not running, for the diagnostics page.</summary>
@@ -190,15 +202,26 @@ public sealed class ProcessEventWatcher : IDisposable
 
             foreach (var evt in Parse(buffer.AsSpan(0, (int)received)))
             {
-                if (evt.Kind == ProcessEventKind.Fork && OnForkFastPath is { } fast)
+                if (evt.Kind == ProcessEventKind.Fork && OnForkFastPath is { } excludeFast)
                 {
                     try
                     {
-                        fast(evt.Pid, evt.ChildPid);
+                        excludeFast(evt.Pid, evt.ChildPid);
                     }
                     catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                     {
                         // The child exited already, or is not ours to move.
+                    }
+                }
+                else if (evt.Kind == ProcessEventKind.Exec && OnExecFastPath is { } includeFast)
+                {
+                    try
+                    {
+                        includeFast(evt.Pid);
+                    }
+                    catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                    {
+                        // It exited already, or it is not a process we may move.
                     }
                 }
 

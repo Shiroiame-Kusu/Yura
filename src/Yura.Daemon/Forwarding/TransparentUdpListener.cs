@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using Yura.Core.Agent;
 using Yura.Core.Connections;
 using Yura.Core.Proxies;
 using Yura.Core.Rules;
@@ -194,6 +195,28 @@ public sealed class TransparentUdpListener : IAsyncDisposable
 
                         var session = await DirectUdpSession.OpenAsync(_replies, client, original, flow, learn, _stopping.Token,
                             tunnel.Mark, source, target).ConfigureAwait(false);
+                        flow.MarkEstablished(RouteObservation.ConfirmedProxied);
+                        return session;
+                    }
+
+                    if (plan.Hops.Count == 1 && plan.Hops[0].IsAgent)
+                    {
+                        var hop = plan.Hops[0];
+                        var agent = await _decider.Agents.GetAsync(hop.Endpoint, hop.Password, _stopping.Token)
+                            .ConfigureAwait(false);
+                        if (agent is null || !agent.UdpAvailable)
+                        {
+                            var why = agent is null
+                                ? $"Agent exit '{hop.Endpoint.Name}' is not answering" +
+                                  $"{(_decider.Agents.FailureFor(hop.Endpoint.Id) is { } detail ? $": {detail}" : ".")}"
+                                : $"Agent exit '{hop.Endpoint.Name}' was started without UDP relaying.";
+                            flow.MarkFailed(why);
+                            _log($"slot {_slot.Name}: udp {client} -> {original} dropped: {why}");
+                            return new DropSession(flow);
+                        }
+
+                        var session = AgentUdpSession.Open(
+                            _replies, agent, client, original, plan.DialDestination ?? original, flow, learn);
                         flow.MarkEstablished(RouteObservation.ConfirmedProxied);
                         return session;
                     }
@@ -458,6 +481,106 @@ internal sealed class DirectUdpSession : UdpSession
         _closing.Cancel();
         Flow.MarkClosed();
         _relay.Dispose();
+        _closing.Dispose();
+        return ValueTask.CompletedTask;
+    }
+}
+
+/// <summary>
+/// One UDP flow carried on an agent's datagram channel.
+/// </summary>
+/// <remarks>
+/// The channel is this flow's own, for as long as the flow lasts, which is what keeps the
+/// source port the game appears to come from stable at the far end. Answers arrive on the
+/// session's socket and are handed here by channel, so nothing has to be matched by address.
+/// </remarks>
+internal sealed class AgentUdpSession : UdpSession
+{
+    private readonly ReplySocketPool _replies;
+    private readonly AgentSession _agent;
+    private readonly IPEndPoint _client;
+    private readonly IPEndPoint _original;
+    private readonly IPEndPoint _target;
+    private readonly DnsCache? _learn;
+    private readonly CancellationTokenSource _closing = new();
+    private ushort _channel;
+    private bool _reported;
+
+    private AgentUdpSession(
+        ReplySocketPool replies, AgentSession agent, IPEndPoint client, IPEndPoint original, IPEndPoint target,
+        Flow flow, DnsCache? learn)
+        : base(flow)
+    {
+        _replies = replies;
+        _agent = agent;
+        _client = client;
+        _original = original;
+        _target = target;
+        _learn = learn;
+    }
+
+    public static AgentUdpSession Open(
+        ReplySocketPool replies, AgentSession agent, IPEndPoint client, IPEndPoint original, IPEndPoint target,
+        Flow flow, DnsCache? learn)
+    {
+        replies.Reserve(original);
+        var session = new AgentUdpSession(replies, agent, client, original, target, flow, learn);
+        session._channel = agent.OpenChannel((from, payload) => session.OnAnswer(from, payload));
+        return session;
+    }
+
+    /// <summary>
+    /// An answer from the agent, on the session's socket, for this flow's channel.
+    /// </summary>
+    /// <remarks>
+    /// The source is ignored on purpose: the channel is bound to one destination at the agent,
+    /// so an answer on this channel came from that destination and the reply must appear to
+    /// come from the address the application sent to — which is what the flow already records.
+    /// </remarks>
+    private void OnAnswer(IPEndPoint from, ReadOnlyMemory<byte> payload) => _ = OnAnswerAsync(payload);
+
+    private async Task OnAnswerAsync(ReadOnlyMemory<byte> payload)
+    {
+        LastActivityUtc = DateTimeOffset.UtcNow;
+        _learn?.Learn(payload.Span);
+        try
+        {
+            await _replies.SendAsync(_original, _client, payload).ConfigureAwait(false);
+            Flow.AddDown(payload.Length);
+        }
+        catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
+        {
+        }
+    }
+
+    public override async Task SendAsync(byte[] datagram)
+    {
+        LastActivityUtc = DateTimeOffset.UtcNow;
+        try
+        {
+            await _agent.SendDatagramAsync(_channel, _target, datagram, _closing.Token).ConfigureAwait(false);
+            Flow.AddUp(datagram.Length);
+        }
+        catch (AgentProtocolException e)
+        {
+            // Almost always a datagram over the agent's size limit. Said once, on the flow,
+            // rather than silently dropped or repeated for every packet.
+            if (!_reported)
+            {
+                _reported = true;
+                Flow.MarkFailed(e.Message);
+            }
+        }
+        catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
+        {
+        }
+    }
+
+    public override ValueTask DisposeAsync()
+    {
+        _closing.Cancel();
+        _agent.CloseChannel(_channel);
+        Flow.MarkClosed();
         _closing.Dispose();
         return ValueTask.CompletedTask;
     }

@@ -1,10 +1,12 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/Yura.App/Yura.App.csproj" />
+    <Project Path="src/Yura.Agent/Yura.Agent.csproj" />
     <Project Path="src/Yura.Core/Yura.Core.csproj" />
     <Project Path="src/Yura.Daemon/Yura.Daemon.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Yura.Agent.Tests/Yura.Agent.Tests.csproj" />
     <Project Path="tests/Yura.Core.Tests/Yura.Core.Tests.csproj" />
     <Project Path="tests/Yura.Daemon.Tests/Yura.Daemon.Tests.csproj" />
   </Folder>
