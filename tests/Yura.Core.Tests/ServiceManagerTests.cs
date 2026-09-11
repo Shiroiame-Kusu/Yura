@@ -45,7 +45,9 @@ public sealed class ServiceManagerTests
 
         var script = ServiceManager.BuildInstallScript(location, unit);
 
-        Assert.Contains("cp -a '/home/someone/src/Yura/src/Yura.Daemon/bin/Debug/net10.0/.' '/usr/local/lib/yura/daemon'/", script);
+        Assert.Contains("src='/home/someone/src/Yura/src/Yura.Daemon/bin/Debug/net10.0'", script);
+        Assert.Contains("dst='/usr/local/lib/yura/daemon'", script);
+        Assert.Contains("cp -a \"$src/.\" \"$dst.new/\"", script);
         Assert.Contains("ExecStart=/usr/share/dotnet/dotnet /usr/local/lib/yura/daemon/yura-daemon.dll --socket", script);
         Assert.Contains("ProtectHome=yes\n", script);
         Assert.DoesNotContain("ProtectHome=read-only", script);
@@ -64,7 +66,46 @@ public sealed class ServiceManagerTests
 
         var location = new DaemonLocation("/opt/y d/yura-daemon", "/opt/y d", DaemonSource.Explicit, InHome: false);
         var script = ServiceManager.BuildInstallScript(location, SystemdUnit.Generate("/opt/y d/yura-daemon", 1000, "/run/yura/yura.sock", false));
-        Assert.Contains("cp -a '/opt/y d/.'", script);
+        Assert.Contains("src='/opt/y d'", script);
+    }
+
+    [Fact]
+    public void Installing_a_daemon_that_is_already_in_the_install_directory_is_not_a_failure()
+    {
+        // What the button means after a service has been installed once: reinstall, to pick up
+        // a rebuilt daemon. When the daemon found *is* the installed copy, cp refuses to copy a
+        // directory onto itself, and under set -e that aborted the script before the unit was
+        // ever written — leaving a machine with no service and a message about the same file.
+        var location = new DaemonLocation(
+            "/usr/local/lib/yura/daemon/yura-daemon",
+            DaemonLocator.InstallDirectory,
+            DaemonSource.Installed,
+            InHome: false);
+
+        var script = ServiceManager.BuildInstallScript(
+            location, SystemdUnit.Generate("/usr/local/lib/yura/daemon/yura-daemon", 1000, "/run/yura/yura.sock", false));
+
+        // The copy is guarded by comparing the resolved paths, so the rest of the script still
+        // runs: the unit is written, reloaded and enabled.
+        Assert.Contains("if [ \"$(cd \"$src\" && pwd -P)\" = \"$(cd \"$dst\" 2>/dev/null && pwd -P || echo none)\" ]; then", script);
+        Assert.Contains("leaving the files as they are", script);
+        Assert.Contains("cat > '/etc/systemd/system/yura-daemon.service' <<'YURA_UNIT'", script);
+        Assert.Contains("systemctl enable --now yura-daemon.service", script);
+    }
+
+    [Fact]
+    public void The_copy_is_staged_so_a_failure_leaves_the_previous_install_alone()
+    {
+        var location = new DaemonLocation(Exec, "/opt/build/net10.0", DaemonSource.Sibling, InHome: false);
+
+        var script = ServiceManager.BuildInstallScript(
+            location, SystemdUnit.Generate(Exec, 1000, "/run/yura/yura.sock", false));
+
+        // Copied beside the target, then moved over it: a half-finished copy is never what the
+        // service points at.
+        var copyAt = script.IndexOf("cp -a \"$src/.\" \"$dst.new/\"", StringComparison.Ordinal);
+        var moveAt = script.IndexOf("mv \"$dst.new\" \"$dst\"", StringComparison.Ordinal);
+        Assert.True(copyAt > 0 && moveAt > copyAt, script);
     }
 
     [Fact]

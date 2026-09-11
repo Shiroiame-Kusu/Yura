@@ -310,6 +310,9 @@ public sealed partial class SettingsPageViewModel : ObservableObject
         _serviceQueryInFlight = true;
         try
         {
+            // Where the daemon is, as well as what the service is doing: an install or an
+            // uninstall changes both, and a path from two minutes ago is not a fact.
+            Daemon = DaemonLocator.Find(DaemonPathOverride);
             Service = await _services.QueryAsync().ConfigureAwait(true);
             JournalTail = Service.State == ServiceState.Failed
                 ? await _services.JournalTailAsync(20).ConfigureAwait(true)
@@ -325,8 +328,20 @@ public sealed partial class SettingsPageViewModel : ObservableObject
     [RelayCommand]
     private async Task InstallServiceAsync()
     {
-        if (Daemon is not { } daemon || !HasSystemd)
+        if (!HasSystemd)
         {
+            return;
+        }
+
+        // Located again now, not reused from when the page was last refreshed. The displayed
+        // location can be minutes old, and an uninstall in between deletes the very directory
+        // it names — which is how an install came to copy a directory that was no longer there.
+        Daemon = DaemonLocator.Find(DaemonPathOverride);
+        RaiseService();
+        if (Daemon is not { } daemon)
+        {
+            ServiceError = Loc.Current["Settings.Service.NoDaemon"];
+            RaiseService();
             return;
         }
 
@@ -335,8 +350,16 @@ public sealed partial class SettingsPageViewModel : ObservableObject
     }
 
     [RelayCommand]
-    private Task UninstallServiceAsync() =>
-        RunPrivilegedAsync(ServiceManager.BuildUninstallScript(), Loc.Current["Settings.Service.Uninstalled"]);
+    private async Task UninstallServiceAsync()
+    {
+        await RunPrivilegedAsync(ServiceManager.BuildUninstallScript(), Loc.Current["Settings.Service.Uninstalled"])
+            .ConfigureAwait(true);
+
+        // The directory the location pointed at has just been removed; saying where the daemon
+        // is now — the build it would install next — is more use than a stale path.
+        Daemon = DaemonLocator.Find(DaemonPathOverride);
+        RaiseService();
+    }
 
     [RelayCommand]
     private Task StartServiceAsync() => ControlAsync("start");
