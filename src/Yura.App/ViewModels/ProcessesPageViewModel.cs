@@ -548,7 +548,17 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
 
             if (result.Succeeded)
             {
-                _rules.Add(rule with { AppliedAtUtc = result.ConfirmedAtUtc });
+                // Whatever this replaces has to come out of the kernel as well. The store
+                // drops a superseded selection from the list, but the daemon keeps every rule
+                // it was given: the old one has a lower position, so it would go on winning
+                // while the UI showed only the new one. That is precisely how a process ends
+                // up "proxied" in the list and routed direct in the kernel.
+                var superseded = _rules.Add(rule with { AppliedAtUtc = result.ConfirmedAtUtc });
+                if (superseded is not null)
+                {
+                    await RetireAsync(superseded).ConfigureAwait(true);
+                }
+
                 LastApplied = new AppliedRuleNotice
                 {
                     RouteName = DescribeAction(action),
@@ -568,6 +578,26 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
             ApplyPolicies();
             OnPropertyChanged(nameof(CanApply));
             OnPropertyChanged(nameof(ApplyBlockedReason));
+        }
+    }
+
+    /// <summary>
+    /// Takes a rule the app no longer lists out of the daemon.
+    /// </summary>
+    /// <remarks>
+    /// A failure here is reported as a warning on the notice rather than as a failed apply:
+    /// the new rule is installed, and hiding that the old one is still live would be the worse
+    /// of the two lies.
+    /// </remarks>
+    private async Task RetireAsync(RoutingRule rule)
+    {
+        var removal = await _daemon.RemoveRuleAsync(rule.Id).ConfigureAwait(true);
+        if (!removal.Succeeded)
+        {
+            ErrorMessage = string.Format(
+                System.Globalization.CultureInfo.CurrentCulture,
+                Loc.Current["Processes.Applied.StaleRule"], rule.Name);
+            ErrorDiagnostics = removal.FailureReason;
         }
     }
 

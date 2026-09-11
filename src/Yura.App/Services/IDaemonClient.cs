@@ -147,6 +147,18 @@ public interface IDaemonClient
 
     Task<RuleApplyResult> RemoveRuleAsync(Guid ruleId, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// The user-editable rules the daemon currently holds, by id and name.
+    /// </summary>
+    /// <remarks>
+    /// The app is the source of truth for what should be installed, but it is not the only
+    /// thing that has ever talked to this daemon: a rule left behind by a previous app run, or
+    /// one the app superseded while the removal failed, keeps deciding routes from a position
+    /// the user cannot see. Asking is the only way to find those.
+    /// </remarks>
+    Task<IReadOnlyList<(Guid Id, string Name)>> GetInstalledRulesAsync(
+        CancellationToken cancellationToken = default);
+
     /// <summary>Replaces the daemon's proxy and chain list. Secrets travel only here.</summary>
     Task<RuleApplyResult> SetProxiesAsync(
         IReadOnlyList<(ProxyEndpoint Endpoint, ProxySecrets Secrets)> proxies,
@@ -215,6 +227,10 @@ public sealed class DisconnectedDaemonClient : IDaemonClient
 
     public Task<RuleApplyResult> RemoveRuleAsync(Guid ruleId, CancellationToken cancellationToken = default) =>
         Task.FromResult(Refused());
+
+    public Task<IReadOnlyList<(Guid Id, string Name)>> GetInstalledRulesAsync(
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<(Guid, string)>>([]);
 
     public Task<RuleApplyResult> SetProxiesAsync(
         IReadOnlyList<(ProxyEndpoint Endpoint, ProxySecrets Secrets)> proxies,

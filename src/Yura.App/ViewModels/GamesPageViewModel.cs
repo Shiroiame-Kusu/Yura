@@ -939,7 +939,14 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         }
 
         _sessionRule = rule;
-        _rules.Add(rule with { AppliedAtUtc = result.ConfirmedAtUtc });
+        var superseded = _rules.Add(rule with { AppliedAtUtc = result.ConfirmedAtUtc });
+        if (superseded is not null)
+        {
+            // Also out of the kernel: it sits at a lower position than this one, so leaving
+            // it installed would keep the game on the previous route.
+            await _daemon.RemoveRuleAsync(superseded.Id).ConfigureAwait(true);
+        }
+
         State = row.Running is null ? BoostState.WaitingForGame : BoostState.Routing;
         StatusMessage = result.PreExistingConnections is > 0
             ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.StartedWithExisting"], result.PreExistingConnections)

@@ -33,16 +33,31 @@ internal sealed class FakeSecretStore : ISecretStore
     }
 }
 
-/// <summary>Captures what the app asked the daemon to probe, secrets included.</summary>
+/// <summary>Captures what the app asked the daemon to do: probes, applies and removals.</summary>
 internal sealed class RecordingDaemonClient : IDaemonClient
 {
     public List<(ProxyEndpoint Endpoint, ProxySecrets Secrets)> Probes { get; } = [];
 
-    public DaemonState State => DaemonState.Connected;
+    /// <summary>Every rule the app installed, in order.</summary>
+    public List<RoutingRule> Applied { get; } = [];
+
+    /// <summary>Every rule id the app asked the daemon to take out.</summary>
+    public List<Guid> Removed { get; } = [];
+
+    /// <summary>What the next apply reports back. Lets a test drive the failure path.</summary>
+    public RuleApplyResult NextApplyResult { get; set; } = new() { Succeeded = true };
+
+    /// <summary>Makes removals fail, the way a daemon that went away mid-edit would.</summary>
+    public bool FailRemovals { get; set; }
+
+    /// <summary>What the daemon is holding, as it would answer list-rules.</summary>
+    public List<(Guid Id, string Name)> Installed { get; } = [];
+
+    public DaemonState State { get; set; } = DaemonState.Connected;
 
     public event EventHandler<DaemonState>? StateChanged { add { } remove { } }
 
-    public string? UnavailableReason => null;
+    public string? UnavailableReason => State == DaemonState.Connected ? null : "the test daemon is not connected";
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
 
@@ -54,11 +69,37 @@ internal sealed class RecordingDaemonClient : IDaemonClient
     public Task<IReadOnlyList<Connections.ConnectionRecord>> GetConnectionsAsync(int? pid = null, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Connections.ConnectionRecord>>([]);
 
-    public Task<RuleApplyResult> ApplyRuleAsync(RoutingRule rule, CancellationToken ct = default) =>
-        Task.FromResult(new RuleApplyResult { Succeeded = true });
+    public Task<RuleApplyResult> ApplyRuleAsync(RoutingRule rule, CancellationToken ct = default)
+    {
+        Applied.Add(rule);
+        if (NextApplyResult.Succeeded)
+        {
+            Installed.RemoveAll(r => r.Id == rule.Id);
+            Installed.Add((rule.Id, rule.Name));
+        }
 
-    public Task<RuleApplyResult> RemoveRuleAsync(Guid ruleId, CancellationToken ct = default) =>
-        Task.FromResult(new RuleApplyResult { Succeeded = true });
+        return Task.FromResult(NextApplyResult.Succeeded
+            ? NextApplyResult with { ConfirmedAtUtc = DateTimeOffset.UtcNow }
+            : NextApplyResult);
+    }
+
+    public Task<RuleApplyResult> RemoveRuleAsync(Guid ruleId, CancellationToken ct = default)
+    {
+        Removed.Add(ruleId);
+        if (FailRemovals)
+        {
+            return Task.FromResult(new RuleApplyResult
+            {
+                Succeeded = false, FailureReason = "the test daemon refused",
+            });
+        }
+
+        Installed.RemoveAll(r => r.Id == ruleId);
+        return Task.FromResult(new RuleApplyResult { Succeeded = true });
+    }
+
+    public Task<IReadOnlyList<(Guid Id, string Name)>> GetInstalledRulesAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<(Guid, string)>>(Installed.ToArray());
 
     public Task<RuleApplyResult> SetProxiesAsync(
         IReadOnlyList<(ProxyEndpoint Endpoint, ProxySecrets Secrets)> proxies,

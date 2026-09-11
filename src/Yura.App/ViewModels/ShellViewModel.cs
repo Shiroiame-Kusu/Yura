@@ -400,17 +400,59 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
         await PushProxiesToDaemonAsync().ConfigureAwait(true);
         await _daemon.SetDnsPolicyAsync(DnsPolicy).ConfigureAwait(true);
 
-        foreach (var rule in Rules.Rules.Where(r => r.Lifetime == RuleLifetime.Persistent && r.Enabled))
+        // Every enabled rule, not only the saved ones. A daemon that has just started holds
+        // nothing, and a rule bound to a process that is still running is still wanted — the
+        // alternative is a list that says "Proxied" about a rule no longer in any kernel.
+        foreach (var rule in Rules.Rules.Where(r => r.Enabled))
         {
             var result = await _daemon.ApplyRuleAsync(rule).ConfigureAwait(true);
             if (result.Succeeded)
             {
                 Rules.MarkApplied(rule.Id, result.ConfirmedAtUtc);
+                continue;
             }
-            else
+
+            if (rule.Lifetime == RuleLifetime.Persistent)
             {
                 ConfigWarning = $"Saved rule “{rule.Name}” could not be reapplied: {result.FailureReason}";
             }
+            else
+            {
+                // A temporary rule the daemon will not take is a rule whose process is gone.
+                // Dropping it is the honest outcome; keeping it would show a policy that
+                // nothing is enforcing.
+                Rules.Remove(rule.Id);
+            }
+        }
+
+        await PruneStrayDaemonRulesAsync().ConfigureAwait(true);
+    }
+
+    /// <summary>
+    /// Takes out rules the daemon holds that this app does not.
+    /// </summary>
+    /// <remarks>
+    /// The app is the source of truth for what should be installed, and anything else the
+    /// daemon is holding decides routes from a position no page shows. That happens when a
+    /// previous app run exited between installing a rule and replacing it, and it happened
+    /// systematically until superseded rules were removed at the point they are replaced.
+    /// </remarks>
+    private async Task PruneStrayDaemonRulesAsync()
+    {
+        var installed = await _daemon.GetInstalledRulesAsync().ConfigureAwait(true);
+        var known = Rules.Rules.Select(r => r.Id).ToHashSet();
+        var strays = installed.Where(r => !known.Contains(r.Id)).ToList();
+
+        foreach (var stray in strays)
+        {
+            await _daemon.RemoveRuleAsync(stray.Id).ConfigureAwait(true);
+        }
+
+        if (strays.Count > 0)
+        {
+            ConfigWarning = strays.Count == 1
+                ? $"Removed a rule the daemon still held from an earlier session: “{strays[0].Name}”."
+                : $"Removed {strays.Count} rules the daemon still held from an earlier session.";
         }
     }
 

@@ -183,6 +183,11 @@ public sealed class SimulatedDaemonClient : IDaemonClient
         return new RuleApplyResult { Succeeded = true, ConfirmedAtUtc = DateTimeOffset.UtcNow };
     }
 
+    /// <summary>The demo daemon holds exactly what it was told to, so there is never a stray.</summary>
+    public Task<IReadOnlyList<(Guid Id, string Name)>> GetInstalledRulesAsync(
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<(Guid, string)>>([]);
+
     public Task<RuleApplyResult> SetProxiesAsync(
         IReadOnlyList<(ProxyEndpoint Endpoint, ProxySecrets Secrets)> proxies,
         IReadOnlyList<ProxyChain> chains,

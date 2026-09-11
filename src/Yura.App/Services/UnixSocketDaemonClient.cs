@@ -110,6 +110,23 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
         return ToApplyResult(response);
     }
 
+    public async Task<IReadOnlyList<(Guid Id, string Name)>> GetInstalledRulesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var response = await SendAsync(
+            new IpcRequest { Op = "list-rules" }, cancellationToken).ConfigureAwait(false);
+        if (!response.Ok || response.Rules is null)
+        {
+            return [];
+        }
+
+        // System rules are the daemon's own and are not the app's to remove.
+        return response.Rules
+            .Where(r => r.Origin != RuleOrigin.System)
+            .Select(r => (r.Id, r.Name))
+            .ToArray();
+    }
+
     public async Task<RuleApplyResult> SetProxiesAsync(
         IReadOnlyList<(ProxyEndpoint Endpoint, ProxySecrets Secrets)> proxies,
         IReadOnlyList<ProxyChain> chains,

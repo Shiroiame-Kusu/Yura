@@ -209,7 +209,15 @@ public sealed class RuleStore
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
-    public void Add(RoutingRule rule)
+    /// <summary>
+    /// Adds a rule, replacing any earlier selection for the same subject.
+    /// </summary>
+    /// <returns>
+    /// The rule this one superseded, or null. The caller must take that rule out of the daemon
+    /// as well: dropping it from this list only changes what the app shows, and a superseded
+    /// rule left installed sits at a lower position, so it keeps winning in the kernel.
+    /// </returns>
+    public RoutingRule? Add(RoutingRule rule)
     {
         // A new selection for the same process replaces the previous one rather than
         // stacking, so the effective policy is never the result of two competing overrides.
@@ -222,6 +230,7 @@ public sealed class RuleStore
         _rules.Add(rule);
         PendingUndo = new RuleUndo(rule.Name, replaced, rule);
         Changed?.Invoke(this, EventArgs.Empty);
+        return replaced;
     }
 
     /// <summary>

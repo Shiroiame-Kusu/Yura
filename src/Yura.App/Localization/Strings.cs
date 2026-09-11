@@ -117,6 +117,8 @@ internal static class Strings
         ["Processes.Applied.Title"] = "Rule active for new connections",
         ["Processes.Applied.Body"] =
             "Connections opened from now on use {0}. Connections that were already open keep their previous route until the application reconnects.",
+        ["Processes.Applied.StaleRule"] =
+            "The new rule is in place, but the rule it replaces (“{0}”) could not be taken out of the daemon. It sits above the new one, so it may still decide. Remove it on the Rules page.",
         ["Processes.PathDenied"] = "Permission denied",
         ["Processes.PathDeleted"] = "Executable replaced since start",
 
@@ -635,6 +637,7 @@ internal static class Strings
 
         ["Processes.Applied.Title"] = "规则已对新连接生效",
         ["Processes.Applied.Body"] = "此后建立的连接将使用 {0}。已经打开的连接在应用程序重新连接之前仍使用原有路由。",
+        ["Processes.Applied.StaleRule"] = "新规则已生效，但它所替换的规则（“{0}”）未能从守护进程中移除。该规则位于新规则之前，因此仍可能生效。请在规则页面将其删除。",
         ["Processes.PathDenied"] = "权限不足",
         ["Processes.PathDeleted"] = "启动后可执行文件已被替换",
 
