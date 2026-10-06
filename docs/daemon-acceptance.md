@@ -8,7 +8,7 @@ dotnet build src/Yura.Daemon
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-**128 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
+**137 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
 wireguard-tools 1.0.
 
 Nothing in the harness touches nftables, cgroups or policy routing directly. Every kernel
@@ -106,8 +106,9 @@ what a user experiences as "the route does nothing":
 ### NAT type, direct and through a route
 
 What a peer-to-peer game needs is not that its packets leave but that a peer's packets arrive,
-which depends on the route rather than on the machine. Seven checks measure it the way the
-harness proves everything else — with a server that only one path can reach:
+which depends on the route rather than on the machine. Sixteen checks measure it the way the
+harness proves everything else — with a server that only one path can reach. The first seven
+ask STUN servers what mapping each route gives:
 
 | Check | Result |
 | --- | --- |
@@ -127,18 +128,49 @@ the forwarder relays each destination over an association of its own.
 ² Changed with full-cone UDP, and verified on 2026-10-06: `moderate`, both servers seeing the
 agent at `10.78.1.2:40092` — one address, from the default full-cone range. Before full cone
 this row reported `strict`, `addressAndPortDependent` — a channel per destination, a port per
-peer — with both servers on one address. The second server now has an address of its own, since two ports of one address
-agreeing about a mapping say nothing about whether it depends on the address; and the agent is
-told its own address with `--own-address`, because this fixture puts its "remote" servers on
-the namespace's own loopback, which the agent otherwise refuses to relay to. What this table
-does not show is a peer the game never sent to getting through. The agent's half of that is
-proved against a real agent in `FullConeTests`, and the daemon's routing of it in
-`AgentConeTests`; the last step — the daemon handing the datagram to the game from the peer's
-address — needs root and a second client to play the peer, and is not exercised anywhere yet.
+peer — with both servers on one address. The second server now has an address of its own,
+since two ports of one address agreeing about a mapping say nothing about whether it depends on
+the address; and the agent is told its own address with `--own-address`, because this fixture
+puts its "remote" servers on the namespace's own loopback, which the agent otherwise refuses to
+relay to. What this table cannot show is a peer the game never sent to getting through; the
+next one does.
+
+The other nine ask the question the STUN fixture leaves open: whether a peer the game has never
+sent to gets in, and only the peers it should. A game routed through the agent learns its address
+from the server at `198.51.100.7:3478`, and a second client at `198.51.100.8:6112`, on another
+address and another port that both exist only inside the agent's namespace, sends to it. Then a
+second game, whose rule covers only the server's address, hears from a stranger at that address
+and from one somewhere else:
+
+| Check | Result |
+| --- | --- |
+| A rule routes a peer-to-peer game through the agent | Applied before the game starts, as an executable rule |
+| The game learns the address its peers will see | The server inside the namespace reports the agent's address and a port from the full-cone range |
+| **A peer at an address the game never sent to gets through** | The game receives the peer's datagram from `198.51.100.8:6112`, having sent only to `198.51.100.7:3478` |
+| **The game's answer reaches the peer from the address the server saw** | One socket at the agent for the server and the stranger alike, so the peer can tell the game's answer from anyone else's |
+| Nothing from the agent's own loopback reaches the game | Two datagrams from `127.0.0.1` inside the namespace, sent ahead of the peer's on the same socket; the game hears only the peer |
+| The Connections view lists the peer's flow under the game | `confirmedProxied` through the agent, with bytes both ways, and the note "Opened by the peer, through the full-cone channel at the agent." |
+| A rule routes a second game through the agent for one address only | `networks: 198.51.100.7/32`, so only the server's address takes the agent's route |
+| **A stranger at that one address still gets through** | From `198.51.100.7:6112`, a port the game never sent to, and it hears the answer from the game's address |
+| **A stranger anywhere else is turned away, by the daemon** | Two datagrams from `198.51.100.8:6112`, which the agent passes on, as the check above shows: the game hears neither, and no flow is opened. Its answer would not take the agent's route, so the peer could never have heard it |
+
+Nothing the game sent opened the way for the peer, and nothing but the agent connects the two,
+so the datagram the game received from `198.51.100.8:6112` came through every stage: the agent's
+full-cone socket, its datagram channel, the daemon's cone routing, and a transparent socket
+answering as the peer. Verified on 2026-10-06 across consecutive runs: the game was told
+`10.78.1.2:40755`, then `10.78.1.2:40583`, and each time it heard the peer, and the peer heard
+the answer from that same address about 1.5 ms after sending. In the runs with the narrowed
+rule, the stranger at the covered address was answered from the second game's own address
+(`10.78.1.2:40305` in the last run), and the one elsewhere was heard by nothing. The agent's
+half is also proved against a real agent in `FullConeTests`, and the daemon's routing by sender
+in `AgentConeTests`.
 
 The fixture (`spikes/lib/stun_server.py`) answers binding requests and logs every query, and
 deliberately ignores `CHANGE-REQUEST`: it exists to pin the mapping behaviour, and simulating
 the filtering tests would let the suite assert something the fixture was only pretending to do.
+The game and its peer are `spikes/lib/p2p_game.py`. The game opens a new socket for each binding
+attempt until one is answered, because a socket opened before the exec-time classification
+reached the process is never routed; then it answers whoever sends to that socket.
 
 ### A rule reaching connections that were already open
 
@@ -324,5 +356,8 @@ passes for the wrong reason.
   in a namespace on the same machine, so the handshake, the cryptokey routing and the
   source-address requirement are real, but path MTU, NAT traversal and a peer that roams are
   not exercised.
+- **A full-cone channel expiring** once the game stops sending, at either end: four minutes at
+  the daemon, five at the agent. Nothing here waits that long, and the unit tests check only
+  that the daemon's limit is the shorter one.
 - **IPv6 inside a tunnel.** The interface gets its IPv6 address and its own `ip -6` rule and
   route when the configuration has one, but every flow in the suite is IPv4.

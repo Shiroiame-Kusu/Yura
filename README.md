@@ -10,7 +10,7 @@ traffic goes there.
 
 > **Status: working end to end.** The privileged daemon routes selected running processes
 > through user-supplied proxies and WireGuard exits, verified by
-> [128 acceptance checks](docs/daemon-acceptance.md) driven through its real IPC socket, and
+> [137 acceptance checks](docs/daemon-acceptance.md) driven through its real IPC socket, and
 > the desktop application drives it and can install it as a systemd service. All eleven
 > mandatory acceptance tests are covered. See [Current state](#current-state) for what is
 > proven and what is not.
@@ -161,9 +161,9 @@ yura-daemon ctl log
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-128 checks against a controlled network on a dummy interface, where each marker payload is
+137 checks against a controlled network on a dummy interface, where each marker payload is
 reachable only through one specific proxy — or, for a WireGuard exit and a Yura agent, only
-inside a network namespace that the tunnel or the agent is the sole way into. **128 passed, 0
+inside a network namespace that the tunnel or the agent is the sole way into. **137 passed, 0
 failed.** All eleven mandatory acceptance tests are covered, including child exclusion, rule
 precedence in the kernel, and Wine/Proton isolation. See
 [docs/daemon-acceptance.md](docs/daemon-acceptance.md) for the evidence behind each one and for
@@ -265,7 +265,7 @@ is unreferenced.
 - All seven pages: Processes, Games, Connections, Proxies, Rules, Diagnostics, Settings
 - Design system, both themes, both languages, 960×640 to 1280×800, 100–200% scaling —
   see [docs/ux-verification.md](docs/ux-verification.md)
-- **Routing spike passing 12/12** and the **daemon acceptance suite passing 128/128**: a
+- **Routing spike passing 12/12** and the **daemon acceptance suite passing 137/137**: a
   running process migrated into a cgroup live, classified by nftables, captured by TPROXY and
   forwarded to a SOCKS5 proxy, through a WireGuard tunnel, or through a Yura agent — TCP and
   UDP, per instance, with the process still running as its original user

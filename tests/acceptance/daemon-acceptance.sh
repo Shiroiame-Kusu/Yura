@@ -1088,6 +1088,126 @@ check "the servers inside the namespace saw the probes arrive from the agent" ba
   b=\$(python3 '$LIB/logquery.py' count '$RUN/stun-agent-b.jsonl' --event binding)
   [[ \$a -ge 1 && \$b -ge 1 ]] && echo \"\$a query at ${UNREACHABLE} and \$b at ${UNREACHABLE_B}, inside ${AG_NS}\""
 
+# The other half of full cone, which the NAT test cannot see because these STUN servers do not
+# answer the filtering question: whether a peer the game has never sent to can reach it. Asked
+# the way a game asks it. The game learns its address from one server and hands it to a peer at
+# another address entirely, so nothing the game sent opened the way. The peer exists only
+# inside the namespace, so its datagram can reach the game only through the agent, the daemon
+# and a reply socket answering as the peer; and the game's answer has to leave from the address
+# the server saw, or the peer could not tell it from a stranger's.
+
+# Starts a game as the desktop user through a private copy of the interpreter, so a rule can name
+# it, and prints its pid.
+start_p2p_game() {  # runner log-name
+  as_user "$1" "${LIB}/p2p_game.py" game --rendezvous "${UNREACHABLE}:3478" \
+    --log "$RUN/$2.jsonl" > "$RUN/$2.out" 2>&1 &
+  await_pid "$RUN/$2.jsonl"
+}
+
+# The address a game was told its peers will see, once it has been told; empty if it never was.
+p2p_mapped() {  # log-name
+  local mapped=""
+  for _ in $(seq 1 80); do
+    mapped="$(python3 -c "
+import json,sys
+try:
+    for l in open(sys.argv[1]):
+        r=json.loads(l)
+        if r.get('event')=='mapped': print(r['mapped']); break
+except (OSError, ValueError): pass" "$RUN/$1.jsonl")"
+    [[ -n "$mapped" ]] && break
+    sleep 0.25
+  done
+  echo "$mapped"
+}
+
+P2P_APP="$RUN/yura-p2papp"
+cp /usr/bin/python3 "$P2P_APP"; chmod 755 "$P2P_APP"
+RULE_PP="eeee9999-0000-4000-8000-000000000099"
+P2P_PEER="${UNREACHABLE_B}:6112"
+check "daemon applies a rule routing a peer-to-peer game through the agent" ctl apply-rule \
+  "$(exe_rule "$RULE_PP" "p2p game via agent" "$P2P_APP" proxy "\"$AG_ID\"" 124)"
+P2P_PID="$(start_p2p_game "$P2P_APP" p2p-game || true)"; BG+=("$P2P_PID")
+P2P_MAPPED="$(p2p_mapped p2p-game)"
+check "the game learns the address its peers will see, from a server inside the namespace" bash -c "
+  [[ '$P2P_MAPPED' == '${AG_ADDR}:'* ]] && echo 'peers are to send to $P2P_MAPPED, which is the agent' || { tail -3 '$RUN/p2p-game.jsonl'; exit 1; }"
+
+# A sender the agent refuses to relay to goes first, from the agent's own loopback: if it got
+# through, anything on the agent's machine could write into a client's game. It travels the
+# same channel ahead of the peer, so had it been passed on, it would have arrived first.
+ip netns exec "$AG_NS" python3 "${LIB}/p2p_game.py" peer --bind 127.0.0.1:6112 --to "$P2P_MAPPED" \
+  --payload YURA-P2P-FROM-LOOPBACK --attempts 2 --log "$RUN/p2p-refused.jsonl" > "$RUN/p2p-refused.out" 2>&1 || true
+ip netns exec "$AG_NS" python3 "${LIB}/p2p_game.py" peer --bind "$P2P_PEER" --to "$P2P_MAPPED" \
+  --log "$RUN/p2p-peer.jsonl" > "$RUN/p2p-peer.out" 2>&1 || true
+check "a peer at an address the game never sent to gets through to it" bash -c "
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/p2p-game.jsonl' --event peer --where-contains sender=$P2P_PEER)
+  [[ \$n -ge 1 ]] && echo \"\$n datagram(s) from $P2P_PEER reached the game, which had only sent to ${UNREACHABLE}:3478\""
+check "and the game's answer reaches the peer from the address the server saw" bash -c "
+  python3 -c \"
+import json
+rs=[json.loads(l) for l in open('$RUN/p2p-peer.jsonl') if l.strip()]
+a=[r for r in rs if r.get('event')=='answer']
+assert a, rs[-3:]
+assert a[0]['sender']=='$P2P_MAPPED', a[0]
+assert a[0]['detail'].startswith('YURA-P2P-ANSWER YURA-P2P-HELLO'), a[0]
+print(f\\\"answered from {a[0]['sender']}: one address for the server and the stranger alike\\\")\""
+check "nothing sent from the agent's own loopback is passed on to the game" bash -c "
+  s=\$(python3 '$LIB/logquery.py' count '$RUN/p2p-refused.jsonl' --event sent)
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/p2p-game.jsonl' --event peer)
+  m=\$(python3 '$LIB/logquery.py' count '$RUN/p2p-game.jsonl' --event peer --where-contains sender=$P2P_PEER)
+  [[ \$s -ge 1 && \$n -eq \$m ]] && echo \"\$s datagram(s) sent from 127.0.0.1 inside ${AG_NS}; the game heard only the peer\""
+check "the Connections view lists the peer's flow under the game, and says who opened it" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' list-connections '{\"pid\":$P2P_PID}' | python3 -c \"
+import json,sys
+rows=json.load(sys.stdin)['connections']
+mine=[c for c in rows if c['remote']=='$P2P_PEER']
+assert len(mine)==1, rows
+c=mine[0]
+assert c['route']=='confirmedProxied' and c['proxyName']=='Agent', c
+assert 'Opened by the peer' in (c.get('note') or ''), c
+assert c['bytesUp']>0 and c['bytesDown']>0, c
+print(f\\\"{c['remote']} via {c['proxyName']}: {c['note']}\\\")\""
+ctl remove-rule "{\"ruleId\":\"$RULE_PP\"}" > /dev/null
+kill -9 "$P2P_PID" 2>/dev/null || true
+
+# A rule narrowed to some destinations lets a stranger in only from one of them. From anywhere
+# else, the game's answer would not take the agent's route; it would leave from an address the
+# peer has never heard of, so the daemon turns the peer away rather than open a flow that cannot
+# work. The agent passes both strangers on alike, as it passed the one above, so whichever the
+# game does not hear, the daemon stopped. The one it does hear sends from a port the game never
+# used, so it is a stranger as well, and its getting through shows the way in was open.
+P2N_APP="$RUN/yura-p2pnarrow"
+cp /usr/bin/python3 "$P2N_APP"; chmod 755 "$P2N_APP"
+RULE_PN="eeeeaaaa-0000-4000-8000-0000000000aa"
+P2N_INSIDE="${UNREACHABLE}:6112"
+check "daemon applies a rule routing a game through the agent for one address only" ctl apply-rule \
+  "$(exe_rule "$RULE_PN" "p2p game via agent, one address" "$P2N_APP" proxy "\"$AG_ID\"" 125 manual ",\"networks\":[\"${UNREACHABLE}/32\"]")"
+P2N_PID="$(start_p2p_game "$P2N_APP" p2p-narrow || true)"; BG+=("$P2N_PID")
+P2N_MAPPED="$(p2p_mapped p2p-narrow)"
+ip netns exec "$AG_NS" python3 "${LIB}/p2p_game.py" peer --bind "$P2P_PEER" --to "$P2N_MAPPED" \
+  --attempts 2 --log "$RUN/p2p-outside.jsonl" > "$RUN/p2p-outside.out" 2>&1 || true
+ip netns exec "$AG_NS" python3 "${LIB}/p2p_game.py" peer --bind "$P2N_INSIDE" --to "$P2N_MAPPED" \
+  --log "$RUN/p2p-inside.jsonl" > "$RUN/p2p-inside.out" 2>&1 || true
+check "a stranger at the one address the rule covers still gets through" bash -c "
+  python3 -c \"
+import json
+def events(path, kind): return [r for r in map(json.loads, filter(str.strip, open(path))) if r.get('event')==kind]
+assert '$P2N_MAPPED'.startswith('${AG_ADDR}:'), 'the game was never told its address'
+heard=[r['sender'] for r in events('$RUN/p2p-narrow.jsonl','peer')]
+assert '$P2N_INSIDE' in heard, heard
+a=events('$RUN/p2p-inside.jsonl','answer')
+assert a and a[0]['sender']=='$P2N_MAPPED', a
+print(f\\\"$P2N_INSIDE, on a port the game never sent to, heard the answer from {a[0]['sender']}\\\")\""
+check "a stranger outside the rule's destinations is turned away, and no flow is opened for it" bash -c "
+  s=\$(python3 '$LIB/logquery.py' count '$RUN/p2p-outside.jsonl' --event sent)
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/p2p-narrow.jsonl' --event peer --where-contains sender=$P2P_PEER)
+  f=\$('$DAEMON' ctl --socket '$SOCK' list-connections '{\"pid\":$P2N_PID}' | python3 -c \"
+import json,sys
+print(sum(1 for c in json.load(sys.stdin)['connections'] if c['remote']=='$P2P_PEER'))\")
+  [[ \$s -ge 1 && \$n -eq 0 && \$f == 0 ]] && echo \"\$s datagram(s) from $P2P_PEER, which the agent passes on; the game heard none, and no flow was opened\""
+ctl remove-rule "{\"ruleId\":\"$RULE_PN\"}" > /dev/null
+kill -9 "$P2N_PID" 2>/dev/null || true
+
 check "a chain is reported as carrying no UDP at all, rather than as unknown" bash -c "
   '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"chainId\":\"$AG_CHAIN_ID\",\"servers\":[$NS_STUN],\"routeOnly\":true}}' | python3 -c \"
 import json,sys

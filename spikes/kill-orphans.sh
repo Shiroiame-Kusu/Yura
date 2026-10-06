@@ -9,7 +9,7 @@
 set -uo pipefail
 
 killed=0
-for name in marker_server socks5_proxy tproxy_forwarder spike_client dns_server stun_server; do
+for name in marker_server socks5_proxy tproxy_forwarder spike_client dns_server stun_server p2p_game; do
   while read -r pid; do
     [[ -z "$pid" || "$pid" == "$$" ]] && continue
     kill -9 "$pid" 2>/dev/null && killed=$((killed + 1))
