@@ -131,7 +131,7 @@ public static class Program
         }
 
         AgentIdentity.RotateToken(arguments.State);
-        var identity = AgentIdentity.LoadOrCreate(arguments.State);
+        var identity = AgentIdentity.Load(arguments.State)!;
         Console.WriteLine("The token has been replaced. Every client must be given the new connect string,");
         Console.WriteLine($"and the agent must be restarted: systemctl restart {AgentUnit.ServiceName}");
         PrintConnection(identity, arguments);
@@ -204,12 +204,17 @@ public static class Program
 
         if (!string.Equals(executable, AgentUnit.InstallPath, StringComparison.Ordinal))
         {
+            // Copied beside the old one and renamed over it. On a server already running the
+            // agent, that file is the service's executable, and the kernel refuses to write to it
+            // ("text file busy") but not to replace it.
             Directory.CreateDirectory(Path.GetDirectoryName(AgentUnit.InstallPath)!);
-            File.Copy(executable, AgentUnit.InstallPath, overwrite: true);
-            File.SetUnixFileMode(AgentUnit.InstallPath,
+            var staging = AgentUnit.InstallPath + ".new";
+            File.Copy(executable, staging, overwrite: true);
+            File.SetUnixFileMode(staging,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
                 UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
                 UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+            File.Move(staging, AgentUnit.InstallPath, overwrite: true);
             Console.WriteLine($"Copied the agent to {AgentUnit.InstallPath}.");
         }
 
@@ -217,28 +222,83 @@ public static class Program
             .ConfigureAwait(false);
         Console.WriteLine($"Wrote {AgentUnit.UnitPath}.");
 
+        // Earlier versions wrote into the service's directory as root, leaving files the service
+        // could not read once it restarted. They go back to the service's user before it starts.
+        var repaired = FileOwnership.Repair(AgentUnit.StateDirectory);
+        if (repaired > 0)
+        {
+            Console.WriteLine($"Gave {repaired} file(s) in {AgentUnit.StateDirectory} back to the service's user.");
+        }
+
+        // Restarted rather than started: starting a service that is already running does
+        // nothing, so installing again — to upgrade, or to change an option — left the old
+        // binary running under the old unit.
         if (await Systemctl("daemon-reload").ConfigureAwait(false) != 0 ||
-            await Systemctl("enable", "--now", AgentUnit.ServiceName).ConfigureAwait(false) != 0)
+            await Systemctl("enable", AgentUnit.ServiceName).ConfigureAwait(false) != 0 ||
+            await Systemctl("restart", AgentUnit.ServiceName).ConfigureAwait(false) != 0)
         {
             return Fail("systemd would not start the service; see: systemctl status " + AgentUnit.ServiceName);
         }
 
-        Console.WriteLine($"{AgentUnit.ServiceName} is enabled and running.");
-
-        // The service creates its identity on first run, in a directory systemd owns.
-        for (var attempt = 0; attempt < 25 && AgentIdentity.Load(AgentUnit.StateDirectory) is null; attempt++)
+        // The service creates its identity on its first run, in a directory systemd owns, and
+        // writes the name it was given just after the key and token.
+        AgentIdentity? identity = null;
+        for (var attempt = 0; attempt < 25; attempt++)
         {
+            identity = AgentIdentity.Load(AgentUnit.StateDirectory);
+            if (identity is not null && (arguments.Name is null || identity.Name == arguments.Name))
+            {
+                break;
+            }
+
             await Task.Delay(200).ConfigureAwait(false);
         }
 
-        if (AgentIdentity.Load(AgentUnit.StateDirectory) is not { } identity)
+        if (identity is null)
         {
             return Fail($"the service started but wrote no identity to {AgentUnit.StateDirectory}; " +
                         "see: journalctl -u " + AgentUnit.ServiceName);
         }
 
+        // Started is not running. A service that fails as it starts is started again by systemd,
+        // and looks active between attempts; this said "running" over an agent that never got as
+        // far as listening. One that accepts a connection has read its identity and is serving.
+        if (!await AcceptsConnectionsAsync(options).ConfigureAwait(false))
+        {
+            return Fail($"{AgentUnit.ServiceName} started but is not accepting connections on port {options.Port}; " +
+                        "see: journalctl -u " + AgentUnit.ServiceName);
+        }
+
+        Console.WriteLine($"{AgentUnit.ServiceName} is enabled and running.");
         PrintConnection(identity, arguments);
         return 0;
+    }
+
+    /// <summary>Whether the agent accepts a TCP connection on its own port, tried for five seconds.</summary>
+    /// <remarks>The agent treats a connection that closes without a handshake as a scanner, silently.</remarks>
+    private static async Task<bool> AcceptsConnectionsAsync(AgentOptions options)
+    {
+        var address = options.Listen.Equals(IPAddress.IPv6Any) ? IPAddress.IPv6Loopback
+            : options.Listen.Equals(IPAddress.Any) ? IPAddress.Loopback
+            : options.Listen;
+
+        for (var attempt = 0; attempt < 25; attempt++)
+        {
+            using var probe = new System.Net.Sockets.Socket(
+                address.AddressFamily, System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp);
+            try
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                await probe.ConnectAsync(new IPEndPoint(address, options.Port), timeout.Token).ConfigureAwait(false);
+                return true;
+            }
+            catch (Exception e) when (e is System.Net.Sockets.SocketException or OperationCanceledException)
+            {
+                await Task.Delay(200).ConfigureAwait(false);
+            }
+        }
+
+        return false;
     }
 
     private static async Task<int> UninstallAsync(string[] args)

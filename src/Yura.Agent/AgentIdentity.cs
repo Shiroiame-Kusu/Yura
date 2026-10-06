@@ -83,25 +83,41 @@ public sealed class AgentIdentity
             ? existing
             : NewToken(tokenPath);
 
-        var label = name
-                    ?? (File.Exists(namePath) ? File.ReadAllText(namePath).Trim() : null)
-                    ?? DefaultName();
-        WriteFile(namePath, label + "\n", UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        var stored = ReadName(directory);
+        var label = name ?? stored ?? DefaultName();
+        if (!string.Equals(label, stored, StringComparison.Ordinal))
+        {
+            WriteFile(namePath, label + "\n", UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
 
         return new AgentIdentity(directory, certificate, token, label);
     }
 
     /// <summary>Reads an existing identity, or null when the agent has never run here.</summary>
+    /// <remarks>
+    /// Reads and nothing more. Root runs this from the command line, through install and show,
+    /// against the service's own directory. It used to go through <see cref="LoadOrCreate"/>,
+    /// which rewrote the name file each time, as root, so the service failed at its next start.
+    /// </remarks>
     public static AgentIdentity? Load(string directory)
     {
         var certificatePath = Path.Combine(directory, CertificateFile);
         var tokenPath = Path.Combine(directory, TokenFile);
-        if (!File.Exists(certificatePath) || !File.Exists(tokenPath))
+        if (!File.Exists(certificatePath) || !File.Exists(tokenPath) ||
+            !AgentConnection.TryDecodeToken(File.ReadAllText(tokenPath).Trim(), out var token))
         {
             return null;
         }
 
-        return LoadOrCreate(directory);
+        var certificate = X509CertificateLoader.LoadPkcs12FromFile(certificatePath, password: null,
+            X509KeyStorageFlags.EphemeralKeySet);
+        return new AgentIdentity(directory, certificate, token, ReadName(directory) ?? DefaultName());
+    }
+
+    private static string? ReadName(string directory)
+    {
+        var path = Path.Combine(directory, NameFile);
+        return File.Exists(path) && File.ReadAllText(path).Trim() is { Length: > 0 } name ? name : null;
     }
 
     private static X509Certificate2 Create(string path)
@@ -158,6 +174,9 @@ public sealed class AgentIdentity
             stream.Flush(flushToDisk: true);
         }
 
+        // Root writing into the service's directory, as rotate does, would otherwise leave a file
+        // the service cannot read; it goes to the directory's owner before it replaces the old one.
+        FileOwnership.MatchDirectory(temporary, Path.GetDirectoryName(Path.GetFullPath(path))!);
         File.Move(temporary, path, overwrite: true);
     }
 

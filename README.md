@@ -296,16 +296,16 @@ is unreferenced.
 - A systemd service installed from Settings through polkit, with the unit and the script
   shown before anything runs as root, and start / stop / restart / uninstall from the same
   page
-- 404 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
-  wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and
-  tunnel manager, the agent protocol end to end against a real agent — full-cone UDP
-  included — the agent's systemd unit, the connect string, the datagram sealing and its
-  replay window, the systemd unit generators, the Steam library reader and its KeyValues
-  parser, the STUN codec and the NAT classifier's table of cases, the socket-abort request's
-  byte layout, socket lookups against the running kernel, the flow registry, full-cone
-  routing in the daemon, the rule store and the rule editor, the process inspector, the
-  Games page, the proxy, agent and chain editors, the secret store, the daemon client
-  against a stand-in daemon, keeping a restarted daemon in step, the routing-evidence
+- 410 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+  wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and tunnel
+  manager, the agent protocol end to end against a real agent — full-cone UDP included — the
+  agent's systemd unit, its key and token on disk and who may write them, the connect string,
+  the datagram sealing and its replay window, the systemd unit generators, the Steam library
+  reader and its KeyValues parser, the STUN codec and the NAT classifier's table of cases, the
+  socket-abort request's byte layout, socket lookups against the running kernel, the flow
+  registry, full-cone routing in the daemon, the rule store and the rule editor, the process
+  inspector, the Games page, the proxy, agent and chain editors, the secret store, the daemon
+  client against a stand-in daemon, keeping a restarted daemon in step, the routing-evidence
   sentences, and the configuration file
 - Configuration under `~/.config/Yura`, with passwords and keys in the desktop secret service
   and persistent rules reapplied to the daemon on every connection
