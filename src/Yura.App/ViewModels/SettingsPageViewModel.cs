@@ -443,6 +443,9 @@ public sealed partial class SettingsPageViewModel : ObservableObject
         }
     }
 
+    /// <summary>Re-renders every localised string after a language change.</summary>
+    public void NotifyLanguageChanged() => OnPropertyChanged(string.Empty);
+
     /// <summary>Re-raises everything the shell owns, after the shell changes it.</summary>
     public void NotifyShellChanged()
     {

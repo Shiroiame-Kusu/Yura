@@ -22,10 +22,14 @@ namespace Yura.Daemon.Diagnostics;
 /// measured here, the same way, so the two verdicts are comparable — the same reason
 /// <see cref="NetworkMeasurer"/> measures its target twice.
 ///
-/// The probe is STUN over the route's own UDP path: a plain marked socket, a WireGuard exit's
-/// socket, a SOCKS5 association, or an agent's datagram channel. A route that cannot carry
-/// UDP at all is not a failure to report as unknown — it is a definite answer, because a game
-/// whose UDP cannot leave has no peer-to-peer connectivity whatsoever.
+/// The probe is STUN over the route's own UDP path, carried exactly the way the forwarder
+/// carries a game's datagrams: the direct path on one socket, like the game's own; a WireGuard
+/// exit on one socket per destination, a SOCKS5 proxy on one association per destination, and
+/// an agent on one channel per destination — because that is what the forwarder opens for each
+/// flow. Measuring a relayed route on a single socket reported the mapping of a socket no game
+/// traffic ever uses. A route that cannot carry UDP at all is not a failure to report as
+/// unknown — it is a definite answer, because a game whose UDP cannot leave has no
+/// peer-to-peer connectivity whatsoever.
 /// </remarks>
 public static class NatProbe
 {
@@ -121,17 +125,19 @@ public static class NatProbe
         // mapping, and its OTHER-ADDRESS decides whether the filtering tests are possible.
         StunMessage? first = null;
         IPEndPoint? firstServer = null;
+        var firstIndex = -1;
         double? roundTrip = null;
-        foreach (var server in servers)
+        for (var i = 0; i < servers.Count; i++)
         {
             var attempt = Stopwatch.StartNew();
-            var answer = await RequestAsync(transport, server, Stun.Change.None, ct).ConfigureAwait(false);
+            var answer = await RequestAsync(transport, servers[i], Stun.Change.None, ct).ConfigureAwait(false);
             if (answer?.Message.MappedEndpoint is not null)
             {
                 first = answer.Value.Message;
-                firstServer = server;
+                firstServer = servers[i];
+                firstIndex = i;
                 roundTrip = attempt.Elapsed.TotalMilliseconds;
-                used.Add(server.ToString());
+                used.Add(servers[i].ToString());
                 break;
             }
         }
@@ -147,50 +153,63 @@ public static class NatProbe
             };
         }
 
-        // A second, genuinely different server address on the same socket: if the mapping
-        // differs between the two, the address a peer would be told is not the address it
-        // would see, and no amount of hole punching helps.
-        // Another address if there is one, otherwise another port of the same server, and
-        // failing both, whatever second address the server advertised. The three are not
-        // equally conclusive and the classifier is told which it got.
-        var second = servers.FirstOrDefault(s => !s.Address.Equals(firstServer.Address))
-                     ?? servers.FirstOrDefault(s => !s.Equals(firstServer))
-                     ?? first.OtherAddress;
-        StunMessage? secondAnswer = null;
-        var distinct = false;
-        var onlyPortDiffers = false;
+        IPEndPoint anchor = firstServer;
 
-        if (second is not null)
-        {
-            distinct = !second.Equals(firstServer);
-            onlyPortDiffers = second.Address.Equals(firstServer.Address);
-            var answer = await RequestAsync(transport, second, Stun.Change.None, ct).ConfigureAwait(false);
-            if (answer?.Message.MappedEndpoint is not null)
-            {
-                secondAnswer = answer.Value.Message;
-                used.Add(second.ToString());
-            }
-            else
-            {
-                distinct = false;
-            }
-        }
-
-        // Filtering needs the server to answer from somewhere it was never sent to, which it
-        // can only do if it has a second address. Most public servers do not.
+        // Filtering first, while the only address this route has sent to is the first server's.
+        // Asked after the mapping test, the second server — or the first server's own other
+        // address, which is where that test falls back to — would already have opened the NAT
+        // to the very address the answer comes back from, and a filter that admits only hosts
+        // it has sent to would pass for one that admits anybody: the flattering Open, given to
+        // a Moderate NAT. It needs a server with a second address, which most public ones lack.
         bool? fromOtherAddressAndPort = null;
         bool? fromOtherPort = null;
-        if (first.OtherAddress is { } other && !other.Address.Equals(firstServer.Address))
+        if (first.OtherAddress is { } other && !other.Address.Equals(anchor.Address))
         {
-            var changed = await RequestAsync(
-                transport, firstServer, Stun.Change.Address | Stun.Change.Port, ct).ConfigureAwait(false);
-            fromOtherAddressAndPort = changed is not null;
+            fromOtherAddressAndPort = await FilteringProbeAsync(
+                transport, anchor, Stun.Change.Address | Stun.Change.Port,
+                from => !from.Address.Equals(anchor.Address), ct).ConfigureAwait(false);
 
             if (fromOtherAddressAndPort is false)
             {
-                var port = await RequestAsync(transport, firstServer, Stun.Change.Port, ct).ConfigureAwait(false);
-                fromOtherPort = port is not null;
+                fromOtherPort = await FilteringProbeAsync(
+                    transport, anchor, Stun.Change.Port,
+                    from => from.Address.Equals(anchor.Address) && from.Port != anchor.Port, ct).ConfigureAwait(false);
             }
+        }
+
+        // The mapping: a second server on the same route. If the mapping differs between the
+        // two, the address a peer would be told is not the address it would see, and no amount
+        // of hole punching helps. Another address if there is one, otherwise another port of
+        // the same server, and failing both, whatever second address the server advertised;
+        // the three are not equally conclusive and the classifier is told which it got. Only
+        // servers after the first one that answered are candidates: those before it have
+        // already failed to answer once, and asking again cost the wait a second time and left
+        // the mapping unknown when a later server would have answered.
+        var untried = servers.Skip(firstIndex + 1).ToList();
+        var candidates = untried.Where(s => !s.Address.Equals(anchor.Address))
+            .Concat(untried.Where(s => s.Address.Equals(anchor.Address) && !s.Equals(anchor)))
+            .ToList();
+        if (first.OtherAddress is { } alternate && !alternate.Equals(anchor) && !candidates.Contains(alternate))
+        {
+            candidates.Add(alternate);
+        }
+
+        StunMessage? secondAnswer = null;
+        var distinct = false;
+        var onlyPortDiffers = false;
+        foreach (var candidate in candidates)
+        {
+            var answer = await RequestAsync(transport, candidate, Stun.Change.None, ct).ConfigureAwait(false);
+            if (answer?.Message.MappedEndpoint is null)
+            {
+                continue;
+            }
+
+            secondAnswer = answer.Value.Message;
+            distinct = true;
+            onlyPortDiffers = candidate.Address.Equals(anchor.Address);
+            used.Add(candidate.ToString());
+            break;
         }
 
         var assessment = NatClassifier.Classify(new NatObservations
@@ -229,27 +248,56 @@ public static class NatProbe
         Diagnostics = reason,
     };
 
+    /// <summary>
+    /// Asks the server to answer from somewhere else, and says whether an answer from there got
+    /// through.
+    /// </summary>
+    /// <param name="expectedFrom">Whether an answer came from where it was asked to come from.</param>
+    /// <returns>
+    /// True when it did; false when nothing came back, which is the NAT filtering it out; null
+    /// when the server answered from somewhere it was asked not to — it ignored the request, so
+    /// the answer says nothing about filtering and must not be counted as if it did.
+    /// </returns>
+    private static async Task<bool?> FilteringProbeAsync(
+        INatTransport transport, IPEndPoint server, Stun.Change change, Func<IPEndPoint, bool> expectedFrom,
+        CancellationToken ct)
+    {
+        var answer = await RequestAsync(transport, server, change, ct).ConfigureAwait(false);
+        if (answer is null)
+        {
+            return false;
+        }
+
+        return answer.Value.From is not { } from || expectedFrom(from) ? true : null;
+    }
+
     /// <summary>One request, retried, and the matching answer with the address it came from.</summary>
     /// <remarks>
     /// Matched on the transaction id and never on the source address: the whole point of the
     /// filtering tests is that the answer arrives from somewhere else. Datagrams that are not
     /// this transaction's answer are discarded, because the route's socket may carry other
-    /// traffic.
+    /// traffic. Every retransmission carries the same transaction id, as RFC 5389 §7.2.1 has
+    /// it, so an answer to the first send that arrives during the second wait is still the
+    /// answer; a fresh id per attempt threw exactly those away, turning a slow route into a
+    /// silent one.
     /// </remarks>
     private static async Task<StunAnswer?> RequestAsync(
         INatTransport transport, IPEndPoint server, Stun.Change change, CancellationToken ct)
     {
+        var transactionId = Stun.NewTransactionId();
+        var request = Stun.BuildBindingRequest(transactionId, change);
+
         foreach (var wait in Attempts)
         {
-            var transactionId = Stun.NewTransactionId();
             try
             {
-                await transport.SendAsync(server, Stun.BuildBindingRequest(transactionId, change), ct)
-                    .ConfigureAwait(false);
+                await transport.SendAsync(server, request, ct).ConfigureAwait(false);
             }
-            catch (Exception e) when (e is SocketException or ObjectDisposedException
-                                         or AgentProtocolException or IOException)
+            catch (Exception e) when (e is SocketException or ObjectDisposedException or AgentProtocolException
+                                         or IOException or ProxyHandshakeException or UdpUnsupportedException)
             {
+                // The route would not carry a datagram to this server: as far as the test is
+                // concerned, the server did not answer.
                 return null;
             }
 
@@ -312,7 +360,7 @@ public static class NatProbe
     {
         if (route is not { Count: > 0 })
         {
-            return SocketNatTransport.Open(PolicyRouting.BypassMark, bindTo: null, firstServer);
+            return SocketNatTransport.Open(PolicyRouting.BypassMark, firstServer);
         }
 
         if (route.Count > 1)
@@ -328,12 +376,12 @@ public static class NatProbe
             var source = tunnel.SourceFor(AddressFamily.InterNetwork)
                          ?? throw new UdpUnsupportedException(
                              $"WireGuard exit '{tunnel.Name}' has no IPv4 address inside the tunnel.");
-            return SocketNatTransport.Open(tunnel.Mark, source, firstServer);
+            return new PerDestinationNatTransport(tunnel.Mark, source);
         }
 
         return hop.Endpoint.Protocol switch
         {
-            ProxyProtocol.Socks5 => await Socks5NatTransport.OpenAsync(hop, ct).ConfigureAwait(false),
+            ProxyProtocol.Socks5 => await Socks5NatTransport.OpenAsync(hop, firstServer, ct).ConfigureAwait(false),
             ProxyProtocol.YuraAgent => await AgentNatTransport.OpenAsync(hop, ct).ConfigureAwait(false),
             _ => throw new UdpUnsupportedException(
                 $"'{hop.Endpoint.Name}' is an {hop.Endpoint.ProtocolDisplay} proxy, which carries TCP only. " +
@@ -349,9 +397,10 @@ public sealed class UdpUnsupportedException(string message) : Exception(message)
 
 /// <summary>A way to send datagrams the way the route would, and read what comes back.</summary>
 /// <remarks>
-/// Small on purpose. The forwarder's UDP sessions cannot be reused here: each of those is
-/// bound to one destination and writes its answers back to an application's socket, and this
-/// probe needs the opposite — several destinations on one mapping, with the answers in hand.
+/// Small on purpose. The forwarder's UDP sessions cannot be reused here: each of those writes
+/// its answers back to an application's socket, and this probe needs the answers in hand. What
+/// the transports do reproduce is how the forwarder spreads destinations over sockets, because
+/// that is what decides the mapping a peer sees.
 /// </remarks>
 internal interface INatTransport : IAsyncDisposable
 {
@@ -372,7 +421,7 @@ internal interface INatTransport : IAsyncDisposable
 
 internal readonly record struct NatDatagram(IPEndPoint? From, byte[] Payload);
 
-/// <summary>A plain UDP socket: the direct path, and a WireGuard exit's path.</summary>
+/// <summary>A plain UDP socket: the direct path, which is the game's own socket.</summary>
 /// <remarks>
 /// Unconnected on purpose. The mapping test needs two destinations on one socket, and the
 /// filtering test needs an answer from an address the socket never sent to — a connected
@@ -383,22 +432,18 @@ internal sealed class SocketNatTransport : INatTransport
     private readonly Socket _socket;
     private readonly IPAddress? _source;
 
-    private SocketNatTransport(Socket socket, IPAddress? source, string? detail)
+    private SocketNatTransport(Socket socket, IPAddress? source)
     {
         _socket = socket;
         _source = source;
-        Detail = detail;
     }
 
-    public static SocketNatTransport Open(uint mark, IPAddress? bindTo, IPEndPoint towards)
+    public static SocketNatTransport Open(uint mark, IPEndPoint towards)
     {
         var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         socket.SetMark(mark);
-        socket.Bind(new IPEndPoint(bindTo ?? IPAddress.Any, 0));
-        return new SocketNatTransport(
-            socket,
-            bindTo ?? SourceTowards(mark, towards),
-            bindTo is null ? null : $"Measured from inside the tunnel, source {bindTo}.");
+        socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+        return new SocketNatTransport(socket, SourceTowards(mark, towards));
     }
 
     /// <summary>
@@ -431,7 +476,7 @@ internal sealed class SocketNatTransport : INatTransport
         ? null
         : new IPEndPoint(_source, bound.Port);
 
-    public string? Detail { get; }
+    public string? Detail => null;
 
     public async Task SendAsync(IPEndPoint destination, byte[] payload, CancellationToken ct) =>
         await _socket.SendToAsync(payload, SocketFlags.None, destination, ct).ConfigureAwait(false);
@@ -466,205 +511,23 @@ internal sealed class SocketNatTransport : INatTransport
     }
 }
 
-/// <summary>One SOCKS5 UDP association, carrying datagrams to several destinations.</summary>
-/// <remarks>
-/// This is what a game gets through a SOCKS5 proxy, and the mapping it reports is the
-/// proxy's: an association is one relay socket, so whether that socket keeps one mapping for
-/// every destination is a property of the proxy and of whatever NAT sits beyond it.
-/// </remarks>
-internal sealed class Socks5NatTransport : INatTransport
-{
-    private readonly Socket _control;
-    private readonly Socket _relay;
-
-    private Socks5NatTransport(Socket control, Socket relay, string detail)
-    {
-        _control = control;
-        _relay = relay;
-        Detail = detail;
-    }
-
-    public static async Task<Socks5NatTransport> OpenAsync(ProxyHop hop, CancellationToken ct)
-    {
-        var proxyAddress = await ProxyDialer.ResolveAsync(hop.Endpoint.Host, ct).ConfigureAwait(false);
-        var control = await ProxyDialer
-            .ConnectWithBypassAsync(hop.Endpoint.Host, hop.Endpoint.Port, ct)
-            .ConfigureAwait(false);
-
-        IPEndPoint relayEndpoint;
-        try
-        {
-            using var stream = new NetworkStream(control, ownsSocket: false);
-            await ProxyDialer.Socks5GreetAsync(stream, hop.Endpoint.Username, hop.Password, ct).ConfigureAwait(false);
-            await stream.WriteAsync(ProxyDialer.BuildSocks5Request(0x03, "0.0.0.0", 0), ct).ConfigureAwait(false);
-            await stream.FlushAsync(ct).ConfigureAwait(false);
-
-            var reply = await ProxyDialer.ReadExactlyAsync(stream, 4, ct).ConfigureAwait(false);
-            if (reply[1] != 0)
-            {
-                throw new UdpUnsupportedException(reply[1] == 7
-                    ? $"'{hop.Endpoint.Name}' refuses UDP, so a game's peer-to-peer traffic cannot go through it."
-                    : $"'{hop.Endpoint.Name}' refused UDP ASSOCIATE (reply {reply[1]:#x}).");
-            }
-
-            var bound = await ProxyDialer.DrainSocks5AddressAsync(stream, reply[3], ct).ConfigureAwait(false)
-                        ?? throw new ProxyHandshakeException("The proxy returned a named relay address.");
-            relayEndpoint = bound.Address.Equals(IPAddress.Any)
-                ? new IPEndPoint(proxyAddress, bound.Port)
-                : bound;
-        }
-        catch
-        {
-            control.Dispose();
-            throw;
-        }
-
-        var relay = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        relay.SetMark(PolicyRouting.BypassMark);
-        try
-        {
-            await relay.ConnectAsync(relayEndpoint, ct).ConfigureAwait(false);
-        }
-        catch
-        {
-            relay.Dispose();
-            control.Dispose();
-            throw;
-        }
-
-        return new Socks5NatTransport(
-            control, relay, $"Measured through the UDP association at {relayEndpoint}.");
-    }
-
-    /// <summary>Null: the socket facing the internet is the proxy's, not ours.</summary>
-    public IPEndPoint? LocalEndpoint => null;
-
-    public string? Detail { get; }
-
-    public async Task SendAsync(IPEndPoint destination, byte[] payload, CancellationToken ct)
-    {
-        // SOCKS5 UDP header: RSV(2) FRAG(1) ATYP(1) ADDR PORT, then the datagram. Per
-        // datagram, which is what lets one association reach two servers.
-        var address = destination.Address.GetAddressBytes();
-        var framed = new byte[4 + address.Length + 2 + payload.Length];
-        framed[3] = destination.AddressFamily == AddressFamily.InterNetworkV6 ? (byte)0x04 : (byte)0x01;
-        address.CopyTo(framed, 4);
-        BinaryPrimitives.WriteUInt16BigEndian(framed.AsSpan(4 + address.Length), (ushort)destination.Port);
-        payload.CopyTo(framed, 4 + address.Length + 2);
-
-        await _relay.SendAsync(framed, ct).ConfigureAwait(false);
-    }
-
-    public async Task<NatDatagram?> ReceiveAsync(TimeSpan within, CancellationToken ct)
-    {
-        if (within <= TimeSpan.Zero)
-        {
-            return null;
-        }
-
-        var buffer = new byte[2048];
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(within);
-        try
-        {
-            var received = await _relay.ReceiveAsync(buffer, timeout.Token).ConfigureAwait(false);
-            if (received < 4 || buffer[2] != 0)
-            {
-                return new NatDatagram(null, []);
-            }
-
-            var offset = buffer[3] switch
-            {
-                1 => 4 + 4 + 2,
-                4 => 4 + 16 + 2,
-                3 => 4 + 1 + buffer[4] + 2,
-                _ => -1,
-            };
-            if (offset < 0 || offset > received)
-            {
-                return new NatDatagram(null, []);
-            }
-
-            // The header names who sent it, which is what the filtering test needs.
-            IPEndPoint? from = buffer[3] switch
-            {
-                1 => new IPEndPoint(new IPAddress(buffer[4..8]), BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(8))),
-                4 => new IPEndPoint(new IPAddress(buffer[4..20]), BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(20))),
-                _ => null,
-            };
-
-            return new NatDatagram(from, buffer[offset..received]);
-        }
-        catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
-        {
-            return null;
-        }
-    }
-
-    public ValueTask DisposeAsync()
-    {
-        _relay.Dispose();
-        _control.Dispose();
-        return ValueTask.CompletedTask;
-    }
-}
-
 /// <summary>
-/// A Yura agent's datagram channels, used exactly the way a game's UDP flows use them.
+/// Answers from several per-destination sockets or associations, collected in one queue.
 /// </summary>
-/// <remarks>
-/// One channel per destination, because that is what the forwarder opens per flow and what
-/// the agent binds a socket to. That makes this measurement report the mapping a game would
-/// really get through this agent — including the consequence that two destinations are two
-/// sockets at the agent, which a peer sees as two different source ports.
-/// </remarks>
-internal sealed class AgentNatTransport : INatTransport
+internal abstract class FannedInNatTransport : INatTransport
 {
-    private readonly AgentSession _session;
-    private readonly Dictionary<IPEndPoint, ushort> _channels = [];
     private readonly System.Threading.Channels.Channel<NatDatagram> _answers =
         System.Threading.Channels.Channel.CreateUnbounded<NatDatagram>();
 
-    private AgentNatTransport(AgentSession session, string detail)
-    {
-        _session = session;
-        Detail = detail;
-    }
+    protected CancellationTokenSource Closing { get; } = new();
 
-    public static async Task<AgentNatTransport> OpenAsync(ProxyHop hop, CancellationToken ct)
-    {
-        var options = ProxyDialer.AgentOptionsFor(hop, socket => socket.SetMark(PolicyRouting.BypassMark));
-        var session = await AgentSession.ConnectAsync(options, ct).ConfigureAwait(false);
-        if (!session.Welcome.Available.HasFlag(AgentProtocol.Features.Udp))
-        {
-            await session.DisposeAsync().ConfigureAwait(false);
-            throw new UdpUnsupportedException(
-                $"Agent '{hop.Endpoint.Name}' was started without UDP relaying, so a game's " +
-                "peer-to-peer traffic cannot go through it.");
-        }
+    public abstract IPEndPoint? LocalEndpoint { get; }
 
-        return new AgentNatTransport(
-            session,
-            $"Measured through agent '{session.AgentName}'. The agent gives each destination its own " +
-            "socket, so a peer sees a different source port per peer.");
-    }
+    public abstract string? Detail { get; }
 
-    /// <summary>Null: the socket facing the internet is the agent's.</summary>
-    public IPEndPoint? LocalEndpoint => null;
+    public abstract Task SendAsync(IPEndPoint destination, byte[] payload, CancellationToken ct);
 
-    public string? Detail { get; }
-
-    public async Task SendAsync(IPEndPoint destination, byte[] payload, CancellationToken ct)
-    {
-        if (!_channels.TryGetValue(destination, out var channel))
-        {
-            channel = _session.OpenChannel((from, data) =>
-                _answers.Writer.TryWrite(new NatDatagram(from, data.ToArray())));
-            _channels[destination] = channel;
-        }
-
-        await _session.SendDatagramAsync(channel, destination, payload, ct).ConfigureAwait(false);
-    }
+    protected void Deliver(NatDatagram datagram) => _answers.Writer.TryWrite(datagram);
 
     public async Task<NatDatagram?> ReceiveAsync(TimeSpan within, CancellationToken ct)
     {
@@ -687,9 +550,371 @@ internal sealed class AgentNatTransport : INatTransport
 
     public async ValueTask DisposeAsync()
     {
+        await Closing.CancelAsync().ConfigureAwait(false);
+        await CloseAsync().ConfigureAwait(false);
+        Closing.Dispose();
+    }
+
+    protected abstract ValueTask CloseAsync();
+}
+
+/// <summary>
+/// One socket per destination, connected to it: how the forwarder relays a flow from inside a
+/// WireGuard exit.
+/// </summary>
+/// <remarks>
+/// The forwarder gives every (application socket, destination) flow a socket of its own, bound
+/// to the tunnel address and connected to the destination. So a game talking to two peers
+/// leaves by two source ports, and a datagram from anyone but the peer a socket is connected to
+/// never reaches the game. Measuring that on one shared socket reported a mapping, and a
+/// filter, that no routed game traffic ever has.
+/// </remarks>
+internal sealed class PerDestinationNatTransport : FannedInNatTransport
+{
+    private readonly uint _mark;
+    private readonly IPAddress _source;
+    private readonly Dictionary<IPEndPoint, Socket> _sockets = [];
+
+    public PerDestinationNatTransport(uint mark, IPAddress source)
+    {
+        _mark = mark;
+        _source = source;
+    }
+
+    /// <summary>The first socket's address: the tunnel's, which the far side sees translated or not.</summary>
+    public override IPEndPoint? LocalEndpoint => _sockets.Values.FirstOrDefault()?.LocalEndPoint as IPEndPoint;
+
+    public override string Detail =>
+        $"Measured from inside the tunnel, source {_source}, with one socket per destination as the " +
+        "forwarder relays a game's UDP — so each peer sees its own source port, and only the peer a " +
+        "socket was opened for can answer it.";
+
+    public override async Task SendAsync(IPEndPoint destination, byte[] payload, CancellationToken ct)
+    {
+        if (!_sockets.TryGetValue(destination, out var socket))
+        {
+            socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            try
+            {
+                socket.SetMark(_mark);
+                socket.Bind(new IPEndPoint(_source, 0));
+                socket.Connect(destination);
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
+
+            _sockets[destination] = socket;
+            _ = PumpAsync(socket, destination, Closing.Token);
+        }
+
+        await socket.SendAsync(payload, SocketFlags.None, ct).ConfigureAwait(false);
+    }
+
+    private async Task PumpAsync(Socket socket, IPEndPoint destination, CancellationToken ct)
+    {
+        var buffer = new byte[2048];
+        while (!ct.IsCancellationRequested)
+        {
+            int received;
+            try
+            {
+                received = await socket.ReceiveAsync(buffer, SocketFlags.None, ct).ConfigureAwait(false);
+            }
+            catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
+            {
+                return;
+            }
+
+            // Connected, so the kernel delivers only what the destination sent.
+            Deliver(new NatDatagram(destination, buffer[..received]));
+        }
+    }
+
+    protected override ValueTask CloseAsync()
+    {
+        foreach (var socket in _sockets.Values)
+        {
+            socket.Dispose();
+        }
+
+        return ValueTask.CompletedTask;
+    }
+}
+
+/// <summary>SOCKS5 UDP associations, one per destination, as the forwarder opens them.</summary>
+/// <remarks>
+/// The forwarder opens an association for every (application socket, destination) flow, and
+/// hands whatever arrives on it to the application as if it came from that flow's destination.
+/// So through Yura a game's peers see one relay socket each — whatever mapping the proxy keeps
+/// per association — and a datagram from anyone else reaches the game labelled as the wrong
+/// peer, which for peer-to-peer purposes is as good as not reaching it. That is what is measured
+/// here: one association per destination, crediting only what the destination itself sent.
+/// </remarks>
+internal sealed class Socks5NatTransport : FannedInNatTransport
+{
+    private static readonly TimeSpan AssociateTimeout = TimeSpan.FromSeconds(10);
+
+    private readonly ProxyHop _hop;
+    private readonly IPAddress _proxyAddress;
+    private readonly Dictionary<IPEndPoint, (Socket Control, Socket Relay)> _associations = [];
+
+    private Socks5NatTransport(ProxyHop hop, IPAddress proxyAddress)
+    {
+        _hop = hop;
+        _proxyAddress = proxyAddress;
+    }
+
+    /// <summary>Opens the association for the first destination now, so a proxy that refuses UDP says so at once.</summary>
+    public static async Task<Socks5NatTransport> OpenAsync(ProxyHop hop, IPEndPoint firstDestination, CancellationToken ct)
+    {
+        var proxyAddress = await ProxyDialer.ResolveAsync(hop.Endpoint.Host, ct).ConfigureAwait(false);
+        var transport = new Socks5NatTransport(hop, proxyAddress);
+        try
+        {
+            await transport.AssociationForAsync(firstDestination, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            await transport.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+
+        return transport;
+    }
+
+    /// <summary>Null: the socket facing the internet is the proxy's, not ours.</summary>
+    public override IPEndPoint? LocalEndpoint => null;
+
+    public override string Detail =>
+        $"Measured through '{_hop.Endpoint.Name}' with one UDP association per destination, as the " +
+        "forwarder relays a game's UDP — so each peer reaches the game through its own relay socket.";
+
+    public override async Task SendAsync(IPEndPoint destination, byte[] payload, CancellationToken ct)
+    {
+        var (_, relay) = await AssociationForAsync(destination, ct).ConfigureAwait(false);
+
+        // SOCKS5 UDP header: RSV(2) FRAG(1) ATYP(1) ADDR PORT, then the datagram.
+        var address = destination.Address.GetAddressBytes();
+        var framed = new byte[4 + address.Length + 2 + payload.Length];
+        framed[3] = destination.AddressFamily == AddressFamily.InterNetworkV6 ? (byte)0x04 : (byte)0x01;
+        address.CopyTo(framed, 4);
+        BinaryPrimitives.WriteUInt16BigEndian(framed.AsSpan(4 + address.Length), (ushort)destination.Port);
+        payload.CopyTo(framed, 4 + address.Length + 2);
+
+        await relay.SendAsync(framed, ct).ConfigureAwait(false);
+    }
+
+    private async Task<(Socket Control, Socket Relay)> AssociationForAsync(IPEndPoint destination, CancellationToken ct)
+    {
+        if (_associations.TryGetValue(destination, out var existing))
+        {
+            return existing;
+        }
+
+        var control = await ProxyDialer
+            .ConnectWithBypassAsync(_hop.Endpoint.Host, _hop.Endpoint.Port, ct)
+            .ConfigureAwait(false);
+
+        IPEndPoint relayEndpoint;
+        try
+        {
+            relayEndpoint = await AssociateAsync(control, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            control.Dispose();
+            throw;
+        }
+
+        var relay = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        try
+        {
+            relay.SetMark(PolicyRouting.BypassMark);
+            await relay.ConnectAsync(relayEndpoint, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            relay.Dispose();
+            control.Dispose();
+            throw;
+        }
+
+        _associations[destination] = (control, relay);
+        _ = PumpAsync(relay, destination, Closing.Token);
+        return (control, relay);
+    }
+
+    private async Task<IPEndPoint> AssociateAsync(Socket control, CancellationToken ct)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(AssociateTimeout);
+        try
+        {
+            using var stream = new NetworkStream(control, ownsSocket: false);
+            await ProxyDialer.Socks5GreetAsync(stream, _hop.Endpoint.Username, _hop.Password, timeout.Token).ConfigureAwait(false);
+            await stream.WriteAsync(ProxyDialer.BuildSocks5Request(0x03, "0.0.0.0", 0), timeout.Token).ConfigureAwait(false);
+            await stream.FlushAsync(timeout.Token).ConfigureAwait(false);
+
+            var reply = await ProxyDialer.ReadExactlyAsync(stream, 4, timeout.Token).ConfigureAwait(false);
+            if (reply[1] != 0)
+            {
+                throw new UdpUnsupportedException(reply[1] == 7
+                    ? $"'{_hop.Endpoint.Name}' refuses UDP, so a game's peer-to-peer traffic cannot go through it."
+                    : $"'{_hop.Endpoint.Name}' refused UDP ASSOCIATE (reply {reply[1]:#x}).");
+            }
+
+            var bound = await ProxyDialer.DrainSocks5AddressAsync(stream, reply[3], timeout.Token).ConfigureAwait(false)
+                        ?? throw new ProxyHandshakeException("The proxy returned a named relay address.");
+            return bound.Address.Equals(IPAddress.Any) ? new IPEndPoint(_proxyAddress, bound.Port) : bound;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new ProxyHandshakeException(
+                $"'{_hop.Endpoint.Name}' did not answer UDP ASSOCIATE within {AssociateTimeout.TotalSeconds:0} s.");
+        }
+    }
+
+    private async Task PumpAsync(Socket relay, IPEndPoint destination, CancellationToken ct)
+    {
+        var buffer = new byte[2048];
+        while (!ct.IsCancellationRequested)
+        {
+            int received;
+            try
+            {
+                received = await relay.ReceiveAsync(buffer, SocketFlags.None, ct).ConfigureAwait(false);
+            }
+            catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
+            {
+                return;
+            }
+
+            if (received < 4 || buffer[2] != 0)
+            {
+                continue;
+            }
+
+            var offset = buffer[3] switch
+            {
+                1 => 4 + 4 + 2,
+                4 => 4 + 16 + 2,
+                3 when received > 4 => 4 + 1 + buffer[4] + 2,
+                _ => -1,
+            };
+            if (offset < 0 || offset > received)
+            {
+                continue;
+            }
+
+            // The header names who sent it. Only the association's own destination is delivered
+            // as itself by the forwarder, so only it is credited here.
+            IPEndPoint? from = buffer[3] switch
+            {
+                1 => new IPEndPoint(new IPAddress(buffer.AsSpan(4, 4)), BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(8))),
+                4 => new IPEndPoint(new IPAddress(buffer.AsSpan(4, 16)), BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(20))),
+                _ => null,
+            };
+            if (from is not null && !from.Equals(destination))
+            {
+                continue;
+            }
+
+            Deliver(new NatDatagram(destination, buffer[offset..received]));
+        }
+    }
+
+    protected override ValueTask CloseAsync()
+    {
+        foreach (var (control, relay) in _associations.Values)
+        {
+            relay.Dispose();
+            control.Dispose();
+        }
+
+        return ValueTask.CompletedTask;
+    }
+}
+
+/// <summary>
+/// An agent's datagram channel, used the way the forwarder uses it.
+/// </summary>
+/// <remarks>
+/// Through an agent that grants full cone, one channel for every destination, because the
+/// forwarder gives an application socket one channel whatever it sends to — so both servers see
+/// one mapping, and an answer from the server's other address can arrive on it. Through one that
+/// does not, a channel per destination, each a socket of its own at the agent, which a peer sees
+/// as a different source port per peer. Either way this reports the mapping a game would really
+/// get through that agent.
+/// </remarks>
+internal sealed class AgentNatTransport : FannedInNatTransport
+{
+    private readonly AgentSession _session;
+    private readonly Dictionary<IPEndPoint, ushort> _channels = [];
+    private ushort? _cone;
+
+    private AgentNatTransport(AgentSession session, string detail)
+    {
+        _session = session;
+        Detail = detail;
+    }
+
+    public static async Task<AgentNatTransport> OpenAsync(ProxyHop hop, CancellationToken ct)
+    {
+        var options = ProxyDialer.AgentOptionsFor(hop, socket => socket.SetMark(PolicyRouting.BypassMark));
+        var session = await AgentSession.ConnectAsync(options, ct).ConfigureAwait(false);
+        if (!session.Welcome.Available.HasFlag(AgentProtocol.Features.Udp))
+        {
+            await session.DisposeAsync().ConfigureAwait(false);
+            throw new UdpUnsupportedException(
+                $"Agent '{hop.Endpoint.Name}' was started without UDP relaying, so a game's " +
+                "peer-to-peer traffic cannot go through it.");
+        }
+
+        return new AgentNatTransport(
+            session,
+            session.FullCone
+                ? $"Measured through agent '{session.AgentName}' with full-cone UDP: one socket at the agent for " +
+                  "every peer, which anyone may send to if the agent's firewall lets them."
+                : $"Measured through agent '{session.AgentName}'. The agent gives each destination its own " +
+                  "socket, so a peer sees a different source port per peer. An agent started with full cone, " +
+                  "which is the default for recent ones, would not.");
+    }
+
+    /// <summary>Null: the socket facing the internet is the agent's.</summary>
+    public override IPEndPoint? LocalEndpoint => null;
+
+    public override string? Detail { get; }
+
+    public override async Task SendAsync(IPEndPoint destination, byte[] payload, CancellationToken ct)
+    {
+        ushort channel;
+        if (_session.FullCone)
+        {
+            channel = _cone ??= _session.OpenChannel(
+                (from, data) => Deliver(new NatDatagram(from, data.ToArray())), fullCone: true);
+        }
+        else if (!_channels.TryGetValue(destination, out channel))
+        {
+            channel = _session.OpenChannel((from, data) => Deliver(new NatDatagram(from, data.ToArray())));
+            _channels[destination] = channel;
+        }
+
+        await _session.SendDatagramAsync(channel, destination, payload, ct).ConfigureAwait(false);
+    }
+
+    protected override async ValueTask CloseAsync()
+    {
         foreach (var channel in _channels.Values)
         {
             _session.CloseChannel(channel);
+        }
+
+        if (_cone is { } cone)
+        {
+            _session.CloseChannel(cone);
         }
 
         await _session.DisposeAsync().ConfigureAwait(false);

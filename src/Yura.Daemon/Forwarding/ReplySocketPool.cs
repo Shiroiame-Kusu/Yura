@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using Yura.Daemon.Linux;
@@ -20,11 +19,15 @@ namespace Yura.Daemon.Forwarding;
 /// datagram to a destination that already has a session would be silently queued on an idle
 /// socket and lost — which is exactly what a DNS resolver behind a proxy would experience.
 ///
-/// One socket per original destination, shared by every session to it, created on first use.
+/// One socket per original destination, shared by every session to it, created when the first
+/// session reserves it and closed when the last one releases it. Kept for the listener's whole
+/// life instead, every server, peer and resolver a game or browser ever reached held a socket
+/// and a receive buffer until the rule was removed.
 /// </remarks>
 internal sealed class ReplySocketPool : IAsyncDisposable
 {
-    private readonly ConcurrentDictionary<IPEndPoint, Entry> _entries = new();
+    private readonly Dictionary<IPEndPoint, Entry> _entries = [];
+    private readonly Lock _gate = new();
     private readonly Func<IPEndPoint, IPEndPoint, byte[], Task> _dispatch;
     private readonly Action<string> _log;
     private readonly CancellationTokenSource _stopping = new();
@@ -35,14 +38,39 @@ internal sealed class ReplySocketPool : IAsyncDisposable
         _log = log;
     }
 
-    private sealed record Entry(Socket Socket, Task Drain);
+    private sealed class Entry(Socket socket)
+    {
+        public Socket Socket { get; } = socket;
+
+        public int Users { get; set; }
+
+        public Task Drain { get; set; } = Task.CompletedTask;
+    }
+
+    /// <summary>Destinations that currently have a socket. For tests and diagnostics.</summary>
+    public int Count
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _entries.Count;
+            }
+        }
+    }
 
     /// <summary>Sends one datagram to <paramref name="client"/> as if it came from <paramref name="original"/>.</summary>
     public async Task SendAsync(IPEndPoint original, IPEndPoint client, ReadOnlyMemory<byte> payload)
     {
-        if (!TryGet(original, out var socket))
+        Socket? socket;
+        lock (_gate)
         {
-            return;
+            socket = _entries.GetValueOrDefault(original)?.Socket;
+        }
+
+        if (socket is null)
+        {
+            return; // No session holds this destination any more, so there is nobody to answer.
         }
 
         try
@@ -54,44 +82,64 @@ internal sealed class ReplySocketPool : IAsyncDisposable
         }
     }
 
-    /// <summary>Opens the socket for a destination up front, so a session fails early if it cannot.</summary>
-    public bool Reserve(IPEndPoint original) => TryGet(original, out _);
-
-    private bool TryGet(IPEndPoint original, out Socket socket)
+    /// <summary>
+    /// Takes a reference on the socket for a destination, opening it if this is the first.
+    /// Every reservation that returns true must be matched by one <see cref="Release"/>.
+    /// </summary>
+    /// <returns>False when the socket cannot be opened; replies to that destination are then lost.</returns>
+    public bool Reserve(IPEndPoint original)
     {
-        if (_entries.TryGetValue(original, out var existing))
+        Entry entry;
+        lock (_gate)
         {
-            socket = existing.Socket;
-            return true;
+            if (_entries.TryGetValue(original, out var existing))
+            {
+                existing.Users++;
+                return true;
+            }
+
+            Socket created;
+            try
+            {
+                created = new Socket(original.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+                created.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                created.SetTransparent();
+                created.SetMark(PolicyRouting.BypassMark);
+                created.Bind(original);
+            }
+            catch (SocketException e)
+            {
+                _log($"udp: cannot answer as {original}: {e.SocketErrorCode}");
+                return false;
+            }
+
+            entry = new Entry(created) { Users = 1 };
+            _entries[original] = entry;
         }
 
-        Socket created;
-        try
-        {
-            created = new Socket(original.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
-            created.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            created.SetTransparent();
-            created.SetMark(PolicyRouting.BypassMark);
-            created.Bind(original);
-        }
-        catch (SocketException e)
-        {
-            _log($"udp: cannot answer as {original}: {e.SocketErrorCode}");
-            socket = null!;
-            return false;
-        }
-
-        var entry = new Entry(created, Task.CompletedTask);
-        if (!_entries.TryAdd(original, entry))
-        {
-            created.Dispose();
-            socket = _entries[original].Socket;
-            return true;
-        }
-
-        _entries[original] = entry with { Drain = DrainAsync(created, original, _stopping.Token) };
-        socket = created;
+        // Started outside the lock: a datagram already waiting would be dispatched from here,
+        // and dispatching can reserve.
+        entry.Drain = DrainAsync(entry.Socket, original, _stopping.Token);
         return true;
+    }
+
+    /// <summary>Gives back a reservation; the last one closes the destination's socket.</summary>
+    public void Release(IPEndPoint original)
+    {
+        Socket closing;
+        lock (_gate)
+        {
+            if (!_entries.TryGetValue(original, out var entry) || --entry.Users > 0)
+            {
+                return;
+            }
+
+            _entries.Remove(original);
+            closing = entry.Socket;
+        }
+
+        // Ends its drain loop, which is waiting in a receive on it.
+        closing.Dispose();
     }
 
     /// <summary>
@@ -133,7 +181,14 @@ internal sealed class ReplySocketPool : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _stopping.Cancel();
-        foreach (var entry in _entries.Values)
+        List<Entry> entries;
+        lock (_gate)
+        {
+            entries = _entries.Values.ToList();
+            _entries.Clear();
+        }
+
+        foreach (var entry in entries)
         {
             entry.Socket.Dispose();
             try
@@ -145,7 +200,6 @@ internal sealed class ReplySocketPool : IAsyncDisposable
             }
         }
 
-        _entries.Clear();
         _stopping.Dispose();
     }
 }

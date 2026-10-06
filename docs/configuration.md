@@ -20,9 +20,13 @@ The **application** owns the configuration; the daemon owns nothing across a res
 
 That split is deliberate. The daemon runs as root, and a root process writing into a user's
 home directory leaves root-owned files the application can then no longer rewrite. So the
-app is the source of truth, and it re-sends its proxies and persistent rules to the daemon
-every time it connects. A restart of either process converges to the same state, and there
-is no second copy of the truth to drift.
+app is the source of truth, and it re-sends its proxies and rules to the daemon every time it
+connects: at startup, whenever the daemon answers again after being unreachable, and whenever
+an answer comes from a different run of the daemon than the last one — every answer names the
+run it came from, and the app asks something small every few seconds, so a daemon restarted
+behind a page that asks nothing is still noticed. Until the daemon confirms them again, rules
+read as pending rather than active. A restart of either process converges to the same state,
+and there is no second copy of the truth to drift.
 
 ## What is written
 
@@ -76,7 +80,9 @@ The secret is written to the tool's stdin, so it never appears in the process ta
 WireGuard exit the same reference holds the private key.
 
 If no secret service is available Yura keeps the password **in memory for that session
-only** and says so under the password field. It does not fall back to a file: writing a
+only** and says so under the password field. The same goes for a secret service that is there
+and refuses the secret — `secret-tool` with nothing running behind it, say — and then Yura says
+so when the proxy is saved, because the field had promised otherwise. It does not fall back to a file: writing a
 password to disk because the keyring was missing would be a silent downgrade of the one
 guarantee worth making here.
 

@@ -67,6 +67,42 @@ public sealed record DestinationSelector
     public bool IsUnconstrained =>
         Hosts.Count == 0 && Networks.Count == 0 && Ports.Count == 0 && Protocol == TransportFilter.Any;
 
+    /// <summary>Two selectors are equal when they constrain the same things, whatever lists hold them.</summary>
+    /// <remarks>
+    /// The generated record equality compares the list properties by reference, so a selector
+    /// read back from the configuration never equalled the one it was saved from — and a rule
+    /// restored after a restart was never recognised as the one a new selection replaces, which
+    /// left it installed at its lower position, winning.
+    /// </remarks>
+    public bool Equals(DestinationSelector? other) =>
+        other is not null &&
+        Protocol == other.Protocol &&
+        Hosts.SequenceEqual(other.Hosts) &&
+        Networks.SequenceEqual(other.Networks) &&
+        Ports.SequenceEqual(other.Ports);
+
+    public override int GetHashCode()
+    {
+        var hash = new HashCode();
+        hash.Add(Protocol);
+        foreach (var host in Hosts)
+        {
+            hash.Add(host);
+        }
+
+        foreach (var network in Networks)
+        {
+            hash.Add(network);
+        }
+
+        foreach (var port in Ports)
+        {
+            hash.Add(port);
+        }
+
+        return hash.ToHashCode();
+    }
+
     /// <summary>
     /// True when this selector can only be evaluated once a destination host name is known.
     /// </summary>

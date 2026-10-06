@@ -141,13 +141,31 @@ public sealed class TransparentTcpListener : IAsyncDisposable
             _log($"slot {_slot.Name}: {peer} -> {original}: {reason}");
             Reset(client);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // The listener is stopping; the flow ended because the daemon did.
+            flow.MarkClosed();
+        }
         catch (OperationCanceledException)
         {
-            flow.MarkClosed();
+            // A timeout of our own that surfaced as a cancellation. It is still a failure, and
+            // recording it as a normal close left a dead proxy looking like a finished download.
+            flow.MarkFailed($"Timed out reaching {original}.");
+            _log($"slot {_slot.Name}: {peer} -> {original}: timed out");
+            Reset(client);
         }
         catch (Exception e) when (e is IOException or ObjectDisposedException)
         {
             flow.MarkFailed(e.Message);
+        }
+        catch (Exception e)
+        {
+            // Anything else still ends the flow with a reason — an agent refusing a key, say.
+            // Left to escape, it vanished as an unobserved exception and the flow stayed
+            // "being established" in the list for as long as the daemon ran.
+            flow.MarkFailed(e.Message);
+            _log($"slot {_slot.Name}: {peer} -> {original} failed: {e}");
+            Reset(client);
         }
         finally
         {

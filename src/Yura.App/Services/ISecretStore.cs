@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 
 namespace Yura.App.Services;
@@ -154,7 +155,7 @@ public sealed class SecretToolSecretStore : ISecretStore
 /// </remarks>
 public sealed class InMemorySecretStore : ISecretStore
 {
-    private readonly Dictionary<string, string> _secrets = [];
+    private readonly ConcurrentDictionary<string, string> _secrets = new();
 
     public bool IsAvailable => false;
 
@@ -171,7 +172,46 @@ public sealed class InMemorySecretStore : ISecretStore
 
     public Task DeleteAsync(string reference, CancellationToken cancellationToken = default)
     {
-        _secrets.Remove(reference);
+        _secrets.TryRemove(reference, out _);
         return Task.CompletedTask;
+    }
+}
+
+/// <summary>
+/// A persistent store, with a copy of every secret set this session kept in memory beside it.
+/// </summary>
+/// <remarks>
+/// What the app runs with. When the persistent store cannot take a secret — no
+/// <c>secret-tool</c>, or one with no secret service running behind it — the secret still
+/// works until the app exits, which is what the editor tells the user will happen. Without the
+/// copy it was silently discarded: the proxy was saved referring to a secret nothing held, and
+/// the daemon was handed an exit without its password or key.
+///
+/// The copy is read first, so a secret changed this session is the one used even when the
+/// persistent store still holds the previous one.
+/// </remarks>
+public sealed class SessionBackedSecretStore(ISecretStore persistent) : ISecretStore
+{
+    private readonly InMemorySecretStore _session = new();
+
+    public bool IsAvailable => persistent.IsAvailable;
+
+    public string Description => persistent.Description;
+
+    /// <returns>Whether the persistent store took it. It is kept for the session either way.</returns>
+    public async Task<bool> SetAsync(string reference, string secret, CancellationToken cancellationToken = default)
+    {
+        await _session.SetAsync(reference, secret, cancellationToken).ConfigureAwait(false);
+        return await persistent.SetAsync(reference, secret, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<string?> GetAsync(string reference, CancellationToken cancellationToken = default) =>
+        await _session.GetAsync(reference, cancellationToken).ConfigureAwait(false)
+        ?? await persistent.GetAsync(reference, cancellationToken).ConfigureAwait(false);
+
+    public async Task DeleteAsync(string reference, CancellationToken cancellationToken = default)
+    {
+        await _session.DeleteAsync(reference, cancellationToken).ConfigureAwait(false);
+        await persistent.DeleteAsync(reference, cancellationToken).ConfigureAwait(false);
     }
 }

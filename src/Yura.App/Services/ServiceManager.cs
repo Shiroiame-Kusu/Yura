@@ -322,12 +322,15 @@ public sealed class ServiceManager : IServiceManager
     /// The exact script that installation runs as root.
     /// </summary>
     /// <remarks>
-    /// Two things this has to survive, both learned the hard way. The daemon it is installing
+    /// Three things this has to survive, all learned the hard way. The daemon it is installing
     /// can already <em>be</em> the installed copy — reinstalling to pick up a rebuild, or a path
     /// typed by hand — and <c>cp</c> refuses to copy a directory onto itself, which under
-    /// <c>set -e</c> aborted the script before the unit was ever written. And the copy is staged
+    /// <c>set -e</c> aborted the script before the unit was ever written. The copy is staged
     /// beside the target and moved into place, so a failure part way through leaves the previous
-    /// install as it was rather than half of it.
+    /// install as it was rather than half of it. And the files end up belonging to root: they
+    /// are what the service runs as root, and a copy that kept the build directory's owner —
+    /// which <c>cp -a</c> does when root runs it — left them writable by the desktop user, so
+    /// anything running as that user could replace the daemon and be root at its next start.
     /// </remarks>
     public static string BuildInstallScript(DaemonLocation location, string unitText)
     {
@@ -347,10 +350,15 @@ public sealed class ServiceManager : IServiceManager
         sb.Append("else\n");
         sb.Append("  rm -rf \"$dst.new\"\n");
         sb.Append("  install -d -m 755 \"$dst.new\"\n");
-        sb.Append("  cp -a \"$src/.\" \"$dst.new/\"\n");
+        sb.Append("  # Not -a: that would keep the build directory's owner on files root is about to run.\n");
+        sb.Append("  cp -R \"$src/.\" \"$dst.new/\"\n");
         sb.Append("  rm -rf \"$dst\"\n");
         sb.Append("  mv \"$dst.new\" \"$dst\"\n");
         sb.Append("fi\n");
+        sb.Append("# Root runs these files, so only root may change them — including a copy an earlier\n");
+        sb.Append("# install left owned by the desktop user.\n");
+        sb.Append("chown -R 0:0 \"$dst\"\n");
+        sb.Append("chmod -R u+rwX,go+rX,go-w \"$dst\"\n");
         sb.Append(CultureInfo.InvariantCulture, $"chmod 755 {Quote(target + "/yura-daemon")} 2>/dev/null || true\n");
         sb.Append(CultureInfo.InvariantCulture, $"cat > {Quote(SystemdUnit.UnitPath)} <<'YURA_UNIT'\n");
         sb.Append(RelocateExecStart(unitText, location.Directory, target));

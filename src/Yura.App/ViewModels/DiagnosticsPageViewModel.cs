@@ -40,7 +40,7 @@ public sealed record AgentRow(AgentStatus Status)
         ? string.Create(CultureInfo.InvariantCulture,
             $"{Status.AgentName ?? Status.Name} {Status.AgentVersion}; " +
             $"round trip {(Status.RoundTripMilliseconds is { } ms ? $"{ms:0.#} ms" : "not measured")}; " +
-            $"{(Status.Udp ? "udp carried" : "no udp")}" +
+            $"{(Status.Udp ? Status.FullCone ? "udp carried, full cone" : "udp carried, a socket per destination" : "no udp")}" +
             $"{(Status.Resolver is { Length: > 0 } dns ? $"; dns {dns}" : string.Empty)}")
         : Status.Failure ?? Loc.Current["Common.Unknown"];
 }
@@ -287,6 +287,31 @@ public sealed partial class DiagnosticsPageViewModel : ObservableObject, IDispos
         }
 
         return report.ToString();
+    }
+
+    /// <summary>Re-renders every localised string after a language change.</summary>
+    /// <remarks>
+    /// The rows are records with no change notification of their own, so they are replaced:
+    /// a new item is what makes the list read its labels again.
+    /// </remarks>
+    public void NotifyLanguageChanged()
+    {
+        OnPropertyChanged(string.Empty);
+
+        for (var i = 0; i < Checks.Count; i++)
+        {
+            Checks[i] = Checks[i] with { };
+        }
+
+        for (var i = 0; i < Tunnels.Count; i++)
+        {
+            Tunnels[i] = Tunnels[i] with { };
+        }
+
+        for (var i = 0; i < Agents.Count; i++)
+        {
+            Agents[i] = Agents[i] with { };
+        }
     }
 
     private void RaiseAll()

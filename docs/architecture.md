@@ -241,11 +241,15 @@ is the address the peer will see. That is a property of **the route**, not of th
 it can move in either direction when a game is routed: a proxy on a public address can turn
 Strict into Open, and a relay that gives every destination its own socket does the opposite.
 
-So the test is STUN over the route's own UDP path — a plain marked socket, a WireGuard exit's
-socket, a SOCKS5 association, or an agent's datagram channel — and both paths are measured in
-one call, against the same servers, for the same reason `NetworkMeasurer` measures its target
-twice. `Stun` and `NatClassifier` are pure and live in `Yura.Core`, so the table of cases is
-unit tested rather than inferred from a live network.
+So the test is STUN over the route, used the way the forwarder uses it: a plain marked socket
+for the direct path; a socket inside a WireGuard exit or a SOCKS5 UDP association **per
+destination**, because that is what the forwarder opens per (application socket, destination)
+flow on those routes; and through an agent that grants full cone, **one** channel for every
+destination, because that is what the forwarder gives an application socket there (see below).
+The mapping a peer sees is the one those give. A test that sent both probes down one association
+measured a mapping no game routed through that proxy ever gets. Both paths are measured in one call, against the same servers, for the same
+reason `NetworkMeasurer` measures its target twice. `Stun` and `NatClassifier` are pure and live
+in `Yura.Core`, so the table of cases is unit tested rather than inferred from a live network.
 
 Three things it deliberately does not do:
 
@@ -260,7 +264,14 @@ Three things it deliberately does not do:
 - **It does not report a mapping comparison it did not really make.** Two server names that
   resolve to one address would agree about the mapping for the trivial reason, so the
   classifier is told whether the second probe reached a genuinely different address, a
-  different port of the same one, or nothing at all.
+  different port of the same one, or nothing at all. A match between two ports of one server
+  rules out a mapping keyed on the port and says nothing about one keyed on the address, so
+  it stays Unknown rather than counting as endpoint-independent. The second server is tried
+  among those not yet asked — a different address first — until one answers.
+- **It asks about filtering before anything else touches the mapping.** Whether a packet from
+  an address the game never sent to gets in is only a fair question while the game has not
+  sent there; probing the server's other address first would open the very hole the test then
+  reports as open.
 
 ## The daemon as a service
 
@@ -270,7 +281,11 @@ root through `pkexec` — the desktop's polkit agent asks for the user's passwor
 a settings panel would. Nothing edits sudoers and nothing stores a credential.
 
 The script copies the daemon's build directory to `/usr/local/lib/yura/daemon` so the service
-does not depend on a source tree or a home directory, then writes the unit and enables it. The
+does not depend on a source tree or a home directory, makes root the owner of every file in it
+with nothing writable by anyone else, then writes the unit and enables it. The copy does not
+preserve ownership: a build directory belongs to the desktop user, and files root runs at every
+boot that the user can rewrite would let anything running as that user replace the daemon
+without a password prompt. The
 unit runs the daemon with `ProtectHome=yes`, `ProtectSystem=strict`, `PrivateTmp`,
 `NoNewPrivileges`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK` and `HOME`
 pointed at its tmpfs runtime directory, so anything the .NET runtime insists on writing lands
@@ -381,15 +396,39 @@ Several types exist specifically to stop the UI asserting more than is known:
   session reconnects, an SSH session dies. That is why it is a checkbox — on by default,
   because a rule the user just applied almost always means "now" — and why the daemon aborts
   only the sockets whose route the rule changes rather than everything the process holds.
-- **An agent gives a peer-to-peer game a Strict NAT.** A datagram channel is one destination
-  for its lifetime and the agent connects a socket to it, so a game talking to two peers is two
-  channels and two sockets, and each peer sees a different source port. That is exactly
+- **WireGuard and SOCKS5 exits give a peer-to-peer game a Strict NAT.** The forwarder relays
+  each (application socket, destination) flow on its own there: a socket of its own inside a
+  WireGuard exit, a UDP association of its own at a SOCKS5 proxy. So a game talking to two peers
+  leaves by two sockets, and each peer sees a different source port. That is exactly
   address-and-port-dependent mapping, which is what "Strict" means, and the NAT test reports it
-  rather than describing the agent as an improvement. It is not inherent: one socket per session
-  reused across channels would give endpoint-independent mapping, at the cost of the agent
-  having to demultiplex answers by source address instead of by socket. Until then, a
-  peer-to-peer game is better off direct or behind a SOCKS5 proxy whose association keeps one
-  mapping, and the Games page says which of the two is better for the game in front of you.
+  rather than describing the route as an improvement.
+- **An agent gives it an Open one: full-cone UDP.** A session that asks for
+  `Features.FullCone`, and is granted it, may open a channel per *application socket* rather than
+  per destination (`AgentDatagramKind.ConeRelay`). At the agent that channel is one unconnected
+  socket in the `--cone-ports` range: it sends wherever the client asks and passes back whatever
+  arrives, labelled with its true sender. In the daemon, an `AgentCone` holds the channel for one
+  application socket; the flows to and from it stay one per peer, as the Connections page lists
+  them, and share the cone; a datagram from a peer the game never sent to opens a flow of its
+  own, answered from that peer's address through the same transparent reply sockets as every
+  other answer. So every peer sees one address — endpoint-independent mapping — and a new peer
+  can reach it — endpoint-independent filtering: Open, when the firewall in front of the agent
+  lets the range in, and Moderate behind a stateful one that does not. A few choices keep that
+  safe and sane:
+  - The agent's destination policy holds both ways: for each destination a channel sends to,
+    and for each sender it hears from, so its own network and its own addresses can no more
+    write into a client's game than the client can reach them.
+  - Only the client's own traffic keeps a channel: `AgentProtocol.ConeMappingLifetime` (five
+    minutes, the RFC 4787 recommendation) after it last sent, so nobody else can hold a port
+    open. The daemon lets go a minute sooner, so it never sends on a channel the agent has
+    closed and silently gets a new port under an address the peers still hold.
+  - A peer is let in only if the rule would route the game's answer back the same way;
+    otherwise the answer would leave from another address and the peer would never hear it.
+  - Name lookups keep a channel per destination: they come from a fresh socket each time, and
+    a port held five minutes for each would only use up the range.
+
+  `--no-full-cone` turns it off at the agent, for an operator who would rather open no ports;
+  an older agent never grants it. Either way the daemon falls back to a channel per
+  destination, and the NAT test says Strict.
 - **`rp_filter` must be relaxed** for the looped-back packets, or they are dropped.
 - **Proxy chains are TCP-only.** Relaying UDP through more than one hop needs every hop to
   support UDP ASSOCIATE and to agree on the relay address, which cannot be verified end to

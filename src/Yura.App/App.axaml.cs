@@ -2,7 +2,6 @@ using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
 using Avalonia.Styling;
-using Yura.App.Localization;
 using Yura.App.Services;
 using Yura.App.ViewModels;
 using Yura.App.Views;
@@ -34,22 +33,27 @@ public sealed partial class YuraApplication : Application
                 : isolated
                     ? new ConfigStore(Path.Combine(Path.GetTempPath(), $"yura-scratch-{Environment.ProcessId}"))
                     : new ConfigStore();
-            ISecretStore secrets = isolated ? new InMemorySecretStore() : new SecretToolSecretStore();
+            // Kept for the session as well as in the secret service: a secret the service will
+            // not take must still work until the app exits, which is what the editor promises.
+            ISecretStore secrets = isolated
+                ? new InMemorySecretStore()
+                : new SessionBackedSecretStore(new SecretToolSecretStore());
 
-            Loc.Current.Language = options.Language;
-            RequestedThemeVariant = options.Theme.Equals("light", StringComparison.OrdinalIgnoreCase)
-                ? ThemeVariant.Light
-                : ThemeVariant.Dark;
+            // The shell's default. Its configuration and the command line move it from here.
+            RequestedThemeVariant = ThemeVariant.Dark;
 
             // Design review shows a running service; a screenshot of the real app shows the
             // real state, which only ever reads systemd until a button is pressed.
             IServiceManager services = options.Demo ? new SimulatedServiceManager() : new ServiceManager();
 
-            var shell = new ShellViewModel(daemon, secrets, config, services)
-            {
-                IsDarkTheme = !options.Theme.Equals("light", StringComparison.OrdinalIgnoreCase),
-                IsChinese = options.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase),
-            };
+            // The saved theme and language are loaded by the constructor; the command line
+            // overrides them only when it names one.
+            var shell = new ShellViewModel(daemon, secrets, config, services);
+            shell.ApplyStartupOverrides(
+                dark: options.Theme is { } theme ? !theme.Equals("light", StringComparison.OrdinalIgnoreCase) : null,
+                chinese: options.Language is { } language
+                    ? language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+                    : null);
 
             var requested = shell.Pages.FirstOrDefault(p =>
                 string.Equals(p.Key, options.Page, StringComparison.OrdinalIgnoreCase));

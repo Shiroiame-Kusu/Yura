@@ -25,8 +25,9 @@ public sealed record OwnedSocket(
 /// Two paths exist. The full scan behind <see cref="Snapshot"/> joins every socket with every
 /// process and is cached briefly; it feeds the process table's connection counts. The
 /// targeted lookup behind <see cref="FindOwnerPid"/> is for attributing a single freshly
-/// captured flow: it reads the socket's inode from the kernel table and scans only the few
-/// processes that could possibly own it, so per-connection attribution stays cheap.
+/// captured flow: it asks the kernel for that one socket's inode (<see cref="SocketDiag"/>,
+/// falling back to the text tables) and scans only the few processes that could possibly own
+/// it, so per-connection attribution stays cheap.
 ///
 /// Both are inherently racy — a socket can close between the table read and the fd scan —
 /// so callers get a snapshot, never a guarantee. Ownership that could not be established is
@@ -80,10 +81,17 @@ public sealed class SocketOwnership
     /// and falling back to the cached full map.
     /// </summary>
     /// <param name="local">The application's side: its source address and port.</param>
-    /// <param name="remote">The application's peer, or null for an unconnected UDP socket.</param>
+    /// <param name="remote">
+    /// Where the application was sending: its peer, or for an unconnected UDP socket the
+    /// destination of the datagram. Null when not known.
+    /// </param>
     public int? FindOwnerPid(ProtocolType protocol, IPEndPoint local, IPEndPoint? remote, IReadOnlyCollection<int> candidates)
     {
-        var inode = FindInode(protocol, local, remote);
+        // Asked of the kernel directly when it can be: one lookup in its hash tables, rather
+        // than every socket on the machine printed as text for the sake of this one.
+        var inode = remote is not null && SocketDiag.TryFindInode(protocol, local, remote, out var found)
+            ? found
+            : FindInode(protocol, local, remote);
         if (inode is null)
         {
             return null;
@@ -101,30 +109,36 @@ public sealed class SocketOwnership
         return Snapshot().FirstOrDefault(s => s.Inode == inode.Value)?.OwnerPid;
     }
 
+    /// <summary>The same lookup, from the text tables, for a kernel without socket diagnostics.</summary>
     private static long? FindInode(ProtocolType protocol, IPEndPoint local, IPEndPoint? remote)
     {
-        var family = local.AddressFamily;
-        var table = (protocol, family) switch
-        {
-            (ProtocolType.Tcp, AddressFamily.InterNetworkV6) => "/proc/net/tcp6",
-            (ProtocolType.Tcp, _) => "/proc/net/tcp",
-            (_, AddressFamily.InterNetworkV6) => "/proc/net/udp6",
-            _ => "/proc/net/udp",
-        };
-
-        foreach (var socket in ReadTable(table, protocol, family))
-        {
-            if (!socket.Local.Equals(local))
+        var tcp = protocol == ProtocolType.Tcp;
+        var tables = local.AddressFamily == AddressFamily.InterNetworkV6
+            ? new[] { (tcp ? "/proc/net/tcp6" : "/proc/net/udp6", AddressFamily.InterNetworkV6) }
+            // An IPv4 flow can belong to a dual-stack IPv6 socket, which is listed in the IPv6
+            // table as ::ffff:a.b.c.d; ReadTable maps those back to IPv4, so both are searched.
+            : new[]
             {
-                continue;
-            }
+                (tcp ? "/proc/net/tcp" : "/proc/net/udp", AddressFamily.InterNetwork),
+                (tcp ? "/proc/net/tcp6" : "/proc/net/udp6", AddressFamily.InterNetworkV6),
+            };
 
-            if (remote is not null && socket.Remote.Port != 0 && !socket.Remote.Equals(remote))
+        foreach (var (table, family) in tables)
+        {
+            foreach (var socket in ReadTable(table, protocol, family))
             {
-                continue;
-            }
+                if (!socket.Local.Equals(local))
+                {
+                    continue;
+                }
 
-            return socket.Inode;
+                if (remote is not null && socket.Remote.Port != 0 && !socket.Remote.Equals(remote))
+                {
+                    continue;
+                }
+
+                return socket.Inode;
+            }
         }
 
         return null;

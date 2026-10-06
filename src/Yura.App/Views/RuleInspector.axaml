@@ -92,6 +92,9 @@
                 <ComboBox ItemsSource="{Binding ProcessKinds}" SelectedItem="{Binding ProcessKind}"
                           HorizontalAlignment="Stretch"
                           AutomationProperties.Name="{loc:Tr Rules.Editor.ProcessKind}" />
+                <!-- A running instance or a user has no text to edit; say what is kept. -->
+                <TextBlock Classes="Mono Tertiary" Text="{Binding FixedSubjectDescription}" TextWrapping="Wrap"
+                           Margin="0,4,0,0" IsVisible="{Binding HasFixedSubject}" />
               </StackPanel>
 
               <StackPanel IsVisible="{Binding NeedsProcessValue}">

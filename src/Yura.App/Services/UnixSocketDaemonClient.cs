@@ -24,8 +24,10 @@ namespace Yura.App.Services;
 public sealed class UnixSocketDaemonClient : IDaemonClient
 {
     private readonly string _socketPath;
+    private readonly Lock _stateGate = new();
     private DaemonState _state = DaemonState.Disconnected;
     private string? _unavailableReason;
+    private string? _instance;
 
     public UnixSocketDaemonClient(string? socketPath = null) =>
         _socketPath = socketPath ?? IpcProtocol.DefaultSocketPath;
@@ -33,6 +35,8 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
     public DaemonState State => _state;
 
     public event EventHandler<DaemonState>? StateChanged;
+
+    public event EventHandler? InstanceChanged;
 
     public string? UnavailableReason => _state == DaemonState.Connected
         ? null
@@ -44,6 +48,9 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
         var response = await SendAsync(new IpcRequest { Op = "status" }, cancellationToken).ConfigureAwait(false);
         SetState(response.Ok ? DaemonState.Connected : DaemonState.Disconnected);
     }
+
+    public async Task<bool> PingAsync(CancellationToken cancellationToken = default) =>
+        (await SendAsync(new IpcRequest { Op = "ping" }, cancellationToken).ConfigureAwait(false)).Ok;
 
     public async Task<DaemonStatus?> GetStatusAsync(CancellationToken cancellationToken = default)
     {
@@ -73,7 +80,7 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
                 t.ProxyId, t.Name, t.Interface, t.Up, t.Failure, t.LatestHandshakeUtc, t.RxBytes, t.TxBytes, t.Endpoint)).ToArray(),
             Agents = status.Agents.Select(a => new AgentStatus(
                 a.ProxyId, a.Name, a.Connected, a.AgentName, a.AgentVersion, a.RoundTripMilliseconds, a.Udp,
-                a.Resolver, a.Failure)).ToArray(),
+                a.Resolver, a.Failure, a.FullCone)).ToArray(),
         };
     }
 
@@ -250,6 +257,10 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
             SetState(DaemonState.Disconnected);
             return IpcResponse.Failure(_unavailableReason, e.Message);
         }
+        catch (OperationCanceledException e) when (cancellationToken.IsCancellationRequested)
+        {
+            return Cancelled(e);
+        }
         catch (Exception e) when (e is IOException or OperationCanceledException)
         {
             SetState(DaemonState.Disconnected);
@@ -273,8 +284,13 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
 
             var response = JsonSerializer.Deserialize<IpcResponse>(line, IpcProtocol.Json)
                            ?? IpcResponse.Failure("The daemon sent an empty response.");
+            ObserveInstance(response.Instance);
             SetState(response.Ok ? DaemonState.Connected : _state);
             return response;
+        }
+        catch (OperationCanceledException e) when (cancellationToken.IsCancellationRequested)
+        {
+            return Cancelled(e);
         }
         catch (Exception e) when (e is IOException or SocketException or JsonException or OperationCanceledException)
         {
@@ -283,17 +299,52 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
         }
     }
 
-    private void SetState(DaemonState state)
+    /// <summary>
+    /// A request the caller called off. It says nothing about the daemon, so the state stays.
+    /// </summary>
+    /// <remarks>
+    /// Treated as the daemon going away, pressing Stop during a measurement left the whole app
+    /// believing there was no daemon: every privileged action disabled, and the pages that
+    /// only ask while it is there never asking again.
+    /// </remarks>
+    private static IpcResponse Cancelled(OperationCanceledException e) =>
+        IpcResponse.Failure("The request was cancelled.", e.Message);
+
+    /// <summary>Notices an answer from a different run of the daemon than the last one.</summary>
+    private void ObserveInstance(string? instance)
     {
-        if (_state == state)
+        if (instance is null)
         {
             return;
         }
 
-        _state = state;
-        if (state == DaemonState.Connected)
+        bool restarted;
+        lock (_stateGate)
         {
-            _unavailableReason = null;
+            restarted = _instance is not null && _instance != instance;
+            _instance = instance;
+        }
+
+        if (restarted)
+        {
+            InstanceChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    private void SetState(DaemonState state)
+    {
+        lock (_stateGate)
+        {
+            if (_state == state)
+            {
+                return;
+            }
+
+            _state = state;
+            if (state == DaemonState.Connected)
+            {
+                _unavailableReason = null;
+            }
         }
 
         StateChanged?.Invoke(this, state);
@@ -309,6 +360,9 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
         ResetConnections = response.Apply?.ResetConnections,
         ResetFailure = response.Apply?.ResetFailure,
         Warnings = response.Apply?.Warnings ?? [],
+        // The daemon stamps every answer it sends; a failure made up here, because none came
+        // back, has no stamp.
+        Answered = response.Instance is not null,
     };
 
     private static ConnectionRecord ToRecord(ConnectionDto connection) => new()

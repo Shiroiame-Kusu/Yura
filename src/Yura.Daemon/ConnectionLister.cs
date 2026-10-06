@@ -46,6 +46,10 @@ public sealed class ConnectionLister
         var claimed = new HashSet<long>();
         var rows = new List<ConnectionDto>(sockets.Count + flows.Count);
 
+        // Indexed by the application's side, which is what a socket and its flow share, so
+        // matching is a lookup per socket rather than a walk of every flow per socket.
+        var flowsByClient = flows.ToLookup(f => (f.Protocol, f.Client));
+
         var proxyEndpoints = state.Proxies.Values
             .Select(p => IPAddress.TryParse(p.Host, out var a) ? new IPEndPoint(a, p.Port) : null)
             .Where(e => e is not null)
@@ -80,8 +84,7 @@ public sealed class ConnectionLister
             // A captured connection appears twice in the kernel: the application's socket and
             // ours. Reporting the application's socket as the flow the daemon holds for it
             // keeps one row per connection and lets the flow's evidence speak.
-            var flow = flows.FirstOrDefault(f =>
-                f.Protocol == protocol && f.Client.Equals(socket.Local) &&
+            var flow = flowsByClient[(protocol, socket.Local)].FirstOrDefault(f =>
                 (protocol == TransportProtocol.Udp || f.OriginalDestination.Equals(socket.Remote)) &&
                 !claimed.Contains(f.Id));
             if (flow is not null)
@@ -213,5 +216,6 @@ public sealed class ConnectionLister
         CreatedAtUtc = flow.CreatedAtUtc,
         FailureReason = flow.FailureReason,
         Host = flow.Host,
+        Note = flow.Note,
     };
 }

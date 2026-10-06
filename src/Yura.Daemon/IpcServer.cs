@@ -19,6 +19,9 @@ public sealed record DaemonEnvironment
 {
     public required string SocketPath { get; init; }
 
+    /// <summary>Identifies this run of the daemon, so a client can tell it restarted. See <see cref="IpcResponse.Instance"/>.</summary>
+    public string Instance { get; init; } = Guid.NewGuid().ToString("N");
+
     public required IReadOnlyCollection<uint> AllowedUids { get; init; }
 
     public string? KernelRelease { get; init; }
@@ -135,8 +138,9 @@ public sealed class IpcServer : IAsyncDisposable
             if (peerUid is null || !_allowedUids.Contains(peerUid.Value))
             {
                 _log($"ipc: refused connection from uid {peerUid?.ToString() ?? "unknown"}");
-                await WriteAsync(client, IpcResponse.Failure("Not authorised to control the daemon."), ct)
-                    .ConfigureAwait(false);
+                var refusal = IpcResponse.Failure("Not authorised to control the daemon.");
+                refusal.Instance = _environment.Instance;
+                await WriteAsync(client, refusal, ct).ConfigureAwait(false);
                 return;
             }
 
@@ -186,6 +190,7 @@ public sealed class IpcServer : IAsyncDisposable
                     response = IpcResponse.Failure("The daemon hit an internal error.", e.ToString());
                 }
 
+                response.Instance = _environment.Instance;
                 await WriteAsync(client, response, ct).ConfigureAwait(false);
             }
         }
@@ -195,6 +200,11 @@ public sealed class IpcServer : IAsyncDisposable
     {
         switch (request.Op)
         {
+            case "ping":
+                // Cheap enough to ask every few seconds: whether the daemon is there, and — in
+                // the instance every response carries — whether it is still the same one.
+                return new IpcResponse { Ok = true };
+
             case "status":
                 return new IpcResponse
                 {
@@ -225,6 +235,7 @@ public sealed class IpcServer : IAsyncDisposable
                             AgentVersion = a.AgentVersion,
                             RoundTripMilliseconds = a.RoundTripMilliseconds,
                             Udp = a.Udp,
+                            FullCone = a.FullCone,
                             Resolver = a.Resolver?.ToString(),
                             Failure = a.Failure,
                         }).ToList(),

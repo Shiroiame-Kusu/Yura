@@ -231,7 +231,20 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     private long _excludeMisses;
     private long _includedOnExec;
     private readonly CancellationTokenSource _guardStopping = new();
+    private readonly AutoResetEvent _guardWake = new(false);
     private Thread? _exclusionGuard;
+
+    /// <summary>The exclusion guard's poll while children are appearing.</summary>
+    private static readonly TimeSpan GuardFastPoll = TimeSpan.FromMilliseconds(1);
+
+    /// <summary>The exclusion guard's poll once nothing has forked for a while.</summary>
+    private static readonly TimeSpan GuardSlowPoll = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
+    /// Serialises agent reconciliation, which happens outside <see cref="_gate"/> because it
+    /// waits on the network.
+    /// </summary>
+    private readonly SemaphoreSlim _agentGate = new(1, 1);
 
     private readonly Dictionary<int, SlotListener> _listeners = [];
     private DaemonOptions _options = new();
@@ -296,8 +309,14 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     /// the child creating a socket — a socket's cgroup is fixed when it is created. The fork
     /// notification is the fast path, but its latency is at the kernel's and the scheduler's
     /// discretion. This bounds the window to the poll interval instead, which is the one part
-    /// Yura controls. Reading one small file per group costs microseconds, and the thread only
-    /// exists while a rule actually excludes descendants.
+    /// Yura controls.
+    ///
+    /// The interval adapts. A fork in a guarded group — reported by the fast path — and every
+    /// child found here put it back to a millisecond, because forks come in bursts; while nothing
+    /// forks it backs off to <see cref="GuardSlowPoll"/>. Polling at a millisecond all the time
+    /// was a thousand wake-ups a second in a root daemon for as long as any instance rule
+    /// excluded its children, which is the default for "Proxy this instance". With no groups to
+    /// guard the thread sleeps until one appears.
     ///
     /// It does not close the race. A child that connects within the interval keeps the route it
     /// inherited, and that is reported rather than hidden.
@@ -305,16 +324,20 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     private void ExclusionGuardLoop()
     {
         var token = _guardStopping.Token;
+        WaitHandle[] wakers = [token.WaitHandle, _guardWake];
+        var delay = GuardFastPoll;
         while (!token.IsCancellationRequested)
         {
             var groups = _fastExcludeGroups;
             if (groups.Count == 0)
             {
                 // Nothing to guard: wait to be woken rather than spinning.
-                token.WaitHandle.WaitOne(100);
+                WaitHandle.WaitAny(wakers);
+                delay = GuardFastPoll;
                 continue;
             }
 
+            var evicted = false;
             var members = _fastExcludeMembers;
             foreach (var group in groups)
             {
@@ -334,16 +357,31 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
                     if (_cgroups.RestoreToResolved(pid, _cgroups.ResolvedOriginOf(pid)))
                     {
                         Interlocked.Increment(ref _excludedChildren);
+                        evicted = true;
                     }
                 }
             }
 
-            Thread.Sleep(1);
+            delay = evicted
+                ? GuardFastPoll
+                : TimeSpan.FromTicks(Math.Min(delay.Ticks * 2, GuardSlowPoll.Ticks));
+
+            if (WaitHandle.WaitAny(wakers, delay) == 1)
+            {
+                // Woken by a fork in a guarded group: its siblings are likely on their way.
+                delay = GuardFastPoll;
+            }
         }
     }
 
     private void EnsureExclusionGuard()
     {
+        if (_fastExcludeGroups.Count > 0)
+        {
+            // A guard sleeping for want of groups has some now.
+            _guardWake.Set();
+        }
+
         if (_exclusionGuard is not null || _fastExcludeGroups.Count == 0)
         {
             return;
@@ -383,6 +421,10 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         // it a moment later, off this thread.
         var moved = _cgroups.RestoreToResolved(childPid, _cgroups.ResolvedOriginOf(parentPid));
         Interlocked.Increment(ref moved ? ref _excludedChildren : ref _excludeMisses);
+
+        // Forks come in bursts; the guard polls fast for a while to catch any the kernel is
+        // slow to report.
+        _guardWake.Set();
         return moved;
     }
 
@@ -446,6 +488,8 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         IReadOnlyList<ProxyChain> chains,
         CancellationToken ct = default)
     {
+        IReadOnlyList<string> tunnelWarnings;
+        ApplyOutcome outcome;
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -465,18 +509,45 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
 
             // Exits first: the decider snapshot published by the reconcile below must know
             // which of them are up, and an exit that failed is a warning, not a failed apply.
-            var tunnelWarnings = await _wireguard.ReconcileAsync(proxies, ct).ConfigureAwait(false);
-            // Agent sessions are opened here rather than on first use, so a game's first
-            // connection does not wait for a handshake and the UI can say whether the agent is
-            // there before anything is routed through it.
-            var agentWarnings = await _agents.ReconcileAsync(proxies, ct).ConfigureAwait(false);
-            var outcome = await ReconcileAsync(ct).ConfigureAwait(false);
-            return outcome with { Warnings = [.. tunnelWarnings, .. agentWarnings, .. outcome.Warnings] };
+            tunnelWarnings = await _wireguard.ReconcileAsync(proxies, ct).ConfigureAwait(false);
+            outcome = await ReconcileAsync(ct).ConfigureAwait(false);
         }
         finally
         {
             _gate.Release();
         }
+
+        // Agent sessions are opened here rather than on first use, so a game's first connection
+        // does not wait for a handshake and the UI can say whether the agent is there before
+        // anything is routed through it. Outside the gate, though: an agent that does not answer
+        // takes seconds to give up on, and every process event and rule change waited behind it
+        // — a game started meanwhile opened its first connections before it could be placed.
+        IReadOnlyList<string> agentWarnings;
+        await _agentGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            agentWarnings = await _agents.ReconcileAsync(proxies, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _agentGate.Release();
+        }
+
+        // The resolvers the agents offered are part of what a flow decision reads.
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!_tornDown && outcome.Succeeded)
+            {
+                PublishState();
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+
+        return outcome with { Warnings = [.. tunnelWarnings, .. agentWarnings, .. outcome.Warnings] };
     }
 
     public async Task<ApplyOutcome> SetOptionsAsync(DaemonOptions options, CancellationToken ct = default)
@@ -572,34 +643,45 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
                 }
             }
 
+            // A Wine prefix is only readable from a process's environment, which is otherwise
+            // not read; it has to be in this snapshot for the rule to find its processes.
+            if (rule.Process.WinePrefix is { Length: > 0 })
+            {
+                _processes.ReadEnvironment = true;
+            }
+
             var snapshot = _processes.Enumerate();
+
+            // Existing descendants are only swept in when the rule says so, and only once,
+            // at apply time. Everything forked afterwards arrives through fork events. Worked
+            // out first, because they are covered by the rule as much as its own process is:
+            // their open connections count, and are reset, along with the root's.
+            var joining = new HashSet<int>();
+            if (rule.Process.Descendants == DescendantPolicy.IncludeExistingAndFuture)
+            {
+                foreach (var root in snapshot.Where(rule.Process.MatchesProcess))
+                {
+                    joining.UnionWith(Descendants(root.Identity.Pid, snapshot).Select(d => d.Identity.Pid));
+                }
+            }
 
             // Counted BEFORE the rule is installed: afterwards these sockets are
             // indistinguishable from ones opened under the new rule, and they are exactly
             // the connections that will keep their previous route.
-            var preExisting = CountExistingSockets(rule, snapshot);
+            var preExisting = CountExistingSockets(rule, snapshot, joining);
 
             // Listed before the install too, and for the same reason: the route each of those
             // sockets is on can only be worked out from the rules as they stand now. Which of
             // them the new rule actually changes is decided once it is in place.
-            var resetCandidates = resetExisting ? GatherResetCandidates(rule, snapshot) : [];
+            var resetCandidates = resetExisting ? GatherResetCandidates(rule, snapshot, joining) : [];
 
             var previous = _rules.GetValueOrDefault(rule.Id);
             _rules[rule.Id] = rule;
 
-            // Existing descendants are only swept in when the rule says so, and only once,
-            // at apply time. Everything forked afterwards arrives through fork events.
             if (rule.Process.Descendants == DescendantPolicy.IncludeExistingAndFuture)
             {
-                var roots = snapshot.Where(rule.Process.MatchesProcess).Select(p => p.Identity.Pid).ToList();
                 var members = _tree.TryGetValue(rule.Id, out var existing) ? existing : (_tree[rule.Id] = []);
-                foreach (var root in roots)
-                {
-                    foreach (var descendant in Descendants(root, snapshot))
-                    {
-                        members.Add(descendant.Identity.Pid);
-                    }
-                }
+                members.UnionWith(joining);
             }
             else if (previous is null || previous.Process.Descendants != rule.Process.Descendants)
             {
@@ -868,6 +950,15 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         try
         {
             if (_tornDown)
+            {
+                return;
+            }
+
+            // Nothing is placed and no rule could place anything. Reading the whole of /proc
+            // every two seconds to conclude so is what an idle daemon used to spend its time
+            // on; groups a previous daemon left behind are cleared at startup instead.
+            if (_placed.IsEmpty && _groupsByName.Count == 0 &&
+                !_rules.Values.Any(r => r.Process.Kind != ProcessSelectorKind.Any))
             {
                 return;
             }
@@ -1269,6 +1360,10 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         _fastExcludeGroups = excluding.Select(g => g.Name).ToHashSet();
         _fastInclude = BuildFastInclude();
 
+        // The environment is the most expensive thing read per process and the Wine prefix is
+        // the only thing the daemon wants from it, so it is read only while a rule names one.
+        _processes.ReadEnvironment = ordered.Any(r => r.Enabled && r.Process.WinePrefix is { Length: > 0 });
+
         EnsureExclusionGuard();
 
         _state = new DeciderState
@@ -1336,7 +1431,8 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     }
 
     /// <summary>Sockets already open for the processes a rule covers, or null if unknowable.</summary>
-    private int? CountExistingSockets(RoutingRule rule, IReadOnlyList<ProcessSnapshot> snapshot)
+    /// <param name="joining">Existing descendants the rule is about to take in.</param>
+    private int? CountExistingSockets(RoutingRule rule, IReadOnlyList<ProcessSnapshot> snapshot, IReadOnlySet<int> joining)
     {
         if (rule.Process.Kind == ProcessSelectorKind.Any)
         {
@@ -1346,7 +1442,9 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         try
         {
             var counts = _ownership.CountsByPid();
-            return snapshot.Where(rule.Process.MatchesProcess).Sum(p => counts.GetValueOrDefault(p.Identity.Pid));
+            return snapshot
+                .Where(p => rule.Process.MatchesProcess(p) || joining.Contains(p.Identity.Pid))
+                .Sum(p => counts.GetValueOrDefault(p.Identity.Pid));
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
@@ -1368,12 +1466,14 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     /// route a socket was on, and a socket whose route the rule does not change must not be
     /// aborted: the reset exists to make a rule effective, not to drop connections.
     /// </remarks>
-    private List<ResetCandidate> GatherResetCandidates(RoutingRule rule, IReadOnlyList<ProcessSnapshot> snapshot)
+    /// <param name="joining">Existing descendants the rule is about to take in.</param>
+    private List<ResetCandidate> GatherResetCandidates(
+        RoutingRule rule, IReadOnlyList<ProcessSnapshot> snapshot, IReadOnlySet<int> joining)
     {
         var covered = new Dictionary<int, ProcessSnapshot>();
         foreach (var process in snapshot)
         {
-            if (CoveredByRule(rule, process))
+            if (CoveredByRule(rule, process) || joining.Contains(process.Identity.Pid))
             {
                 covered[process.Identity.Pid] = process;
             }
@@ -1593,7 +1693,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         var pid = _ownership.FindOwnerPid(
             protocol == TransportProtocol.Tcp ? ProtocolType.Tcp : ProtocolType.Udp,
             client,
-            protocol == TransportProtocol.Tcp ? destination : null,
+            destination,
             CandidateOwners(slot));
         var process = pid is { } p ? _processes.TryRead(p) : null;
 
@@ -1674,7 +1774,18 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             _listeners.Clear();
             await _nftables.RemoveAsync().ConfigureAwait(false);
             await _wireguard.RemoveAllAsync().ConfigureAwait(false);
-            await _agents.DisposeAsync().ConfigureAwait(false);
+
+            // An agent reconcile runs outside the gate; the sessions it is opening go with it.
+            await _agentGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await _agents.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                _agentGate.Release();
+            }
+
             _cgroups.RemoveAllGroups();
             _installedSlots = [];
             _state = DeciderState.Empty;
@@ -1693,6 +1804,8 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     {
         await TeardownAsync().ConfigureAwait(false);
         _guardStopping.Dispose();
+        _guardWake.Dispose();
+        _agentGate.Dispose();
         _gate.Dispose();
     }
 }

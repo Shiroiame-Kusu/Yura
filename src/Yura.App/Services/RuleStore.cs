@@ -210,27 +210,81 @@ public sealed class RuleStore
     }
 
     /// <summary>
-    /// Adds a rule, replacing any earlier selection for the same subject.
+    /// The earlier selection a new rule for the same subject would replace, if there is one.
+    /// </summary>
+    /// <remarks>
+    /// Asked before the new rule is installed, so the caller can install it <em>in place</em> of
+    /// this one — same id, same position — which the daemon does in one step. Installed beside
+    /// it and removed afterwards, the old rule was still winning at the moment the daemon
+    /// compared routes before and after, so "apply to connections already open" found nothing
+    /// to move.
+    /// </remarks>
+    public RoutingRule? FindSupersededBy(RoutingRule rule) =>
+        _rules.FirstOrDefault(r => r.Id != rule.Id && r.Origin == rule.Origin && SameSubject(r, rule));
+
+    /// <summary>
+    /// Adds a rule, replacing every earlier selection for the same subject.
     /// </summary>
     /// <returns>
-    /// The rule this one superseded, or null. The caller must take that rule out of the daemon
-    /// as well: dropping it from this list only changes what the app shows, and a superseded
-    /// rule left installed sits at a lower position, so it keeps winning in the kernel.
+    /// The rules this one superseded that had a different id. The caller must take them out of
+    /// the daemon as well: dropping them from this list only changes what the app shows, and a
+    /// superseded rule left installed keeps deciding routes from its position. A rule installed
+    /// in place of the one it replaces — same id — needs no such removal.
     /// </returns>
-    public RoutingRule? Add(RoutingRule rule)
+    /// <remarks>
+    /// Every one, not the first. Until destinations were compared by value, a rule restored from
+    /// the configuration was never superseded, so a saved configuration can hold several
+    /// selections for one subject — and replacing only the first left another deciding routes.
+    /// </remarks>
+    public IReadOnlyList<RoutingRule> Add(RoutingRule rule)
     {
         // A new selection for the same process replaces the previous one rather than
         // stacking, so the effective policy is never the result of two competing overrides.
-        var replaced = _rules.FirstOrDefault(r => r.Origin == rule.Origin && SameSubject(r, rule));
-        if (replaced is not null)
+        var sameId = _rules.FirstOrDefault(r => r.Id == rule.Id);
+        var superseded = _rules
+            .Where(r => r.Id != rule.Id && r.Origin == rule.Origin && SameSubject(r, rule))
+            .ToList();
+
+        if (sameId is not null)
         {
-            _rules.Remove(replaced);
+            _rules.Remove(sameId);
+        }
+
+        foreach (var old in superseded)
+        {
+            _rules.Remove(old);
         }
 
         _rules.Add(rule);
-        PendingUndo = new RuleUndo(rule.Name, replaced, rule);
+        PendingUndo = new RuleUndo(rule.Name, sameId ?? superseded.FirstOrDefault(), rule);
         Changed?.Invoke(this, EventArgs.Empty);
-        return replaced;
+        return superseded;
+    }
+
+    /// <summary>
+    /// Records that nothing is confirmed any more: the daemon went away, or came back as a new
+    /// process holding none of the rules it was given.
+    /// </summary>
+    /// <remarks>
+    /// Every rule reads as pending until the daemon confirms it again. Left as they were, the
+    /// pages kept saying "Active" and "Proxied" about rules no kernel was carrying out.
+    /// </remarks>
+    public void MarkAllPending()
+    {
+        var changed = false;
+        for (var i = 0; i < _rules.Count; i++)
+        {
+            if (_rules[i].AppliedAtUtc is not null)
+            {
+                _rules[i] = _rules[i] with { AppliedAtUtc = null };
+                changed = true;
+            }
+        }
+
+        if (changed)
+        {
+            Changed?.Invoke(this, EventArgs.Empty);
+        }
     }
 
     /// <summary>

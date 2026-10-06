@@ -70,6 +70,25 @@ internal static class AgentUnit
             command.Append(" --ports ").Append(string.Join(',', options.Policy.Ports));
         }
 
+        foreach (var own in options.Policy.LocalAddresses)
+        {
+            command.Append(" --own-address ").Append(own);
+        }
+
+        if (options.MaxSessions != new AgentOptions().MaxSessions)
+        {
+            command.Append(CultureInfo.InvariantCulture, $" --max-sessions {options.MaxSessions}");
+        }
+
+        if (!options.FullCone)
+        {
+            command.Append(" --no-full-cone");
+        }
+        else if (options.ConePorts != AgentOptions.DefaultConePorts)
+        {
+            command.Append(" --cone-ports ").Append(options.ConePorts);
+        }
+
         return $"""
             [Unit]
             Description=Yura agent (game acceleration relay)

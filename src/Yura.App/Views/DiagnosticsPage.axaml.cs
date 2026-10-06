@@ -37,10 +37,7 @@ public sealed partial class DiagnosticsPage : UserControl
         if (sender is Button button)
         {
             // Immediate feedback on the control that was pressed, then back to its label.
-            var original = button.Content;
-            button.Content = Loc.Current["Diagnostics.Copied"];
-            await Task.Delay(TimeSpan.FromSeconds(2));
-            button.Content = original;
+            await CopyFeedback.ShowAsync(button, Loc.Current["Diagnostics.Copied"]);
         }
     }
 }

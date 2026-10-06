@@ -132,9 +132,13 @@
                              IsVisible="{Binding !ResetExistingConnections}" />
                 </StackPanel>
 
+                <!-- Says what the chosen scope will install: it always said "this instance",
+                     whichever scope was picked above it. -->
                 <Button Classes="accent" HorizontalAlignment="Stretch"
-                        Command="{Binding ProxyThisInstanceCommand}"
-                        Content="{loc:Tr Processes.Action.ProxyInstance}" />
+                        Command="{Binding ProxyThisInstanceCommand}">
+                  <TextBlock Text="{Binding ProxyButtonLabel}" TextWrapping="Wrap"
+                             TextAlignment="Center" />
+                </Button>
 
                 <Button HorizontalAlignment="Stretch"
                         Command="{Binding AlwaysProxyExecutableCommand}">

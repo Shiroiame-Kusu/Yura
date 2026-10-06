@@ -226,11 +226,20 @@ public static class NatClassifier
 
         if (observations.FirstMapped!.Equals(observations.SecondMapped))
         {
-            detail = observations.SecondServerDiffersOnlyByPort
-                ? "Two servers on the same address but different ports saw the same mapping, so " +
-                  "the mapping does not depend on the destination port."
-                : "Two different servers saw the same mapping, so it does not depend on the " +
-                  "destination. Hole punching can work.";
+            if (observations.SecondServerDiffersOnlyByPort)
+            {
+                // Rules out a mapping keyed on the destination port, and says nothing about one
+                // keyed on the destination address — which breaks hole punching just as surely.
+                // Calling that endpoint-independent would be the flattering answer this type
+                // exists to avoid.
+                detail = "Two ports of the same server saw the same mapping, so it does not depend " +
+                         "on the destination port. Whether it depends on the destination address " +
+                         "could not be established: no second server address answered.";
+                return NatMapping.Unknown;
+            }
+
+            detail = "Two different servers saw the same mapping, so it does not depend on the " +
+                     "destination. Hole punching can work.";
             return NatMapping.EndpointIndependent;
         }
 

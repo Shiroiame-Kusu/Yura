@@ -74,9 +74,26 @@ public sealed class CommandRunner
         }
 
         using var process = new Process { StartInfo = startInfo };
-        if (!process.Start())
+        try
         {
-            return new CommandResult(-1, string.Empty, $"could not start {fileName}");
+            if (!process.Start())
+            {
+                return new CommandResult(-1, string.Empty, $"could not start {fileName}");
+            }
+        }
+        catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            // A tool that is not installed throws here rather than failing to start. That is an
+            // answer for the caller — WireGuard is optional, and a missing nft is a startup
+            // check with a reason — not a reason for the daemon to die. 127 is what a shell
+            // reports for a command it cannot find.
+            var missing = new CommandResult(127, string.Empty, $"could not start {fileName}: {e.Message}");
+            if (!quiet)
+            {
+                _log($"failed ({missing.ExitCode}): {missing.FailureText}");
+            }
+
+            return missing;
         }
 
         // Read both pipes concurrently: a tool that fills stderr while we block on stdout

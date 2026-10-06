@@ -83,6 +83,8 @@ internal static class Strings
         ["Processes.CountFiltered"] = "{0} of {1} processes",
 
         ["Processes.Action.ProxyInstance"] = "Proxy this instance",
+        ["Processes.Action.ProxyExecutable"] = "Proxy every run of this executable",
+        ["Processes.Action.ProxyTree"] = "Proxy this process and its children",
         ["Processes.Action.AlwaysProxy"] = "Always proxy this executable",
         ["Processes.Action.Direct"] = "Route directly",
         ["Processes.Action.Block"] = "Block network access",
@@ -96,7 +98,7 @@ internal static class Strings
         ["Processes.Scope.Executable"] = "Future instances of this executable",
         ["Processes.Scope.ExecutableHint"] = "Saved and reapplied whenever this path runs again.",
         ["Processes.Scope.Tree"] = "This process and its children",
-        ["Processes.Scope.TreeHint"] = "New children are covered. Existing children keep their current route.",
+        ["Processes.Scope.TreeHint"] = "Children it starts later are covered, and children already running are moved in too. Connections they already have open keep their route unless they are reset.",
 
         ["Processes.Inspector.Identity"] = "Identity",
         ["Processes.Inspector.Policy"] = "Current policy",
@@ -183,6 +185,7 @@ internal static class Strings
         ["Proxy.TestFailed"] = "Could not reach the proxy",
         ["Proxy.Hint"] = "Yura does not run a proxy for you. Point it at one you already run.",
         ["Proxy.SecretHint"] = "The password is saved in {0}, never in the configuration file.",
+        ["Proxy.SecretNotStored"] = "The secret for “{0}” could not be saved in {1}. It is kept until Yura exits and has to be entered again after that.",
         ["Proxy.SecretHintUnavailable"] =
             "No desktop secret service was found, so the password is kept for this session only. It is never written to the configuration file.",
         ["Proxy.SecretStore"] = "the desktop secret service",
@@ -444,6 +447,7 @@ internal static class Strings
         ["Proxy.Agent.Down"] = "Not answering: {0}",
         ["Proxy.Agent.Up"] = "{0} · {1} away · {2}",
         ["Proxy.Agent.UdpYes"] = "UDP carried",
+        ["Proxy.Agent.UdpCone"] = "UDP carried, open NAT for peer-to-peer",
         ["Proxy.Agent.UdpNo"] = "no UDP",
         ["Proxy.Validation.Fingerprint"] = "A key fingerprint is a SHA-256 value, as the agent printed it.",
         ["Proxy.Validation.Token"] = "A token is a 32-byte value, as the agent printed it.",
@@ -638,6 +642,8 @@ internal static class Strings
         ["Processes.CountFiltered"] = "{0} / {1} 个进程",
 
         ["Processes.Action.ProxyInstance"] = "代理此实例",
+        ["Processes.Action.ProxyExecutable"] = "代理此可执行文件的每次运行",
+        ["Processes.Action.ProxyTree"] = "代理此进程及其子进程",
         ["Processes.Action.AlwaysProxy"] = "始终代理此可执行文件",
         ["Processes.Action.Direct"] = "直接连接",
         ["Processes.Action.Block"] = "阻止网络访问",
@@ -651,7 +657,7 @@ internal static class Strings
         ["Processes.Scope.Executable"] = "此可执行文件的后续实例",
         ["Processes.Scope.ExecutableHint"] = "已保存，此路径再次运行时会重新应用。",
         ["Processes.Scope.Tree"] = "此进程及其子进程",
-        ["Processes.Scope.TreeHint"] = "新建子进程会被覆盖。已有子进程保持当前路由。",
+        ["Processes.Scope.TreeHint"] = "之后启动的子进程会被覆盖，已在运行的子进程也会一并移入。它们已打开的连接保持原路由，除非被重置。",
 
         ["Processes.Inspector.Identity"] = "标识",
         ["Processes.Inspector.Policy"] = "当前策略",
@@ -732,6 +738,7 @@ internal static class Strings
         ["Proxy.TestFailed"] = "无法连接到代理",
         ["Proxy.Hint"] = "Yura 不会为你运行代理，请指向你已在运行的代理。",
         ["Proxy.SecretHint"] = "密码保存在{0}，不会写入配置文件。",
+        ["Proxy.SecretNotStored"] = "“{0}”的密钥无法保存到{1}。它会保留到 Yura 退出，之后需要重新输入。",
         ["Proxy.SecretHintUnavailable"] = "未找到桌面密钥服务，密码仅在本次会话中保留，且不会写入配置文件。",
         ["Proxy.SecretStore"] = "桌面密钥服务",
 
@@ -981,6 +988,7 @@ internal static class Strings
         ["Proxy.Agent.Down"] = "无应答：{0}",
         ["Proxy.Agent.Up"] = "{0} · 距离 {1} · {2}",
         ["Proxy.Agent.UdpYes"] = "可承载 UDP",
+        ["Proxy.Agent.UdpCone"] = "可承载 UDP，点对点为开放型 NAT",
         ["Proxy.Agent.UdpNo"] = "不承载 UDP",
         ["Proxy.Validation.Fingerprint"] = "密钥指纹是 SHA-256 值，请照代理端打印的填写。",
         ["Proxy.Validation.Token"] = "令牌是 32 字节的值，请照代理端打印的填写。",

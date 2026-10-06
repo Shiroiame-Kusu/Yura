@@ -34,10 +34,7 @@ public sealed partial class SettingsPage : UserControl
         await clipboard.SetTextAsync(text);
         if (sender is Button button)
         {
-            var original = button.Content;
-            button.Content = Loc.Current["Settings.Service.Copied"];
-            await Task.Delay(TimeSpan.FromSeconds(2));
-            button.Content = original;
+            await CopyFeedback.ShowAsync(button, Loc.Current["Settings.Service.Copied"]);
         }
     }
 }

@@ -221,6 +221,27 @@ public sealed class NftablesRulesetTests
     }
 
     [Fact]
+    public void A_capture_rule_scoped_to_IPv4_networks_has_no_IPv6_line_for_nft_to_refuse()
+    {
+        // 'meta nfproto ipv6' beside 'ip daddr' is a contradiction nft rejects outright
+        // ("conflicting network layer protocols"), and one rejected line fails the whole
+        // transaction: no proxy rule scoped to an IPv4 network could ever be installed, and
+        // every other rule went down with it. No IPv6 packet can match such a rule anyway.
+        var rule = Rule("v4 net", 13, new RuleAction.Proxy(ProxyA), destination: new DestinationSelector
+        {
+            Networks = [IPNetwork.Parse("203.0.113.0/24")],
+        });
+
+        var text = NftablesManager.Build([Slot(1, rule, SlotDisposition.Capture, Group(1, rule))], []);
+
+        var lines = text.Split('\n').Where(l => l.Contains("ip daddr", StringComparison.Ordinal)).ToList();
+        Assert.NotEmpty(lines);
+        Assert.All(lines, l => Assert.DoesNotContain("nfproto ipv6", l, StringComparison.Ordinal));
+        Assert.Contains(lines, l => l.Contains("meta nfproto ipv4", StringComparison.Ordinal) &&
+                                    l.Contains("meta mark set 0x7101", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void A_capture_rule_that_names_IPv6_destinations_is_refused_with_the_reason()
     {
         // It could only ever have blocked them, so installing it would be a rule that claims

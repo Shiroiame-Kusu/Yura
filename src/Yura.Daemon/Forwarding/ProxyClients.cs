@@ -243,6 +243,9 @@ public static class ProxyDialer
             Fingerprint = settings.Fingerprint,
             Label = $"yura-daemon/{typeof(ProxyDialer).Assembly.GetName().Version?.ToString(3) ?? "0"}",
             ConfigureSocket = configureSocket,
+            // Always asked for: it is what lets a peer-to-peer game be reached through the agent,
+            // and an agent that will not, or is too old to, simply does not grant it.
+            FullCone = true,
         };
     }
 
@@ -259,7 +262,22 @@ public static class ProxyDialer
         {
             throw new ProxyHandshakeException($"Agent exit '{hop.Endpoint.Name}': {e.Message}");
         }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw HandshakeTimedOut(hop);
+        }
     }
+
+    /// <summary>
+    /// A handshake that ran out of time, as the failure it is.
+    /// </summary>
+    /// <remarks>
+    /// The timeouts in here are our own, and left as cancellations they read to every caller as
+    /// "the caller gave up" — the forwarder recorded a proxy that never answered as a flow that
+    /// had finished normally. Only the caller's own token may surface as a cancellation.
+    /// </remarks>
+    private static ProxyHandshakeException HandshakeTimedOut(ProxyHop hop) =>
+        new($"'{hop.Endpoint.Name}' did not complete its handshake within {HandshakeTimeout.TotalSeconds:0} s.");
 
     /// <summary>A plain connection to the destination, still bypass-marked so it is not re-captured.</summary>
     public static async Task<UpstreamLeg> OpenDirectAsync(IPEndPoint destination, CancellationToken ct)
@@ -267,19 +285,36 @@ public static class ProxyDialer
         var socket = new Socket(destination.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         socket.SetMark(PolicyRouting.BypassMark);
         socket.NoDelay = true;
+        await ConnectWithinAsync(socket, destination, ct).ConfigureAwait(false);
+        return new UpstreamLeg(socket, new NetworkStream(socket, ownsSocket: false), UpstreamHalfClose.Socket);
+    }
+
+    /// <summary>
+    /// Connects within <see cref="ConnectTimeout"/>, disposing the socket on any failure.
+    /// </summary>
+    /// <remarks>
+    /// Running out of time is reported as the socket error it is, <see cref="SocketError.TimedOut"/>,
+    /// not as a cancellation: a cancellation means the caller gave up, and treating an
+    /// unreachable proxy that way recorded its flows as having finished normally.
+    /// </remarks>
+    private static async Task ConnectWithinAsync(Socket socket, IPEndPoint target, CancellationToken ct)
+    {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(ConnectTimeout);
         try
         {
-            await socket.ConnectAsync(destination, timeout.Token).ConfigureAwait(false);
+            await socket.ConnectAsync(target, timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            socket.Dispose();
+            throw new SocketException((int)SocketError.TimedOut);
         }
         catch
         {
             socket.Dispose();
             throw;
         }
-
-        return new UpstreamLeg(socket, new NetworkStream(socket, ownsSocket: false), UpstreamHalfClose.Socket);
     }
 
     /// <summary>
@@ -296,12 +331,9 @@ public static class ProxyDialer
         var socket = new Socket(target.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         socket.SetMark(tunnel.Mark);
         socket.NoDelay = true;
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(ConnectTimeout);
         try
         {
             socket.Bind(new IPEndPoint(source, 0));
-            await socket.ConnectAsync(target, timeout.Token).ConfigureAwait(false);
         }
         catch
         {
@@ -309,6 +341,7 @@ public static class ProxyDialer
             throw;
         }
 
+        await ConnectWithinAsync(socket, target, ct).ConfigureAwait(false);
         return socket;
     }
 
@@ -319,18 +352,7 @@ public static class ProxyDialer
         var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         socket.SetMark(PolicyRouting.BypassMark);
         socket.NoDelay = true;
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(ConnectTimeout);
-        try
-        {
-            await socket.ConnectAsync(new IPEndPoint(address, port), timeout.Token).ConfigureAwait(false);
-        }
-        catch
-        {
-            socket.Dispose();
-            throw;
-        }
-
+        await ConnectWithinAsync(socket, new IPEndPoint(address, port), ct).ConfigureAwait(false);
         return socket;
     }
 
@@ -369,12 +391,30 @@ public static class ProxyDialer
                     ? $"TLS to {hop.Authority} failed: {e.Message} Enable 'allow invalid certificate' only if you trust this proxy."
                     : $"TLS to {hop.Authority} was cut off: {e.Message}");
         }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            tls.Dispose();
+            throw new ProxyHandshakeException(
+                $"TLS to {hop.Authority} did not complete within {HandshakeTimeout.TotalSeconds:0} s.");
+        }
 
         return tls;
     }
 
     /// <summary>Performs one hop's handshake on an already-connected stream.</summary>
     public static async Task TunnelAsync(Stream stream, ProxyHop hop, string targetHost, int targetPort, CancellationToken ct)
+    {
+        try
+        {
+            await TunnelWithinAsync(stream, hop, targetHost, targetPort, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw HandshakeTimedOut(hop);
+        }
+    }
+
+    private static async Task TunnelWithinAsync(Stream stream, ProxyHop hop, string targetHost, int targetPort, CancellationToken ct)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(HandshakeTimeout);

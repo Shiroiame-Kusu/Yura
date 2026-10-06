@@ -375,6 +375,73 @@ public sealed class AgentServerTests
         Assert.Equal(destination.EndPoint.ToString(), reply.Resolved);
     }
 
+    /// <summary>
+    /// A listener whose accept queue is full, so the kernel drops every further connection
+    /// attempt: a destination that does not answer, without leaving loopback.
+    /// </summary>
+    private sealed class Blackhole : IDisposable
+    {
+        private readonly Socket _listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        private readonly List<Socket> _queued = [];
+
+        public Blackhole()
+        {
+            _listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            _listener.Listen(1);
+            for (var i = 0; i < 4; i++)
+            {
+                var filler = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                _queued.Add(filler);
+                using var wait = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+                try
+                {
+                    filler.ConnectAsync(EndPoint, wait.Token).AsTask().GetAwaiter().GetResult();
+                }
+                catch (OperationCanceledException)
+                {
+                    // The queue is full: this one is the first to be dropped.
+                }
+            }
+        }
+
+        public IPEndPoint EndPoint => (IPEndPoint)_listener.LocalEndPoint!;
+
+        public void Dispose()
+        {
+            foreach (var socket in _queued)
+            {
+                socket.Dispose();
+            }
+
+            _listener.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task A_probe_slower_than_the_session_timeout_leaves_the_session_open()
+    {
+        // Every sample of a destination that drops connection attempts waits out the agent's
+        // connect timeout. The session's ordinary timeout was applied to the whole probe, and
+        // when it ran out the session closed — taking every UDP flow through the agent with it.
+        await using var harness = AgentHarness.Start();
+        using var blackhole = new Blackhole();
+        await using var session = await AgentSession.ConnectAsync(
+            harness.Client() with { Timeout = TimeSpan.FromSeconds(1) }, Token);
+
+        var probing = session.ProbeAsync(AgentAddress.From(blackhole.EndPoint), 1, Token);
+
+        // And the agent goes on answering while it measures: a request behind the probe would
+        // have waited for it, and timed out.
+        var stats = await session.StatsAsync(Token);
+        Assert.False(probing.IsCompleted);
+
+        var reply = await probing;
+        Assert.Empty(reply.Microseconds);
+        Assert.NotNull(reply.Failure);
+        Assert.True(session.IsOpen, session.Failure);
+        Assert.True(stats.Sessions >= 1);
+    }
+
     [Fact]
     public async Task A_probe_of_something_unreachable_says_so_instead_of_reporting_zero()
     {

@@ -118,6 +118,11 @@ public sealed partial class ProcessRowViewModel : ObservableObject
         var pathChanged = Snapshot.ExecutablePath != snapshot.ExecutablePath ||
                           Snapshot.ExecutablePathState != snapshot.ExecutablePathState;
 
+        // An exec keeps the pid and the start time — the row's identity — and replaces the
+        // program: the name and the Wine context change under the same row.
+        var imageChanged = pathChanged || Snapshot.DisplayName != snapshot.DisplayName ||
+                           Snapshot.Wine != snapshot.Wine;
+
         Snapshot = snapshot;
 
         // Only the properties that can actually change between refreshes are re-raised,
@@ -133,7 +138,17 @@ public sealed partial class ProcessRowViewModel : ObservableObject
             OnPropertyChanged(nameof(PathIsUnavailable));
             OnPropertyChanged(nameof(ExecutableWasReplaced));
         }
+
+        if (imageChanged)
+        {
+            OnPropertyChanged(nameof(DisplayName));
+            OnPropertyChanged(nameof(IsWine));
+            OnPropertyChanged(nameof(Icon));
+        }
     }
+
+    /// <summary>Re-renders every localised string after a language change.</summary>
+    public void NotifyLanguageChanged() => OnPropertyChanged(string.Empty);
 
     partial void OnPolicyChanged(PolicyKind value)
     {

@@ -36,7 +36,7 @@ public static class IpcProtocol
 public sealed class IpcRequest
 {
     /// <summary>
-    /// status | set-proxies | set-options | apply-rule | remove-rule | list-rules |
+    /// ping | status | set-proxies | set-options | apply-rule | remove-rule | list-rules |
     /// list-flows | list-connections | connection-counts | probe-proxy | measure |
     /// nat-test | dump-ruleset | log
     /// </summary>
@@ -74,6 +74,18 @@ public sealed class IpcRequest
 public sealed class IpcResponse
 {
     public required bool Ok { get; init; }
+
+    /// <summary>
+    /// Identifies the running daemon process, and changes when it restarts. Stamped on every
+    /// response by the server.
+    /// </summary>
+    /// <remarks>
+    /// The daemon keeps nothing across a restart, so a client that sees this change knows the
+    /// proxies and rules it pushed are gone and must push them again — whether or not it ever
+    /// saw the daemon go away in between. A restart under systemd takes two seconds, which is
+    /// shorter than the gap between two requests.
+    /// </remarks>
+    public string? Instance { get; set; }
 
     public string? Error { get; init; }
 
@@ -173,6 +185,9 @@ public sealed class AgentDto
 
     /// <summary>Whether the agent offered the datagram channel and it was set up.</summary>
     public bool Udp { get; init; }
+
+    /// <summary>Whether the agent gave full-cone UDP, so a peer-to-peer game can be reached through it.</summary>
+    public bool FullCone { get; init; }
 
     /// <summary>The resolver the agent offered, used for lookups from processes on this exit.</summary>
     public string? Resolver { get; init; }

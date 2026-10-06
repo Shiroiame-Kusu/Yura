@@ -64,9 +64,17 @@ public sealed class Flow
 
     public DateTimeOffset CreatedAtUtc { get; }
 
+    /// <summary>When the flow ended — closed, failed or blocked — or null while it is live.</summary>
+    public DateTimeOffset? ClosedAtUtc { get; private set; }
+
     public ConnectionState State { get; private set; }
 
     public string? FailureReason { get; private set; }
+
+    /// <summary>Something about the flow worth saying beside it, such as who opened it.</summary>
+    public string? Note { get; private set; }
+
+    public void Annotate(string note) => Note = note;
 
     /// <summary>Bytes from the application towards the destination.</summary>
     public long BytesUp => Interlocked.Read(ref _bytesUp);
@@ -100,16 +108,22 @@ public sealed class Flow
     {
         State = ConnectionState.Closed;
         Route = RouteObservation.ConfirmedBlocked;
+        ClosedAtUtc ??= DateTimeOffset.UtcNow;
     }
 
     public void MarkClosing() => State = ConnectionState.Closing;
 
-    public void MarkClosed() => State = ConnectionState.Closed;
+    public void MarkClosed()
+    {
+        State = ConnectionState.Closed;
+        ClosedAtUtc ??= DateTimeOffset.UtcNow;
+    }
 
     public void MarkFailed(string reason)
     {
         State = ConnectionState.Failed;
         Route = RouteObservation.Unknown;
         FailureReason = reason;
+        ClosedAtUtc ??= DateTimeOffset.UtcNow;
     }
 }

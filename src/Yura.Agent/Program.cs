@@ -163,6 +163,16 @@ public static class Program
             Console.WriteLine();
         }
 
+        var options = arguments.ToOptions();
+        var udpPort = options.UdpPort != 0 ? options.UdpPort : port;
+        Console.WriteLine(options.Udp
+            ? options.FullCone
+                ? $"Open TCP {port} and UDP {udpPort} in this server's firewall, and UDP {options.ConePorts} for\n" +
+                  "peer-to-peer games: that range is where other players reach a game routed through here."
+                : $"Open TCP {port} and UDP {udpPort} in this server's firewall."
+            : $"Open TCP {port} in this server's firewall.");
+        Console.WriteLine();
+
         Console.WriteLine("The string contains the token, which is the whole of a client's authority to");
         Console.WriteLine("use this agent. Treat it like a password: send it over something private, and");
         Console.WriteLine("run 'yura-agent rotate' if it leaks.");
@@ -363,6 +373,20 @@ public static class Program
                         }
 
                         break;
+                    case "--own-address":
+                        OwnAddresses.Add(IPAddress.TryParse(Value(), out var own)
+                            ? own
+                            : throw new ArgumentException("--own-address needs an IP address"));
+                        break;
+                    case "--no-full-cone":
+                        FullCone = false;
+                        break;
+                    case "--cone-ports":
+                        ConePorts = PortRange.TryParse(Value(), out var cone) && cone.From >= 1024 && cone.From <= cone.To
+                            ? cone
+                            : throw new ArgumentException(
+                                "--cone-ports needs a range of unprivileged ports, e.g. 40000-40999");
+                        break;
                     case "--max-sessions":
                         MaxSessions = int.TryParse(Value(), out var sessions) && sessions > 0
                             ? sessions
@@ -400,6 +424,12 @@ public static class Program
 
         public int MaxSessions { get; } = 64;
 
+        public bool FullCone { get; } = true;
+
+        public List<IPAddress> OwnAddresses { get; } = [];
+
+        public PortRange ConePorts { get; } = AgentOptions.DefaultConePorts;
+
         public AgentOptions ToOptions() => new()
         {
             Listen = Listen,
@@ -407,12 +437,15 @@ public static class Program
             UdpPort = UdpPort ?? 0,
             Udp = Udp,
             MaxSessions = MaxSessions,
+            FullCone = FullCone,
+            ConePorts = ConePorts,
             Policy = new DestinationPolicy
             {
                 AllowPrivate = AllowPrivate,
                 Allowed = Allowed,
                 Denied = Denied,
                 Ports = Ports,
+                LocalAddresses = OwnAddresses.ToHashSet(),
             },
         };
 
@@ -461,10 +494,21 @@ public static class Program
               --deny CIDR        never relay to these networks (repeatable)
               --ports LIST       relay only to these destination ports, e.g. 27015-27050,443
               --max-sessions N   how many clients at once (default 64)
+              --own-address IP   an address of this server's, never relayed to (repeatable;
+                                 default: every address on its interfaces). Give the public one
+                                 when it is on no interface, as behind a cloud's 1:1 NAT
+              --cone-ports A-B   UDP ports for full-cone channels (default {AgentOptions.DefaultConePorts})
+              --no-full-cone     give every destination its own socket instead, which a
+                                 peer-to-peer game sees as a Strict NAT
 
             The agent refuses private, loopback and link-local destinations unless told
             otherwise, so a client holding the token cannot use it to reach the server's own
             network.
+
+            Full-cone UDP gives each of a game's sockets one address here for every peer, and
+            lets anyone send to it: a peer-to-peer game sees an Open NAT, provided a firewall in
+            front of this server lets the --cone-ports range in. Behind a stateful firewall that
+            does not, it is Moderate, which most peer-to-peer games still manage.
             """);
         return 0;
     }

@@ -49,6 +49,18 @@ public sealed record DestinationPolicy
     public IPAddress? Resolver { get; init; }
 
     /// <summary>
+    /// The addresses of the machine the agent runs on, public ones included.
+    /// </summary>
+    /// <remarks>
+    /// Refused like loopback, because that is what they are: a connection from the agent to its
+    /// own public address never leaves the machine, so it reaches every service listening on
+    /// it — an SSH daemon, a database, an admin panel — past any firewall rule that only lets
+    /// the machine talk to itself. Kept current by the server, since an address can change
+    /// under a running agent.
+    /// </remarks>
+    public IReadOnlySet<IPAddress> LocalAddresses { get; init; } = new HashSet<IPAddress>();
+
+    /// <summary>
     /// Why this destination is refused, or null when it is allowed. The text goes back to the
     /// client, so it says what the agent's rule is without describing the server's network.
     /// </summary>
@@ -94,12 +106,52 @@ public sealed record DestinationPolicy
             return "The agent does not relay to private or loopback addresses.";
         }
 
+        if (!AllowPrivate && LocalAddresses.Contains(address))
+        {
+            return "The agent does not relay to its own addresses.";
+        }
+
         if (IsMulticastOrUnspecified(address))
         {
             return "That is not an address the agent can relay to.";
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Every unicast address on this machine's interfaces, in the form <see cref="Refuse"/>
+    /// compares: IPv4 as IPv4, and without a scope id.
+    /// </summary>
+    public static IReadOnlySet<IPAddress> ReadLocalAddresses()
+    {
+        var addresses = new HashSet<IPAddress>();
+        try
+        {
+            foreach (var network in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+            {
+                foreach (var unicast in network.GetIPProperties().UnicastAddresses)
+                {
+                    var address = unicast.Address;
+                    if (address.IsIPv4MappedToIPv6)
+                    {
+                        address = address.MapToIPv4();
+                    }
+                    else if (address.AddressFamily == AddressFamily.InterNetworkV6 && address.ScopeId != 0)
+                    {
+                        address = new IPAddress(address.GetAddressBytes());
+                    }
+
+                    addresses.Add(address);
+                }
+            }
+        }
+        catch (System.Net.NetworkInformation.NetworkInformationException)
+        {
+            // Nothing extra to refuse; the range rules still apply.
+        }
+
+        return addresses;
     }
 
     /// <summary>

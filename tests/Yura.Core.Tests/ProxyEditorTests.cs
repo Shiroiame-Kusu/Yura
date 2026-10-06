@@ -52,11 +52,25 @@ internal sealed class RecordingDaemonClient : IDaemonClient
 
     public DaemonState State { get; set; } = DaemonState.Connected;
 
-    public event EventHandler<DaemonState>? StateChanged { add { } remove { } }
+    public event EventHandler<DaemonState>? StateChanged;
+
+    public event EventHandler? InstanceChanged;
+
+    /// <summary>Raises <see cref="StateChanged"/>, the way the socket client does when the daemon comes or goes.</summary>
+    public void RaiseStateChanged(DaemonState state)
+    {
+        State = state;
+        StateChanged?.Invoke(this, state);
+    }
+
+    /// <summary>Raises <see cref="InstanceChanged"/>, as if the daemon had restarted between two requests.</summary>
+    public void RaiseInstanceChanged() => InstanceChanged?.Invoke(this, EventArgs.Empty);
 
     public string? UnavailableReason => State == DaemonState.Connected ? null : "the test daemon is not connected";
 
     public Task ConnectAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<bool> PingAsync(CancellationToken ct = default) => Task.FromResult(State == DaemonState.Connected);
 
     public Task<DaemonStatus?> GetStatusAsync(CancellationToken ct = default) => Task.FromResult<DaemonStatus?>(null);
 
@@ -116,8 +130,18 @@ internal sealed class RecordingDaemonClient : IDaemonClient
         return Task.FromResult(new ProxyProbeResult { TimestampUtc = DateTimeOffset.UtcNow, Reachable = true });
     }
 
-    public Task<MeasurementDto?> MeasureAsync(string host, ushort port, Guid? proxyId, Guid? chainId, int samples, CancellationToken ct = default) =>
-        Task.FromResult<MeasurementDto?>(null);
+    /// <summary>Holds every measurement until completed, so a test can look at the page meanwhile.</summary>
+    public TaskCompletionSource? HoldMeasurements { get; set; }
+
+    public async Task<MeasurementDto?> MeasureAsync(string host, ushort port, Guid? proxyId, Guid? chainId, int samples, CancellationToken ct = default)
+    {
+        if (HoldMeasurements is { } hold)
+        {
+            await hold.Task.WaitAsync(ct);
+        }
+
+        return null;
+    }
 
     /// <summary>What the next NAT test reports, so a test can drive the comparison.</summary>
     public NatTestResultDto? NextNatResult { get; set; }

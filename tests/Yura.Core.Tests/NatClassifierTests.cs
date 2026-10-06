@@ -162,6 +162,28 @@ public sealed class NatClassifierTests
     }
 
     [Fact]
+    public void One_mapping_for_two_ports_of_one_server_says_nothing_about_the_address()
+    {
+        // A second port of the same server rules out a mapping keyed on the destination port
+        // and leaves untested the one keyed on the address, which breaks hole punching just as
+        // surely. This used to read as endpoint-independent, and the page said Moderate.
+        var assessment = NatClassifier.Classify(new NatObservations
+        {
+            Local = Local,
+            FirstMapped = Mapped,
+            SecondMapped = Mapped,
+            SecondServerDistinct = true,
+            SecondServerDiffersOnlyByPort = true,
+            AnsweredFromOtherAddressAndPort = true,
+        });
+
+        Assert.Equal(NatMapping.Unknown, assessment.Mapping);
+        Assert.Equal(NatVerdict.Unknown, assessment.Verdict);
+        Assert.False(assessment.SupportsPeerToPeer);
+        Assert.Contains("could not be established", assessment.Diagnostics, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void One_server_answering_leaves_the_mapping_unknown_rather_than_assumed_good()
     {
         var assessment = NatClassifier.Classify(new NatObservations

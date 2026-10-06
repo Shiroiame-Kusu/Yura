@@ -208,6 +208,71 @@ public sealed class AgentProtocolTests
     }
 
     [Fact]
+    public void Datagrams_sealed_from_several_threads_at_once_all_open()
+    {
+        // One session carries every flow through an agent, so its reply pumps, receive threads
+        // and keepalive all seal at once. AesGcm is not safe for that: overlapping calls threw
+        // "cipher operation failed", and the loop it happened in died with it.
+        var (client, agent) = Pair();
+        using (client)
+        using (agent)
+        {
+            var packets = new System.Collections.Concurrent.ConcurrentBag<byte[]>();
+            Parallel.For(0, 8, _ =>
+            {
+                for (var i = 0; i < 500; i++)
+                {
+                    var packet = new byte[AgentDatagramCrypto.SealedSize(64)];
+                    var length = client.Seal(RandomNumberGenerator.GetBytes(64), packet);
+                    packets.Add(packet[..length]);
+                }
+            });
+
+            static ulong CounterOf(byte[] packet) =>
+                System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(packet.AsSpan(AgentProtocol.SessionIdBytes + 1));
+
+            // Every counter used once: a nonce reused under one key would be worse than a crash.
+            Assert.Equal(4000, packets.Select(CounterOf).Distinct().Count());
+
+            // Opened in counter order, because the replay window is 64 wide and threads finish in
+            // any order.
+            Assert.All(packets.OrderBy(CounterOf), packet => Assert.True(agent.TryOpen(packet, new byte[128], out _)));
+        }
+    }
+
+    [Fact]
+    public void Datagrams_opened_from_several_threads_at_once_all_open()
+    {
+        var (client, agent) = Pair();
+        using (client)
+        using (agent)
+        {
+            for (var round = 0; round < 50; round++)
+            {
+                // Fewer than the replay window holds, so any order of arrival is acceptable.
+                var packets = new byte[48][];
+                for (var i = 0; i < packets.Length; i++)
+                {
+                    var packet = new byte[AgentDatagramCrypto.SealedSize(64)];
+                    var length = client.Seal(RandomNumberGenerator.GetBytes(64), packet);
+                    packets[i] = packet[..length];
+                }
+
+                var opened = 0;
+                Parallel.ForEach(packets, packet =>
+                {
+                    if (agent.TryOpen(packet, new byte[128], out _))
+                    {
+                        Interlocked.Increment(ref opened);
+                    }
+                });
+
+                Assert.Equal(packets.Length, opened);
+            }
+        }
+    }
+
+    [Fact]
     public void A_datagram_cannot_be_reflected_back_at_its_sender()
     {
         // Each direction has its own key and its own direction byte, so a packet replayed at
@@ -381,6 +446,37 @@ public sealed class AgentProtocolTests
             Assert.Equal(target, read);
             Assert.Equal(payload, readPayload.ToArray());
         }
+    }
+
+    [Fact]
+    public void A_full_cone_relay_has_the_same_layout_under_its_own_kind()
+    {
+        // The kind is how the agent learns what a new channel is; everything after it is the
+        // ordinary relay, so a client reads an answer the same way whichever it is.
+        var sender = new IPEndPoint(IPAddress.Parse("198.51.100.7"), 61000);
+        var payload = RandomNumberGenerator.GetBytes(32);
+        var body = new byte[AgentDatagram.MaxRelayHeaderBytes + payload.Length];
+        var length = AgentDatagram.WriteRelay(body, 7, sender, payload, cone: true);
+
+        Assert.Equal(AgentDatagramKind.ConeRelay, AgentDatagram.KindOf(body.AsSpan(0, length)));
+        Assert.True(AgentDatagram.TryReadRelay(body.AsSpan(0, length), out var channel, out var read, out var readPayload));
+        Assert.Equal(7, channel);
+        Assert.Equal(sender, read);
+        Assert.Equal(payload, readPayload.ToArray());
+    }
+
+    [Fact]
+    public void Full_cone_is_asked_for_and_granted_like_any_other_feature()
+    {
+        var wanted = AgentProtocol.Features.Udp | AgentProtocol.Features.FullCone;
+        var hello = AgentHello.Decode(
+            new AgentHello(AgentRole.Control, new byte[AgentProtocol.TokenBytes], wanted, "yura").Encode());
+        Assert.Equal(wanted, hello.Wanted);
+
+        var welcome = AgentWelcome.Decode(new AgentWelcome(
+            new byte[AgentProtocol.SessionIdBytes], new byte[AgentProtocol.KeyBytes], 7311, 1350,
+            AgentProtocol.Features.Udp | AgentProtocol.Features.FullCone, "0.4.0", "tokyo-1").Encode());
+        Assert.True(welcome.Available.HasFlag(AgentProtocol.Features.FullCone));
     }
 
     [Fact]

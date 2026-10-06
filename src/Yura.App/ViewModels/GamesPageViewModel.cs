@@ -74,6 +74,9 @@ public sealed partial class GameRowViewModel : ObservableObject
         OnPropertyChanged(nameof(SubtitleText));
         OnPropertyChanged(nameof(IsRunning));
     }
+
+    /// <summary>Re-renders the subtitle, which is localised, after a language change.</summary>
+    public void NotifyLanguageChanged() => OnPropertyChanged(nameof(SubtitleText));
 }
 
 /// <summary>
@@ -82,16 +85,28 @@ public sealed partial class GameRowViewModel : ObservableObject
 /// <remarks>
 /// The whole point of this type is that <see cref="Value"/> is nullable. A missing
 /// measurement renders as "Not measured"; substituting zero would read as a perfect score.
+///
+/// A class rather than a record. The page binds through a figure to its label, and a binding
+/// reads the label again only when it is handed a different figure — which a property setter
+/// never does with a record equal to the one it holds. As a record, "Not measured" stayed in
+/// the language it was first shown in.
 /// </remarks>
-public sealed record Metric(double? Value, string Unit)
+public sealed class Metric(double? value, string unit)
 {
     public static readonly Metric NotMeasured = new(null, string.Empty);
+
+    public double? Value { get; } = value;
+
+    public string Unit { get; } = unit;
 
     public bool HasValue => Value is not null;
 
     public string Display => Value is { } v
         ? string.Create(CultureInfo.CurrentCulture, $"{v:0.#} {Unit}").Trim()
         : Loc.Current["Common.NotMeasured"];
+
+    /// <summary>The same figure as a new object, so whatever shows it reads its label again.</summary>
+    public Metric Rerendered() => new(Value, Unit);
 }
 
 /// <summary>
@@ -113,7 +128,18 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     private readonly DispatcherTimer _attachTimer;
     private DateTimeOffset? _sessionStartedAt;
     private RoutingRule? _sessionRule;
+
+    /// <summary>
+    /// The game the running session is for. Not <see cref="SelectedGame"/>: picking another game
+    /// in the list while one is being routed must not make the session report on the wrong one.
+    /// </summary>
+    private GameRowViewModel? _sessionGame;
+
+    /// <summary>The route the last NAT test ran over, which is what its comparison is about.</summary>
+    private string? _natRouteName;
+
     private CancellationTokenSource? _measuring;
+    private bool _runningRefreshInFlight;
 
     public GamesPageViewModel(RuleStore rules, IDaemonClient daemon, ProcProcessSource processes)
     {
@@ -130,7 +156,7 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         _attachTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
         _attachTimer.Tick += (_, _) =>
         {
-            RefreshRunning();
+            _ = RefreshRunningInBackgroundAsync();
             _ = RefreshEvidenceAsync();
         };
     }
@@ -185,8 +211,24 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     public bool CanStart => SelectedGame is not null && SelectedRoute is not null && !IsRunning &&
                             _daemon.State == DaemonState.Connected;
 
-    public bool CanMeasure => SelectedGame is { } game && game.Profile.IsMeasurable &&
-                              _daemon.State == DaemonState.Connected && State != BoostState.Testing;
+    /// <summary>
+    /// A target to measure against: the one saved with the game, or one typed in the box.
+    /// </summary>
+    /// <remarks>
+    /// The typed one counts. Requiring a saved target made the button unusable for every game
+    /// that did not have one yet — and measuring is the only thing that saves one.
+    /// </remarks>
+    public bool CanMeasure => SelectedGame is { } game &&
+                              (game.Profile.IsMeasurable || TryParseTarget(MeasurementTargetInput, out _, out _)) &&
+                              _daemon.State == DaemonState.Connected && !IsMeasuring;
+
+    /// <summary>True while a measurement is running, whether or not a session is.</summary>
+    [ObservableProperty]
+    public partial bool IsMeasuring { get; set; }
+
+    partial void OnIsMeasuringChanged(bool value) => OnPropertyChanged(nameof(CanMeasure));
+
+    partial void OnMeasurementTargetInputChanged(string value) => OnPropertyChanged(nameof(CanMeasure));
 
     /// <summary>Shown next to a disabled Start button, so the reason needs no hovering.</summary>
     public string? StartBlockedReason
@@ -416,9 +458,36 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     /// <c>steamapps/common/&lt;this game&gt;</c> and so belongs to this game and nothing else —
     /// which is the standard the rest of the Games page is held to.
     /// </remarks>
-    private void RefreshRunning()
+    private void RefreshRunning() => ApplyRunning(_processes.Enumerate());
+
+    /// <summary>
+    /// The periodic refresh: the process table is read off the UI thread and applied back on it.
+    /// </summary>
+    /// <remarks>
+    /// It runs every two seconds for as long as a session does, whichever page is showing, and
+    /// reading all of <c>/proc</c> on the UI thread that often made the window stutter.
+    /// </remarks>
+    private async Task RefreshRunningInBackgroundAsync()
     {
-        var snapshot = _processes.Enumerate();
+        if (_runningRefreshInFlight)
+        {
+            return;
+        }
+
+        _runningRefreshInFlight = true;
+        try
+        {
+            var snapshot = await Task.Run(() => _processes.Enumerate()).ConfigureAwait(true);
+            ApplyRunning(snapshot);
+        }
+        finally
+        {
+            _runningRefreshInFlight = false;
+        }
+    }
+
+    private void ApplyRunning(IReadOnlyList<ProcessSnapshot> snapshot)
+    {
         var changed = false;
 
         foreach (var row in _rows.Values)
@@ -434,7 +503,9 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
                 profile.MatchesInstalledPath(p.ExecutablePath) ||
                 profile.MatchesInstalledPath(p.Wine?.TargetExecutable));
 
-            if (!ReferenceEquals(row.Running, match))
+            // By identity: every read makes new snapshot objects, so comparing references
+            // re-raised every running game's row on every tick whether or not anything changed.
+            if (row.Running?.Identity != match?.Identity)
             {
                 row.Update(profile, match);
                 changed = true;
@@ -445,14 +516,16 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         {
             OnPropertyChanged(nameof(CanStart));
             OnPropertyChanged(nameof(StartBlockedReason));
+            OnPropertyChanged(nameof(CanLaunch));
         }
 
         // A session that was waiting for its game now has one, and vice versa.
-        if (State == BoostState.WaitingForGame && SelectedGame?.Running is not null)
+        var game = _sessionGame ?? SelectedGame;
+        if (State == BoostState.WaitingForGame && game?.Running is not null)
         {
             State = BoostState.Routing;
         }
-        else if (State == BoostState.Routing && SelectedGame?.Running is null)
+        else if (State == BoostState.Routing && game?.Running is null)
         {
             State = BoostState.WaitingForGame;
         }
@@ -485,7 +558,7 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
 
     private async Task RefreshEvidenceAsync()
     {
-        if (_evidenceInFlight || SelectedGame?.Running is not { } process || !IsRunning ||
+        if (_evidenceInFlight || (_sessionGame ?? SelectedGame)?.Running is not { } process || !IsRunning ||
             _daemon.State != DaemonState.Connected)
         {
             return;
@@ -672,6 +745,15 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(CanStart));
         OnPropertyChanged(nameof(StartBlockedReason));
 
+        // The figures and the NAT verdict belong to the route they were measured over. Kept
+        // across a change, the routed column showed one route's numbers under another's name,
+        // and the NAT comparison credited the newly chosen route with the old one's verdict.
+        if (!IsRunning)
+        {
+            ClearMeasurements();
+            ClearNat();
+        }
+
         if (SelectedGame is { } row && value is not null)
         {
             row.Update(row.Profile with { RouteId = value.Id, RouteIsChain = value.IsChain }, row.Running);
@@ -683,10 +765,12 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     {
         OnPropertyChanged(nameof(CanStart));
         OnPropertyChanged(nameof(CanMeasure));
+        OnPropertyChanged(nameof(CanLaunch));
         OnPropertyChanged(nameof(StartBlockedReason));
         // Measurements belong to a game/route pair; carrying them across would show one
         // game's numbers under another's name.
         ClearMeasurements();
+        ClearNat();
 
         if (value is null)
         {
@@ -729,6 +813,28 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HasRouteSplit));
     }
 
+    private void ClearNat()
+    {
+        DirectNat = null;
+        RoutedNat = null;
+        LastNatTestUtc = null;
+        _natRouteName = null;
+        RaiseNat();
+    }
+
+    private void RaiseNat()
+    {
+        OnPropertyChanged(nameof(HasNatResult));
+        OnPropertyChanged(nameof(DirectNatVerdict));
+        OnPropertyChanged(nameof(RoutedNatVerdict));
+        OnPropertyChanged(nameof(DirectNatDetail));
+        OnPropertyChanged(nameof(RoutedNatDetail));
+        OnPropertyChanged(nameof(NatComparison));
+        OnPropertyChanged(nameof(NatComparisonIsWarning));
+        OnPropertyChanged(nameof(HasNatComparisonInfo));
+        OnPropertyChanged(nameof(LastNatTestDisplay));
+    }
+
     /// <summary>Design-review hook: puts the page into a running session with a start time.</summary>
     internal void EnterSimulatedSession(BoostState state, TimeSpan elapsed)
     {
@@ -762,13 +868,23 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         ProfilesChanged?.Invoke(this, EventArgs.Empty);
 
         _measuring?.Cancel();
-        _measuring = new CancellationTokenSource();
-        var token = _measuring.Token;
+        var measuring = new CancellationTokenSource();
+        _measuring = measuring;
+        var token = measuring.Token;
 
+        // A session keeps its own state while it is measured. Switching it to "Testing" made the
+        // page believe no session was running: Stop disappeared and Start came back, for as
+        // long as the measurement took — up to half a minute against a target that drops
+        // connection attempts.
+        var inSession = IsRunning;
         var previous = State;
-        State = BoostState.Testing;
+        if (!inSession)
+        {
+            State = BoostState.Testing;
+        }
+
+        IsMeasuring = true;
         FailureReason = null;
-        OnPropertyChanged(nameof(CanMeasure));
 
         try
         {
@@ -787,12 +903,10 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
                 FailureReason = _daemon.State == DaemonState.Connected
                     ? Loc.Current["Games.MeasureFailed"]
                     : _daemon.UnavailableReason;
-                State = previous == BoostState.Testing ? BoostState.Ready : previous;
                 return;
             }
 
             Apply(measurement);
-            State = previous == BoostState.Testing ? BoostState.Ready : previous;
         }
         catch (OperationCanceledException)
         {
@@ -800,7 +914,16 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         }
         finally
         {
-            OnPropertyChanged(nameof(CanMeasure));
+            if (!inSession && State == BoostState.Testing)
+            {
+                State = previous == BoostState.Testing ? BoostState.Ready : previous;
+            }
+
+            // A newer measurement that replaced this one owns the flag now.
+            if (ReferenceEquals(_measuring, measuring))
+            {
+                IsMeasuring = false;
+            }
         }
     }
 
@@ -883,16 +1006,19 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
                 return null;
             }
 
+            // Named after the route the test ran over, which is not necessarily the one
+            // selected now.
+            var routeName = _natRouteName ?? RouteName;
             if (!routed.SupportsP2P() && direct.SupportsP2P())
             {
                 return string.Format(CultureInfo.CurrentCulture,
-                    Loc.Current["Games.Nat.WorseOnRoute"], RouteName);
+                    Loc.Current["Games.Nat.WorseOnRoute"], routeName);
             }
 
             if (routed.SupportsP2P() && !direct.SupportsP2P())
             {
                 return string.Format(CultureInfo.CurrentCulture,
-                    Loc.Current["Games.Nat.BetterOnRoute"], RouteName);
+                    Loc.Current["Games.Nat.BetterOnRoute"], routeName);
             }
 
             return routed.Verdict == direct.Verdict
@@ -903,6 +1029,9 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
 
     public bool NatComparisonIsWarning => DirectNat is { } direct && RoutedNat is { } routed &&
                                           direct.SupportsP2P() && !routed.SupportsP2P();
+
+    /// <summary>The comparison when it is not a warning, which the page shows in the neutral style.</summary>
+    public bool HasNatComparisonInfo => NatComparison is not null && !NatComparisonIsWarning;
 
     public string LastNatTestDisplay => LastNatTestUtc is { } t
         ? t.ToLocalTime().ToString("HH:mm:ss", CultureInfo.CurrentCulture)
@@ -999,15 +1128,8 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             DirectNat = result.Direct;
             RoutedNat = result.Routed;
             LastNatTestUtc = result.TestedAtUtc;
-
-            OnPropertyChanged(nameof(HasNatResult));
-            OnPropertyChanged(nameof(DirectNatVerdict));
-            OnPropertyChanged(nameof(RoutedNatVerdict));
-            OnPropertyChanged(nameof(DirectNatDetail));
-            OnPropertyChanged(nameof(RoutedNatDetail));
-            OnPropertyChanged(nameof(NatComparison));
-            OnPropertyChanged(nameof(NatComparisonIsWarning));
-            OnPropertyChanged(nameof(LastNatTestDisplay));
+            _natRouteName = result.RouteName;
+            RaiseNat();
         }
         finally
         {
@@ -1094,7 +1216,7 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
 
         var action = SelectedRoute.ToAction();
 
-        var rule = new RoutingRule
+        var built = new RoutingRule
         {
             Id = Guid.NewGuid(),
             Order = _rules.NextOrder(RuleOrigin.GameProfile),
@@ -1109,6 +1231,13 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             CreatedAtUtc = DateTimeOffset.UtcNow,
         };
 
+        // A boost for a game that still has one replaces it in place — same id, same position —
+        // so the daemon swaps the rules in one step and the connections it resets are the ones
+        // the change actually moves. See ProcessesPageViewModel.ApplyAsync.
+        var rule = _rules.FindSupersededBy(built) is { } previous
+            ? built with { Id = previous.Id, Order = previous.Order }
+            : built;
+
         // A boost is asked for while the game is already running and already talking to its
         // servers, so the connections that matter are the ones that exist. They cannot be
         // captured where they are — a socket's cgroup is fixed when it is created — so the
@@ -1121,11 +1250,11 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         }
 
         _sessionRule = rule;
-        var superseded = _rules.Add(rule with { AppliedAtUtc = result.ConfirmedAtUtc });
-        if (superseded is not null)
+        _sessionGame = row;
+        foreach (var superseded in _rules.Add(rule with { AppliedAtUtc = result.ConfirmedAtUtc }))
         {
-            // Also out of the kernel: it sits at a lower position than this one, so leaving
-            // it installed would keep the game on the previous route.
+            // Also out of the kernel: left installed, it would go on deciding the game's route
+            // from its own position.
             await _daemon.RemoveRuleAsync(superseded.Id).ConfigureAwait(true);
         }
 
@@ -1224,6 +1353,7 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             _sessionRule = null;
         }
 
+        _sessionGame = null;
         _sessionTimer.Stop();
         _attachTimer.Stop();
         _sessionStartedAt = null;
@@ -1272,11 +1402,36 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
 
     public bool CanLaunch => SelectedGame?.Profile.SteamAppId is { Length: > 0 } && SelectedGame.Running is null;
 
+    /// <summary>Re-raises everything gated on the daemon being reachable.</summary>
+    /// <remarks>
+    /// The NAT test's button among them. Left out, it kept whatever it had when the page was
+    /// first bound — usually before the daemon had answered — and stayed disabled for the session.
+    /// </remarks>
     public void NotifyDaemonStateChanged()
     {
         OnPropertyChanged(nameof(CanStart));
         OnPropertyChanged(nameof(CanMeasure));
+        OnPropertyChanged(nameof(CanTestNat));
+        OnPropertyChanged(nameof(CanLaunch));
         OnPropertyChanged(nameof(StartBlockedReason));
+    }
+
+    /// <summary>Re-renders every localised string after a language change.</summary>
+    public void NotifyLanguageChanged()
+    {
+        OnPropertyChanged(string.Empty);
+        foreach (var row in _rows.Values)
+        {
+            row.NotifyLanguageChanged();
+        }
+
+        // See Metric: only a new figure makes a cell read its label again.
+        DirectLatency = DirectLatency.Rerendered();
+        DirectJitter = DirectJitter.Rerendered();
+        DirectLoss = DirectLoss.Rerendered();
+        RoutedLatency = RoutedLatency.Rerendered();
+        RoutedJitter = RoutedJitter.Rerendered();
+        RoutedLoss = RoutedLoss.Rerendered();
     }
 
     public void Activate()

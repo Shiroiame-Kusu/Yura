@@ -180,10 +180,29 @@ public sealed class ProcessInspectorTests
         Assert.Equal(daemon.UnavailableReason, page.ApplyBlockedReason);
     }
 
+    [Fact]
+    public void The_proxy_button_says_what_the_chosen_scope_will_install()
+    {
+        // It said "Proxy this instance" whichever scope was chosen above it.
+        var (page, _, _) = New();
+        var raised = new List<string?>();
+        page.PropertyChanged += (_, e) => raised.Add(e.PropertyName);
+
+        page.ScopeChoice = RuleScopeChoice.Executable;
+        var executable = page.ProxyButtonLabel;
+        page.ScopeChoice = RuleScopeChoice.Tree;
+        var tree = page.ProxyButtonLabel;
+        page.ScopeChoice = RuleScopeChoice.Instance;
+        var instance = page.ProxyButtonLabel;
+
+        Assert.Equal(3, new[] { executable, tree, instance }.Distinct().Count());
+        Assert.Contains(nameof(ProcessesPageViewModel.ProxyButtonLabel), raised);
+    }
+
     // -- what the rule replaces has to leave the kernel too ---------------------
 
     [Fact]
-    public async Task Changing_the_route_takes_the_rule_it_replaces_out_of_the_daemon()
+    public async Task Changing_the_route_replaces_the_rule_in_place()
     {
         var (page, rules, daemon) = New();
         var second = new ProxyEndpoint
@@ -199,12 +218,54 @@ public sealed class ProcessInspectorTests
         page.SelectedProxy = second;
         await page.ProxyThisInstanceCommand.ExecuteAsync(null);
 
-        // The superseded rule has the lower position, so leaving it installed would mean the
-        // kernel kept using the first route while the panel showed the second.
-        Assert.Contains(first.Id, daemon.Removed);
+        // Same id, same position: the daemon swaps one rule for the other in a single step.
+        // Installed beside the old rule and removed afterwards, the old one — earlier in the
+        // order — was still winning when the daemon compared routes before and after, so
+        // "apply to connections already open" never found a connection to move.
+        var replacement = daemon.Applied[1];
+        Assert.Equal(first.Id, replacement.Rule.Id);
+        Assert.Equal(first.Order, replacement.Rule.Order);
+        Assert.Equal(new RuleAction.Proxy(second.Id), replacement.Rule.Action);
+        Assert.True(replacement.ResetExisting);
+        Assert.Empty(daemon.Removed);
+
         var live = Assert.Single(daemon.Installed);
-        Assert.Equal(daemon.Applied[1].Rule.Id, live.Id);
-        Assert.Single(rules.Rules);
+        Assert.Equal(first.Id, live.Id);
+        Assert.Equal(second.Id, Assert.IsType<RuleAction.Proxy>(Assert.Single(rules.Rules).Action).EndpointId);
+    }
+
+    /// <summary>
+    /// Two saved rules for one executable, the way a configuration written before destinations
+    /// were compared by value can hold them.
+    /// </summary>
+    private static (RoutingRule First, RoutingRule Duplicate) SeedDuplicates(RuleStore rules, RecordingDaemonClient daemon)
+    {
+        var first = rules.BuildRule(Java(), RuleScopeChoice.Executable, new RuleAction.Proxy(Route.Id), false);
+        var duplicate = rules.BuildRule(Java(), RuleScopeChoice.Executable, new RuleAction.Proxy(Route.Id), false) with
+        {
+            Order = first.Order + 1,
+        };
+        rules.LoadPersisted([first, duplicate]);
+        daemon.Installed.Add((first.Id, first.Name));
+        daemon.Installed.Add((duplicate.Id, duplicate.Name));
+        return (first, duplicate);
+    }
+
+    [Fact]
+    public async Task Every_saved_selection_for_the_executable_is_replaced_not_only_the_first()
+    {
+        var (page, rules, daemon) = New();
+        var (first, duplicate) = SeedDuplicates(rules, daemon);
+
+        page.ScopeChoice = RuleScopeChoice.Executable;
+        await page.RouteDirectCommand.ExecuteAsync(null);
+
+        // The first is replaced in place, and the duplicate taken out of the kernel: left
+        // there, it would go on proxying the executable the user just routed direct.
+        Assert.Equal(first.Id, Assert.Single(daemon.Applied).Rule.Id);
+        Assert.Equal(duplicate.Id, Assert.Single(daemon.Removed));
+        Assert.Equal(first.Id, Assert.Single(daemon.Installed).Id);
+        Assert.Equal(RuleAction.Direct.Instance, Assert.Single(rules.Rules).Action);
     }
 
     [Fact]
@@ -224,15 +285,11 @@ public sealed class ProcessInspectorTests
     public async Task A_failed_removal_of_the_replaced_rule_is_reported_not_hidden()
     {
         var (page, rules, daemon) = New();
-        await page.ProxyThisInstanceCommand.ExecuteAsync(null);
+        SeedDuplicates(rules, daemon);
 
         daemon.FailRemovals = true;
-        page.SelectedProxy = new ProxyEndpoint
-        {
-            Id = Guid.NewGuid(), Name = "other", Protocol = ProxyProtocol.Socks5,
-            Host = "10.0.0.3", Port = 1080,
-        };
-        await page.ProxyThisInstanceCommand.ExecuteAsync(null);
+        page.ScopeChoice = RuleScopeChoice.Executable;
+        await page.RouteDirectCommand.ExecuteAsync(null);
 
         Assert.NotNull(page.ErrorMessage);
         Assert.Contains("Rules page", page.ErrorMessage);

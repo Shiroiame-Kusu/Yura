@@ -83,6 +83,9 @@ public sealed partial class RuleRowViewModel : ObservableObject
 
     public bool IsBlockAction => Rule.Action is RuleAction.Block;
 
+    /// <summary>Re-renders every localised string after a language change.</summary>
+    public void NotifyLanguageChanged() => OnPropertyChanged(string.Empty);
+
     public void Update(RoutingRule rule, string? routeName)
     {
         Rule = rule;
@@ -230,6 +233,18 @@ public sealed partial class RulesPageViewModel : ObservableObject
 
     partial void OnIsCompactChanged(bool value) => OnPropertyChanged(nameof(ShowOverlayInspector));
 
+    /// <summary>Re-renders every localised string after a language change.</summary>
+    public void NotifyLanguageChanged()
+    {
+        OnPropertyChanged(string.Empty);
+        foreach (var row in Rules)
+        {
+            row.NotifyLanguageChanged();
+        }
+
+        Editor.NotifyLanguageChanged();
+    }
+
     partial void OnSelectedRuleChanged(RuleRowViewModel? value)
     {
         OnPropertyChanged(nameof(HasSelection));
@@ -356,7 +371,11 @@ public sealed partial class RulesPageViewModel : ObservableObject
                 return;
             }
 
-            if (undo.Current is not null && undo.Previous is null)
+            // The rule being undone leaves the kernel unless what comes back takes its place
+            // under the same id. A selection that replaced an earlier one with a new id is the
+            // case this used to miss: the earlier rule was put back and the new one stayed
+            // installed, deciding routes from a position no page showed.
+            if (undo.Current is not null && (undo.Previous is null || undo.Previous.Id != undo.Current.Id))
             {
                 await _daemon.RemoveRuleAsync(undo.Current.Id).ConfigureAwait(true);
             }
@@ -515,8 +534,27 @@ public sealed partial class RuleEditorViewModel : ObservableObject
     [ObservableProperty]
     public partial string? ValidationMessage { get; set; }
 
-    public IReadOnlyList<ProcessSelectorKind> ProcessKinds { get; } =
+    private static readonly ProcessSelectorKind[] EditableKinds =
         [ProcessSelectorKind.ProcessName, ProcessSelectorKind.ExecutablePath, ProcessSelectorKind.Any];
+
+    /// <summary>
+    /// The kinds of match the form can build, plus the rule's own when it is one the form cannot
+    /// build from text — a running instance, or a user — so editing it keeps it.
+    /// </summary>
+    [ObservableProperty]
+    public partial IReadOnlyList<ProcessSelectorKind> ProcessKinds { get; set; } = EditableKinds;
+
+    /// <summary>
+    /// True when the rule matches something the form has no field for — one running instance,
+    /// or everything a user runs — and the match is kept exactly as it was.
+    /// </summary>
+    public bool HasFixedSubject => ProcessKind is ProcessSelectorKind.Instance or ProcessSelectorKind.User &&
+                                   _original?.Process.Kind == ProcessKind;
+
+    /// <summary>What a fixed match matches, in words.</summary>
+    public string? FixedSubjectDescription => HasFixedSubject && _original is { } original
+        ? RuleDescriber.Process(original.Process)
+        : null;
 
     public IReadOnlyList<TransportFilter> Protocols { get; } =
         [TransportFilter.Any, TransportFilter.Tcp, TransportFilter.Udp];
@@ -529,7 +567,8 @@ public sealed partial class RuleEditorViewModel : ObservableObject
 
     public bool NeedsRoute => Action == RuleActionChoice.Proxy;
 
-    public bool NeedsProcessValue => ProcessKind != ProcessSelectorKind.Any;
+    public bool NeedsProcessValue =>
+        ProcessKind is not (ProcessSelectorKind.Any or ProcessSelectorKind.Instance or ProcessSelectorKind.User);
 
     public string ProcessValueLabel => ProcessKind switch
     {
@@ -541,6 +580,7 @@ public sealed partial class RuleEditorViewModel : ObservableObject
     {
         _editingId = Guid.NewGuid();
         _original = null;
+        ProcessKinds = EditableKinds;
         Name = string.Empty;
         ProcessKind = ProcessSelectorKind.ProcessName;
         ProcessValue = string.Empty;
@@ -559,8 +599,15 @@ public sealed partial class RuleEditorViewModel : ObservableObject
     {
         _editingId = rule.Id;
         _original = isNew ? null : rule;
+
+        // A rule on one running instance, or on a user, is edited as what it is. Turning it
+        // into a path rule to fit the form would widen it to every run of the program.
+        ProcessKinds = EditableKinds.Contains(rule.Process.Kind) || isNew
+            ? EditableKinds
+            : [.. EditableKinds, rule.Process.Kind];
+
         Name = rule.Name;
-        ProcessKind = rule.Process.Kind == ProcessSelectorKind.Instance
+        ProcessKind = isNew && !EditableKinds.Contains(rule.Process.Kind)
             ? ProcessSelectorKind.ExecutablePath
             : rule.Process.Kind;
         ProcessValue = rule.Process.Kind switch
@@ -590,10 +637,15 @@ public sealed partial class RuleEditorViewModel : ObservableObject
         IsOpen = true;
         OnPropertyChanged(nameof(Title));
         OnPropertyChanged(nameof(Routes));
+        OnPropertyChanged(nameof(HasFixedSubject));
+        OnPropertyChanged(nameof(FixedSubjectDescription));
     }
 
     [RelayCommand]
     public void Close() => IsOpen = false;
+
+    /// <summary>Re-renders every localised string after a language change.</summary>
+    public void NotifyLanguageChanged() => OnPropertyChanged(string.Empty);
 
     /// <summary>
     /// Builds the rule, or explains the first thing that cannot be read.
@@ -694,15 +746,10 @@ public sealed partial class RuleEditorViewModel : ObservableObject
             Name = Name.Trim(),
             Enabled = _original?.Enabled ?? true,
             Origin = _original?.Origin ?? RuleOrigin.Manual,
-            Lifetime = RuleLifetime.Persistent,
+            Lifetime = LifetimeFor(_original),
             CreatedAtUtc = _original?.CreatedAtUtc ?? DateTimeOffset.UtcNow,
-            Process = new ProcessSelector
-            {
-                Kind = ProcessKind,
-                ExecutablePath = ProcessKind == ProcessSelectorKind.ExecutablePath ? ProcessValue.Trim() : null,
-                ProcessName = ProcessKind == ProcessSelectorKind.ProcessName ? ProcessValue.Trim() : null,
-                Descendants = IncludeChildren ? DescendantPolicy.IncludeFuture : DescendantPolicy.Exclude,
-            },
+            Notes = _original?.Notes,
+            Process = BuildProcessSelector(),
             Destination = new DestinationSelector
             {
                 Hosts = hosts,
@@ -716,6 +763,54 @@ public sealed partial class RuleEditorViewModel : ObservableObject
         return true;
     }
 
+    /// <summary>
+    /// The process side as edited, keeping everything about the original the form has no field for.
+    /// </summary>
+    /// <remarks>
+    /// Rebuilding it from the three fields alone threw away the Wine target — which is what keeps
+    /// a rule on a shared Proton runtime from reaching every other game using that runtime — and
+    /// the instance a rule was bound to, and the existing children a process-tree rule covers.
+    /// Saving a rename then widened the rule to exactly what the specification forbids. What
+    /// the form does not show, it keeps.
+    /// </remarks>
+    private ProcessSelector BuildProcessSelector()
+    {
+        var original = _original?.Process;
+        var sameKind = original is not null && original.Kind == ProcessKind;
+
+        // Ticking or unticking the box is a choice; leaving it alone keeps whatever the rule had,
+        // including "existing children too", which the box cannot express.
+        var descendants = sameKind && IncludeChildren == (original!.Descendants != DescendantPolicy.Exclude)
+            ? original.Descendants
+            : IncludeChildren ? DescendantPolicy.IncludeFuture : DescendantPolicy.Exclude;
+
+        if (sameKind && ProcessKind is ProcessSelectorKind.Instance or ProcessSelectorKind.User)
+        {
+            return original! with { Descendants = descendants };
+        }
+
+        return new ProcessSelector
+        {
+            Kind = ProcessKind,
+            ExecutablePath = ProcessKind == ProcessSelectorKind.ExecutablePath ? ProcessValue.Trim() : null,
+            ProcessName = ProcessKind == ProcessSelectorKind.ProcessName ? ProcessValue.Trim() : null,
+            Descendants = descendants,
+            WineTargetExecutable = sameKind ? original!.WineTargetExecutable : null,
+            WinePrefix = sameKind ? original!.WinePrefix : null,
+        };
+    }
+
+    /// <summary>
+    /// A rule keeps how long it lives, unless the edit changed what it is bound to: a rule no
+    /// longer tied to one running instance cannot expire with it, and is kept like any other.
+    /// </summary>
+    private RuleLifetime LifetimeFor(RoutingRule? original) => original switch
+    {
+        null => RuleLifetime.Persistent,
+        { Lifetime: RuleLifetime.Instance } when ProcessKind != ProcessSelectorKind.Instance => RuleLifetime.Persistent,
+        _ => original.Lifetime,
+    };
+
     private static IEnumerable<string> Split(string text) =>
         text.Split([',', ' ', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
@@ -725,6 +820,8 @@ public sealed partial class RuleEditorViewModel : ObservableObject
     {
         OnPropertyChanged(nameof(NeedsProcessValue));
         OnPropertyChanged(nameof(ProcessValueLabel));
+        OnPropertyChanged(nameof(HasFixedSubject));
+        OnPropertyChanged(nameof(FixedSubjectDescription));
     }
 }
 

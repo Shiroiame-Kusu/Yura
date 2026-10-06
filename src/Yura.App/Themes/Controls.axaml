@@ -188,12 +188,30 @@
     <Setter Property="CornerRadius" Value="{DynamicResource YuraRadiusSm}" />
   </Style>
 
+  <!-- The TextBlock style above gives every text its own colour, which the theme's disabled
+       colour cannot reach, so a locked picker looked exactly like one waiting to be used.
+       Dimming the whole control is what tells the two apart. -->
+  <Style Selector="ComboBox:disabled">
+    <Setter Property="Opacity" Value="0.5" />
+  </Style>
+
   <Style Selector="Button">
     <Setter Property="FontFamily" Value="{DynamicResource YuraFontUi}" />
     <Setter Property="FontSize" Value="{DynamicResource YuraFontSizeBody}" />
     <Setter Property="MinHeight" Value="{DynamicResource YuraControlHeightMd}" />
     <Setter Property="CornerRadius" Value="{DynamicResource YuraRadiusSm}" />
     <Setter Property="Padding" Value="14,0" />
+  </Style>
+
+  <!-- A label given to an accent button as a TextBlock, so that it can wrap, takes the TextBlock
+       style above — light text on the light accent — where a plain string label would get the
+       button's own colour. These put it back. -->
+  <Style Selector="Button.accent TextBlock">
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextOnAccent}" />
+  </Style>
+
+  <Style Selector="Button.accent:disabled TextBlock">
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextDisabled}" />
   </Style>
 
   <Style Selector="CheckBox">

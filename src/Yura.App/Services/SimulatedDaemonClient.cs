@@ -33,9 +33,17 @@ public sealed class SimulatedDaemonClient : IDaemonClient
         remove { }
     }
 
+    public event EventHandler? InstanceChanged
+    {
+        add { }
+        remove { }
+    }
+
     public string? UnavailableReason => null;
 
     public Task ConnectAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+    public Task<bool> PingAsync(CancellationToken cancellationToken = default) => Task.FromResult(true);
 
     public Task<DaemonStatus?> GetStatusAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult<DaemonStatus?>(new DaemonStatus
@@ -77,7 +85,7 @@ public sealed class SimulatedDaemonClient : IDaemonClient
             Agents = _proxies.Where(p => p.IsAgent).Select((p, i) => new AgentStatus(
                 p.Id, p.Name, Connected: true, AgentName: p.Agent?.AgentLabel ?? p.Name,
                 AgentVersion: "0.3.0", RoundTripMilliseconds: 11.4 + i, Udp: true,
-                Resolver: "127.0.0.53", Failure: null)).ToArray(),
+                Resolver: "127.0.0.53", Failure: null, FullCone: true)).ToArray(),
         });
 
     public Task<IReadOnlyDictionary<int, int>> GetConnectionCountsAsync(CancellationToken cancellationToken = default) =>

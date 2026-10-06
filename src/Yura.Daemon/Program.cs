@@ -115,6 +115,16 @@ internal static class Program
 
         var processes = new ProcProcessSource();
         var cgroups = new CgroupManager(Log, processes);
+
+        // A daemon that died without cleaning up leaves its groups behind with processes still
+        // in them, captured by nothing and remembered by nobody. They are released now: the
+        // periodic sweep does not walk /proc while there are no rules, so it would never find
+        // them.
+        if (cgroups.ListGroups() is { Count: > 0 } leftovers)
+        {
+            Log($"releasing {leftovers.Count} process group(s) a previous daemon left behind");
+            cgroups.RemoveAllGroups();
+        }
         var nftables = new NftablesManager(commands, Log);
         var routing = new PolicyRouting(commands, Log);
         var flows = new FlowRegistry();
@@ -202,6 +212,7 @@ internal static class Program
         var environment = new DaemonEnvironment
         {
             SocketPath = socketPath,
+            Instance = Guid.NewGuid().ToString("N"),
             AllowedUids = allowedUids,
             KernelRelease = kernel,
             NftVersion = probe.StandardOutput.Trim(),

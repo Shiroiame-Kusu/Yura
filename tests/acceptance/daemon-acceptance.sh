@@ -24,6 +24,9 @@ SOCK="/run/yura/yura.sock"
 DUMMY_IF="yuraacc0"
 LOCAL_ADDR="198.51.100.1"
 UNREACHABLE="198.51.100.7"
+# A second address inside the agent's namespace, for a second STUN server: two ports of one
+# address agreeing about a mapping say nothing about whether it depends on the address.
+UNREACHABLE_B="198.51.100.8"
 MARK_A="YURA-VIA-PROXY-A"
 MARK_B="YURA-VIA-PROXY-B"
 MARK_UDP_A="YURA-UDP-VIA-PROXY-A"
@@ -848,6 +851,7 @@ ip addr add "${AG_HOST_ADDR}/30" dev "$AG_VETH_H"; ip link set "$AG_VETH_H" up
 ip -n "$AG_NS" addr add "${AG_ADDR}/30" dev "$AG_VETH_N"; ip -n "$AG_NS" link set "$AG_VETH_N" up
 ip -n "$AG_NS" link set lo up
 ip -n "$AG_NS" addr add "${UNREACHABLE}/32" dev lo
+ip -n "$AG_NS" addr add "${UNREACHABLE_B}/32" dev lo
 # ip netns exec bind-mounts this over /etc/resolv.conf, which is where the agent reads the
 # resolver it offers its clients from.
 mkdir -p "/etc/netns/${AG_NS}"; printf 'nameserver %s\n' "$AG_RESOLVER" > "/etc/netns/${AG_NS}/resolv.conf"
@@ -867,9 +871,11 @@ AG_CONNECT="$("$AGENT" init --state "$AG_STATE" --name acceptance-agent --host "
 AG_TOKEN="$(python3 -c "import sys;s=sys.argv[1];print(s[len('yura://'):s.index('@')])" "$AG_CONNECT")"
 AG_FP="$(python3 -c "import sys;s=sys.argv[1];print(s.split('fp=')[1].split('&')[0])" "$AG_CONNECT")"
 # The default policy: the marker is in a documentation range and allowed; the resolver is on
-# loopback and allowed only because the agent offered it.
+# loopback and allowed only because the agent offered it. The agent is told its own address
+# rather than reading its interfaces, because this fixture puts the "remote" servers on the
+# namespace's own loopback — which a real agent rightly refuses to relay to.
 ip netns exec "$AG_NS" "$AGENT" run --state "$AG_STATE" --listen "$AG_ADDR" --port "$AG_PORT" \
-  > "$RUN/agent.out" 2>&1 & AG_PID=$!; BG+=("$AG_PID")
+  --own-address "$AG_ADDR" > "$RUN/agent.out" 2>&1 & AG_PID=$!; BG+=("$AG_PID")
 for _ in $(seq 1 40); do grep -q 'ready' "$RUN/agent.out" 2>/dev/null && break; sleep 0.25; done
 info "agent in netns ${AG_NS} at ${AG_ADDR}:${AG_PORT}; resolver ${AG_RESOLVER}; ${UNREACHABLE} exists only inside"
 
@@ -1024,12 +1030,12 @@ as_user python3 "${LIB}/stun_server.py" --listen "$LOCAL_ADDR" --port 3479 \
   --log "$RUN/stun-b.jsonl" > "$RUN/stun-b.out" 2>&1 & BG+=($!)
 ip netns exec "$AG_NS" python3 "${LIB}/stun_server.py" --listen "$UNREACHABLE" --port 3478 \
   --log "$RUN/stun-agent-a.jsonl" > "$RUN/stun-agent-a.out" 2>&1 & BG+=($!)
-ip netns exec "$AG_NS" python3 "${LIB}/stun_server.py" --listen "$UNREACHABLE" --port 3479 \
+ip netns exec "$AG_NS" python3 "${LIB}/stun_server.py" --listen "$UNREACHABLE_B" --port 3478 \
   --log "$RUN/stun-agent-b.jsonl" > "$RUN/stun-agent-b.out" 2>&1 & BG+=($!)
 sleep 1
 HOST_STUN="\"${LOCAL_ADDR}:3478\",\"${LOCAL_ADDR}:3479\""
-NS_STUN="\"${UNREACHABLE}:3478\",\"${UNREACHABLE}:3479\""
-info "stun ${LOCAL_ADDR}:3478/3479 on this machine; ${UNREACHABLE}:3478/3479 exists only inside ${AG_NS}"
+NS_STUN="\"${UNREACHABLE}:3478\",\"${UNREACHABLE_B}:3478\""
+info "stun ${LOCAL_ADDR}:3478/3479 on this machine; ${UNREACHABLE}:3478 and ${UNREACHABLE_B}:3478 exist only inside ${AG_NS}"
 
 check "the direct path's NAT behaviour is measured, not guessed" bash -c "
   '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"servers\":[$HOST_STUN]}}' | python3 -c \"
@@ -1046,33 +1052,41 @@ check "both STUN servers were actually asked" bash -c "
   [[ \$a -ge 1 && \$b -ge 1 ]] && echo \"\$a query at :3478, \$b at :3479\""
 
 T_NAT="$(date +%s.%N)"
-check "a SOCKS5 route's NAT behaviour is measured through its UDP association" bash -c "
+# One association per destination, because that is how the forwarder relays a game's UDP. This
+# proxy gives every association a relay socket of its own, so each server sees a different
+# source port — which is what a game's peers would see, and the verdict has to say so.
+check "a SOCKS5 route's NAT behaviour is measured the way the forwarder uses it" bash -c "
   '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"proxyId\":\"$PROXY_A_ID\",\"servers\":[$HOST_STUN]}}' | python3 -c \"
 import json,sys
 r=json.load(sys.stdin)['nat']['routed']
-assert r['verdict']=='moderate', r
-assert r['mapping']=='endpointIndependent', r
+assert r['verdict']=='strict', r
+assert r['mapping']=='addressAndPortDependent', r
 assert r.get('behindNat') is None, r   # the socket facing the servers is the proxy's, not ours
-print(f\\\"{r['verdict']}: one mapping for both servers, peers see {r['mappedEndpoint']}\\\")\""
-check "the proxy's own log shows it carried the probes" bash -c "
+assert 'one UDP association per destination' in r['diagnostics'], r
+print(f\\\"{r['verdict']}: a relay socket per destination, peers see {r['mappedEndpoint']} and others\\\")\""
+check "the proxy's own log shows it carried the probes, one association per server" bash -c "
   n=\$(python3 '$LIB/logquery.py' count '$RUN/proxy-a.jsonl' --event udp_send --since $T_NAT --where-contains requested=${LOCAL_ADDR}:347)
-  [[ \$n -ge 2 ]] && echo \"\$n STUN datagram(s) went through the association\""
+  a=\$(python3 '$LIB/logquery.py' count '$RUN/proxy-a.jsonl' --event udp_associate --since $T_NAT)
+  [[ \$n -ge 2 && \$a -ge 2 ]] && echo \"\$n STUN datagram(s) through \$a association(s)\""
 
-check "an agent route is measured from the agent, and reports what a peer would really see" bash -c "
+# Full cone: one socket at the agent for every destination, bound to the agent's own address.
+# Both servers live only inside the namespace, so the address they report can only be the
+# agent's; and it is the same for both — endpoint-independent, which is what lets a peer-to-peer
+# game be reached. Moderate rather than Open only because the fixture does not answer the
+# filtering question (CHANGE-REQUEST), and the classifier does not guess at it.
+check "an agent route is measured from the agent, and keeps one address for every peer" bash -c "
   '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"proxyId\":\"$AG_ID\",\"servers\":[$NS_STUN],\"routeOnly\":true}}' | python3 -c \"
 import json,sys
 r=json.load(sys.stdin)['nat']['routed']
-# The address can only have come from inside the namespace: nothing here can reach it.
-assert r['mappedEndpoint'].startswith('${UNREACHABLE}:'), r
-# And it is honest about the consequence of a socket per destination at the agent.
-assert r['verdict']=='strict', r
-assert r['mapping']=='addressAndPortDependent', r
-assert 'own socket' in r['diagnostics'], r
-print(f\\\"{r['verdict']}: peers see {r['mappedEndpoint']}, a different port each\\\")\""
+assert r['mappedEndpoint'].startswith('${AG_ADDR}:'), r
+assert r['mapping']=='endpointIndependent', r
+assert r['verdict']=='moderate', r
+assert 'full-cone' in r['diagnostics'], r
+print(f\\\"{r['verdict']}: peers all see {r['mappedEndpoint']}\\\")\""
 check "the servers inside the namespace saw the probes arrive from the agent" bash -c "
   a=\$(python3 '$LIB/logquery.py' count '$RUN/stun-agent-a.jsonl' --event binding)
   b=\$(python3 '$LIB/logquery.py' count '$RUN/stun-agent-b.jsonl' --event binding)
-  [[ \$a -ge 1 && \$b -ge 1 ]] && echo \"\$a query at :3478 and \$b at :3479, inside ${AG_NS}\""
+  [[ \$a -ge 1 && \$b -ge 1 ]] && echo \"\$a query at ${UNREACHABLE} and \$b at ${UNREACHABLE_B}, inside ${AG_NS}\""
 
 check "a chain is reported as carrying no UDP at all, rather than as unknown" bash -c "
   '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"chainId\":\"$AG_CHAIN_ID\",\"servers\":[$NS_STUN],\"routeOnly\":true}}' | python3 -c \"

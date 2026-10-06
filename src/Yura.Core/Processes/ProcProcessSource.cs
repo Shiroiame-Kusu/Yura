@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 
 namespace Yura.Core.Processes;
@@ -17,7 +18,11 @@ public sealed class ProcProcessSource
     private const string ProcRoot = "/proc";
 
     private readonly string _bootId;
-    private readonly Dictionary<uint, string> _userNames = [];
+
+    // Concurrent: one source is read from several threads at once — the daemon's sweep, its
+    // flow decisions and its connection listing, or the app's two pages refreshing off the UI
+    // thread — and a plain dictionary written from two of them can corrupt itself.
+    private readonly ConcurrentDictionary<uint, string> _userNames = new();
 
     public ProcProcessSource()
     {
@@ -26,6 +31,17 @@ public sealed class ProcProcessSource
 
     /// <summary>Boot identifier used to scope instance identities to this boot.</summary>
     public string BootId => _bootId;
+
+    /// <summary>
+    /// Whether to read each process's environment, which is where the Wine prefix and the
+    /// Steam app id come from.
+    /// </summary>
+    /// <remarks>
+    /// On by default. It is the most expensive read per process — an environment runs to
+    /// kilobytes, and root can read every one of them — so a caller that needs neither value
+    /// can turn it off; the snapshots then carry no prefix and no app id.
+    /// </remarks>
+    public bool ReadEnvironment { get; set; } = true;
 
     /// <summary>Enumerates every process currently visible in <c>/proc</c>.</summary>
     public IReadOnlyList<ProcessSnapshot> Enumerate(bool includeKernelThreads = false)
@@ -83,7 +99,7 @@ public sealed class ProcProcessSource
         var (exePath, pathState) = ResolveExecutable(root);
         var commandLine = ReadCommandLine(root);
         var comm = ReadTextOrNull($"{root}/comm")?.Trim() ?? stat.Comm;
-        var environment = ReadEnvironment(root);
+        var environment = ReadEnvironment ? ReadProcessEnvironment(root) : default;
 
         return new ProcessSnapshot
         {
@@ -294,7 +310,7 @@ public sealed class ProcProcessSource
     /// Wine-looking ones, because Steam sets <c>SteamAppId</c> for native Linux games as well,
     /// and those look like any other binary.
     /// </remarks>
-    private static ProcessEnvironment ReadEnvironment(string root)
+    private static ProcessEnvironment ReadProcessEnvironment(string root)
     {
         var environ = ReadTextOrNull($"{root}/environ");
         if (environ is null)
@@ -328,17 +344,8 @@ public sealed class ProcProcessSource
 
     // -- users ---------------------------------------------------------------
 
-    private string ResolveUserName(uint uid)
-    {
-        if (_userNames.TryGetValue(uid, out var cached))
-        {
-            return cached;
-        }
-
-        var name = LookupPasswd(uid) ?? uid.ToString(CultureInfo.InvariantCulture);
-        _userNames[uid] = name;
-        return name;
-    }
+    private string ResolveUserName(uint uid) =>
+        _userNames.GetOrAdd(uid, static id => LookupPasswd(id) ?? id.ToString(CultureInfo.InvariantCulture));
 
     private static string? LookupPasswd(uint uid)
     {

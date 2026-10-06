@@ -139,6 +139,17 @@ public static class AgentProtocol
 
     public const ushort DefaultPort = 7311;
 
+    /// <summary>
+    /// How long an agent keeps a full-cone channel's port after the client last sent on it.
+    /// </summary>
+    /// <remarks>
+    /// Part of the protocol rather than either end's choice, because both have to agree: a
+    /// client that kept a channel longer than the agent would send on one the agent had closed,
+    /// and be given a new port under an address its peers still hold. RFC 4787 asks a NAT to
+    /// keep a UDP mapping at least two minutes, and recommends five.
+    /// </remarks>
+    public static readonly TimeSpan ConeMappingLifetime = TimeSpan.FromMinutes(5);
+
     /// <summary>Feature bits, exchanged so neither end has to guess what the other supports.</summary>
     [Flags]
     public enum Features : ushort
@@ -153,6 +164,18 @@ public static class AgentProtocol
 
         /// <summary>The agent will measure a destination on request.</summary>
         Probe = 1 << 2,
+
+        /// <summary>
+        /// Full-cone UDP: a datagram channel stands for one of the client's sockets rather than
+        /// one destination. It keeps one address at the agent for every peer it sends to, and
+        /// datagrams from anyone are relayed back with their true source.
+        /// </summary>
+        /// <remarks>
+        /// What a peer-to-peer game needs to be reachable through the agent. Asked for by the
+        /// client and granted per session, so either end may be older than the other: a session
+        /// without it has a channel per destination, each with a socket of its own.
+        /// </remarks>
+        FullCone = 1 << 3,
     }
 
     // -- framing -------------------------------------------------------------

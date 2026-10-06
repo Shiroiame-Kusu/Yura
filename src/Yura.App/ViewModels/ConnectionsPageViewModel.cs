@@ -135,6 +135,9 @@ public sealed partial class ConnectionRowViewModel : ObservableObject
         OnPropertyChanged(nameof(AgeDisplay));
     }
 
+    /// <summary>Re-renders the row's localised labels after a language change.</summary>
+    public void NotifyLanguageChanged() => OnPropertyChanged(string.Empty);
+
     public bool MatchesFilter(string filter)
     {
         if (string.IsNullOrWhiteSpace(filter))
@@ -235,6 +238,16 @@ public sealed partial class ConnectionsPageViewModel : ObservableObject, IDispos
     {
         _timer.Start();
         _ = RefreshAsync();
+    }
+
+    /// <summary>Re-renders every localised string after a language change.</summary>
+    public void NotifyLanguageChanged()
+    {
+        OnPropertyChanged(string.Empty);
+        foreach (var row in _rows.Values)
+        {
+            row.NotifyLanguageChanged();
+        }
     }
 
     /// <summary>Stops refreshing while the page is not visible, so a hidden table costs nothing.</summary>

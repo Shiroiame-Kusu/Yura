@@ -31,6 +31,7 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
     private readonly uint _currentUid;
     private IReadOnlyDictionary<int, int>? _connectionCounts;
     private bool _countsInFlight;
+    private bool _refreshing;
 
     public ProcessesPageViewModel(ProcProcessSource source, IDaemonClient daemon, RuleStore rules)
     {
@@ -40,8 +41,9 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
         _currentUid = ParseUid();
 
         _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
-        _timer.Tick += (_, _) => Refresh();
+        _timer.Tick += (_, _) => _ = RefreshInBackgroundAsync();
 
+        // The first read happens now, so the window never opens on an empty table.
         Refresh();
         _timer.Start();
     }
@@ -205,6 +207,7 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
 
     // -- refresh ------------------------------------------------------------
 
+    /// <summary>Reads the process table now, on the calling thread.</summary>
     [RelayCommand]
     public void Refresh()
     {
@@ -213,7 +216,41 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
             return;
         }
 
-        var snapshots = _source.Enumerate();
+        Apply(_source.Enumerate());
+    }
+
+    /// <summary>
+    /// The periodic refresh: the table is read off the UI thread and applied back on it.
+    /// </summary>
+    /// <remarks>
+    /// Reading several hundred processes' worth of files under <c>/proc</c> takes long enough to
+    /// be felt, and on the UI thread every two seconds it was — the window stuttered on the
+    /// tick whether or not anything had changed.
+    /// </remarks>
+    private async Task RefreshInBackgroundAsync()
+    {
+        if (IsPaused || _refreshing)
+        {
+            return;
+        }
+
+        _refreshing = true;
+        try
+        {
+            var snapshots = await Task.Run(() => _source.Enumerate()).ConfigureAwait(true);
+            if (!IsPaused)
+            {
+                Apply(snapshots);
+            }
+        }
+        finally
+        {
+            _refreshing = false;
+        }
+    }
+
+    private void Apply(IReadOnlyList<ProcessSnapshot> snapshots)
+    {
         var seen = new HashSet<string>(snapshots.Count);
 
         // Only the daemon can attribute sockets to processes it does not own. With no daemon —
@@ -384,7 +421,7 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
     {
         if (!value)
         {
-            Refresh();
+            _ = RefreshInBackgroundAsync();
         }
     }
 
@@ -487,7 +524,7 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
         {
             if (!IsPaused)
             {
-                Refresh();
+                _ = RefreshInBackgroundAsync();
                 _timer.Start();
             }
         }
@@ -531,6 +568,35 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
         // The checkbox only has a say where children are not already part of the scope.
         OnPropertyChanged(nameof(ChildrenChoiceApplies));
         OnPropertyChanged(nameof(CoversChildren));
+        OnPropertyChanged(nameof(ProxyButtonLabel));
+    }
+
+    /// <summary>
+    /// What the proxy button installs, at the scope chosen above it.
+    /// </summary>
+    /// <remarks>
+    /// The button follows the scope, so its label does too: "Proxy this instance" over a rule
+    /// for every future run of the executable was the button saying one thing and doing another.
+    /// </remarks>
+    public string ProxyButtonLabel => ScopeChoice switch
+    {
+        RuleScopeChoice.Executable => Loc.Current["Processes.Action.ProxyExecutable"],
+        RuleScopeChoice.Tree => Loc.Current["Processes.Action.ProxyTree"],
+        _ => Loc.Current["Processes.Action.ProxyInstance"],
+    };
+
+    /// <summary>Re-renders every localised string after a language change.</summary>
+    public void NotifyLanguageChanged()
+    {
+        // Empty means "everything": every computed label on the page, re-read in one go.
+        OnPropertyChanged(string.Empty);
+        foreach (var row in _rows.Values)
+        {
+            row.NotifyLanguageChanged();
+        }
+
+        CoveringRules.Clear();
+        RefreshCoveringRules();
     }
 
     partial void OnIncludeChildrenChanged(bool value) => OnPropertyChanged(nameof(CoversChildren));
@@ -660,20 +726,29 @@ public sealed partial class ProcessesPageViewModel : ObservableObject, IDisposab
             // Descendants come from the scope when the scope is about a tree; the checkbox
             // only has a say for the two scopes where it is offered.
             var includeChildren = scope != RuleScopeChoice.Tree && IncludeChildren;
-            var rule = _rules.BuildRule(row.Snapshot, scope, action, includeChildren);
+            var built = _rules.BuildRule(row.Snapshot, scope, action, includeChildren);
+
+            // A new choice for a process that already has one replaces it in place: same id,
+            // same position. The daemon then swaps one rule for the other in a single step,
+            // which is what lets it tell which open connections the change moves. Installed
+            // beside the old rule and removed afterwards, the old one was still winning at the
+            // moment of comparison, and no connection was ever reset.
+            var rule = _rules.FindSupersededBy(built) is { } previous
+                ? built with { Id = previous.Id, Order = previous.Order }
+                : built;
+
             var result = await _daemon
                 .ApplyRuleAsync(rule, ResetExistingConnections)
                 .ConfigureAwait(true);
 
             if (result.Succeeded)
             {
-                // Whatever this replaces has to come out of the kernel as well. The store
+                // Anything else this replaces has to come out of the kernel as well. The store
                 // drops a superseded selection from the list, but the daemon keeps every rule
-                // it was given: the old one has a lower position, so it would go on winning
-                // while the UI showed only the new one. That is precisely how a process ends
-                // up "proxied" in the list and routed direct in the kernel.
-                var superseded = _rules.Add(rule with { AppliedAtUtc = result.ConfirmedAtUtc });
-                if (superseded is not null)
+                // it was given, and one left installed would go on deciding routes while the
+                // UI showed only the new one — the way a process ends up "proxied" in the list
+                // and routed direct in the kernel.
+                foreach (var superseded in _rules.Add(rule with { AppliedAtUtc = result.ConfirmedAtUtc }))
                 {
                     await RetireAsync(superseded).ConfigureAwait(true);
                 }

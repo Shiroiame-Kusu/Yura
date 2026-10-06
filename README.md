@@ -89,8 +89,8 @@ Useful flags:
 
 | Flag | Effect |
 | --- | --- |
-| `--theme light\|dark` | Start in a theme |
-| `--lang en\|zh-Hans` | Start in a language |
+| `--theme light\|dark` | Start in a theme, for this launch; the saved one is kept |
+| `--lang en\|zh-Hans` | Start in a language, for this launch; the saved one is kept |
 | `--page processes\|games\|connections\|proxies\|rules\|diagnostics\|settings` | Start on a page |
 | `--demo` | Populate from a **simulated** daemon, for design review only |
 | `--demo-editor socks\|wireguard\|chain` | Which editor the demo opens on the Proxies page |
@@ -185,8 +185,23 @@ ssh user@server 'sudo ./yura-agent install'
 `install` writes a hardened systemd unit, starts it, and prints one connect string. Paste that
 into Yura → Proxies → **Add agent**; the token in it goes to the secret store and the key
 fingerprint — which is what identifies the agent, instead of a certificate authority — goes to
-the configuration file. Open the port it names, TCP **and** UDP: the datagram channel is what
-carries a game's traffic.
+the configuration file.
+
+Then open, in the server's firewall and in your cloud provider's security group:
+
+| Port | For |
+| --- | --- |
+| TCP 7311 | The control connection and every relayed TCP flow |
+| UDP 7311 | The encrypted datagram channel that carries a game's UDP |
+| UDP 40000–40999 | Peer-to-peer games: where other players reach a game routed through the agent |
+
+The last range is **full-cone UDP**, on by default. Each of a game's sockets gets one port there,
+the same for every player it talks to, and anyone may send to it — what a game calls an
+**Open NAT**. Behind a stateful firewall that does not open the range, players the game has
+already sent to still get through, which is **Moderate** and still enough for most peer-to-peer
+games. Without full cone (`--no-full-cone`, or an agent too old to have it) every destination
+gets a socket of its own and each player sees a different port: **Strict**, which breaks most
+of them. Name lookups never use it. The Games page's NAT test reports which one a route gives.
 
 ```bash
 ./yura-agent show       # print the connect string again
@@ -195,9 +210,16 @@ carries a game's traffic.
 sudo ./yura-agent uninstall [--purge]
 ```
 
-By default the agent refuses private, loopback and link-local destinations, so a client holding
-the token cannot use it to reach the server's own network. `--allow`, `--deny`, `--ports` and
-`--allow-private` change that deliberately.
+By default the agent refuses private, loopback and link-local destinations, and the server's own
+addresses, so a client holding the token cannot use it to reach the server's own network or its
+services. The same policy decides who may send in on a full-cone port. `--allow`, `--deny`,
+`--ports` and `--allow-private` change that deliberately.
+
+| Option | Effect |
+| --- | --- |
+| `--cone-ports A-B` | The full-cone range (default `40000-40999`); open whatever you choose |
+| `--no-full-cone` | A socket per destination instead: no open ports, and a Strict NAT for games |
+| `--own-address IP` | The server's own addresses, never relayed to; read from its interfaces by default. Give the public one when it is on no interface, as behind a cloud's 1:1 NAT |
 
 ## Configuration
 
@@ -255,12 +277,15 @@ is unreferenced.
 - WireGuard exits imported from a wg-quick `.conf`, probed by a real handshake and a DNS
   answer through the tunnel, with the peer's handshake time and transfer shown live
 - **Yura agents**: a server-side relay with its own protocol — TLS 1.3 with a pinned public
-  key, a shared token, an AES-GCM datagram channel for UDP, latency measured from the agent's
-  own vantage point, and the resolver it offers used for lookups on that exit. Added by
-  pasting one connect string, deployable as one self-contained file with one command
+  key, a shared token, an AES-GCM datagram channel for UDP, full-cone UDP so a peer-to-peer game
+  routed through it has an Open NAT, latency measured from the agent's own vantage point, and
+  the resolver it offers used for lookups on that exit. Added by pasting one connect string,
+  deployable as one self-contained file with one command
 - **NAT type for peer-to-peer games**, measured over the route rather than guessed from the
-  machine: STUN through the route's own UDP path — a marked socket, a WireGuard exit, a SOCKS5
-  association or an agent's datagram channel — so the Games page can say whether routing this
+  machine: STUN through the route the way the forwarder uses it — a marked socket for the direct
+  path, a socket or SOCKS5 association per destination for a WireGuard or SOCKS5 exit, and one
+  full-cone channel for every destination through an agent, because that is what a peer sees —
+  so the Games page can say whether routing this
   game makes other players able to reach you, or less able. Nothing is sent until the button is
   pressed, and filtering behaviour that could not be tested is reported as untested rather than
   rounded up to Open
@@ -271,13 +296,17 @@ is unreferenced.
 - A systemd service installed from Settings through polkit, with the unit and the script
   shown before anything runs as root, and start / stop / restart / uninstall from the same
   page
-- 327 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+- 404 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
   wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and
-  tunnel manager, the agent protocol end to end against a real agent, the connect string, the
-  datagram sealing and its replay window, the systemd unit generators, the Steam library
-  reader and its KeyValues parser, the STUN codec and the NAT classifier's table of cases,
-  the socket-abort request's byte layout, the rule store, the process inspector, the proxy,
-  agent and chain editors, the routing-evidence sentences, and the configuration file
+  tunnel manager, the agent protocol end to end against a real agent — full-cone UDP
+  included — the agent's systemd unit, the connect string, the datagram sealing and its
+  replay window, the systemd unit generators, the Steam library reader and its KeyValues
+  parser, the STUN codec and the NAT classifier's table of cases, the socket-abort request's
+  byte layout, socket lookups against the running kernel, the flow registry, full-cone
+  routing in the daemon, the rule store and the rule editor, the process inspector, the
+  Games page, the proxy, agent and chain editors, the secret store, the daemon client
+  against a stand-in daemon, keeping a restarted daemon in step, the routing-evidence
+  sentences, and the configuration file
 - Configuration under `~/.config/Yura`, with passwords and keys in the desktop secret service
   and persistent rules reapplied to the daemon on every connection
 
@@ -285,7 +314,8 @@ is unreferenced.
 
 - **Child exclusion is a race.** A child inherits its parent's cgroup at fork and a socket's
   cgroup is fixed at creation, so a child that connects in its first millisecond keeps the
-  parent's route. The daemon narrows the window with an inline fork handler and a 1 ms guard;
+  parent's route. The daemon narrows the window with an inline fork handler and a guard that
+  polls every millisecond once a guarded process forks;
   closing it needs an eBPF hook at socket creation, which is not built. Measured, bounded and
   reported — see [the exclusion race](docs/daemon-acceptance.md#the-exclusion-race).
 - **UDP through a chain, or through an HTTP proxy, is refused rather than lost.** DNS is

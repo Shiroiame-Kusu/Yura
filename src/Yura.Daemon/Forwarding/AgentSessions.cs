@@ -28,6 +28,9 @@ public sealed record AgentState
 
     public bool Udp { get; init; }
 
+    /// <summary>True when the agent gave the session full-cone UDP, which peer-to-peer games need.</summary>
+    public bool FullCone { get; init; }
+
     /// <summary>The resolver the agent offered, used for lookups from processes on this exit.</summary>
     public IPAddress? Resolver { get; init; }
 
@@ -167,7 +170,7 @@ public sealed class AgentSessionManager : IAsyncDisposable
                 entry.Resolver = resolver;
 
                 _log($"agent '{entry.Name}': session up with {session.AgentName} " +
-                     $"({(session.UdpAvailable ? "udp available" : "no udp")}" +
+                     $"({(session.FullCone ? "full-cone udp" : session.UdpAvailable ? "udp available" : "no udp")}" +
                      $"{(resolver is null ? string.Empty : $", dns {resolver}")})");
 
                 // The first ping is what makes the round trip known before anything asks.
@@ -289,6 +292,7 @@ public sealed class AgentSessionManager : IAsyncDisposable
                 AgentVersion = session?.Welcome.AgentVersion,
                 RoundTripMilliseconds = connected ? session?.LastRoundTrip?.TotalMilliseconds : null,
                 Udp = connected && session!.UdpAvailable,
+                FullCone = connected && session!.FullCone,
                 Resolver = connected ? Resolver : null,
                 Failure = connected ? null : Failure ?? "no session yet",
             };

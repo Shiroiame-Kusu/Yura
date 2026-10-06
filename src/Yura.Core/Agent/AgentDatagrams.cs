@@ -18,6 +18,18 @@ public enum AgentDatagramKind : byte
 
     /// <summary>Nothing to say; keeps the path and its NAT mapping alive.</summary>
     Keepalive = 4,
+
+    /// <summary>
+    /// A relayed datagram on a full-cone channel: the same layout as <see cref="Relay"/>, for a
+    /// channel that stands for one of the client's sockets rather than one destination.
+    /// </summary>
+    /// <remarks>
+    /// Chosen per channel, by the kind of its first datagram, and only in a session granted
+    /// <see cref="AgentProtocol.Features.FullCone"/>. Per channel because not everything wants
+    /// it: a name lookup comes from a fresh socket each time and gains nothing from a port kept
+    /// open for minutes after it.
+    /// </remarks>
+    ConeRelay = 5,
 }
 
 /// <summary>
@@ -49,6 +61,13 @@ public sealed class AgentDatagramCrypto : IDisposable
     private readonly byte _sendDirection;
     private readonly byte _receiveDirection;
     private readonly Lock _replayGate = new();
+
+    // AesGcm keeps one cipher context per instance and is not safe to use from two threads at
+    // once: two datagrams sealed at the same moment — two of a game's peers answering together,
+    // or a keepalive beside a relayed packet — make OpenSSL fail the operation outright. So each
+    // direction is used by one thread at a time.
+    private readonly Lock _sendGate = new();
+    private readonly Lock _receiveGate = new();
 
     private ulong _counter;
     private ulong _highestSeen;
@@ -98,22 +117,25 @@ public sealed class AgentDatagramCrypto : IDisposable
             throw new ArgumentException("the destination buffer is too small for this datagram", nameof(destination));
         }
 
-        var counter = Interlocked.Increment(ref _counter);
-        _sessionId.CopyTo(destination);
-        destination[AgentProtocol.SessionIdBytes] = _sendDirection;
-        BinaryPrimitives.WriteUInt64BigEndian(destination[(AgentProtocol.SessionIdBytes + 1)..], counter);
+        lock (_sendGate)
+        {
+            var counter = ++_counter;
+            _sessionId.CopyTo(destination);
+            destination[AgentProtocol.SessionIdBytes] = _sendDirection;
+            BinaryPrimitives.WriteUInt64BigEndian(destination[(AgentProtocol.SessionIdBytes + 1)..], counter);
 
-        var header = destination[..AgentProtocol.DatagramHeaderBytes];
-        Span<byte> nonce = stackalloc byte[NonceBytes];
-        nonce[3] = _sendDirection;
-        BinaryPrimitives.WriteUInt64BigEndian(nonce[4..], counter);
+            var header = destination[..AgentProtocol.DatagramHeaderBytes];
+            Span<byte> nonce = stackalloc byte[NonceBytes];
+            nonce[3] = _sendDirection;
+            BinaryPrimitives.WriteUInt64BigEndian(nonce[4..], counter);
 
-        _send.Encrypt(
-            nonce,
-            plaintext,
-            destination.Slice(AgentProtocol.DatagramHeaderBytes, plaintext.Length),
-            destination.Slice(AgentProtocol.DatagramHeaderBytes + plaintext.Length, TagBytes),
-            header);
+            _send.Encrypt(
+                nonce,
+                plaintext,
+                destination.Slice(AgentProtocol.DatagramHeaderBytes, plaintext.Length),
+                destination.Slice(AgentProtocol.DatagramHeaderBytes + plaintext.Length, TagBytes),
+                header);
+        }
 
         return length;
     }
@@ -150,12 +172,15 @@ public sealed class AgentDatagramCrypto : IDisposable
 
         try
         {
-            _receive.Decrypt(
-                nonce,
-                packet.Slice(AgentProtocol.DatagramHeaderBytes, body),
-                packet.Slice(AgentProtocol.DatagramHeaderBytes + body, TagBytes),
-                plaintext[..body],
-                packet[..AgentProtocol.DatagramHeaderBytes]);
+            lock (_receiveGate)
+            {
+                _receive.Decrypt(
+                    nonce,
+                    packet.Slice(AgentProtocol.DatagramHeaderBytes, body),
+                    packet.Slice(AgentProtocol.DatagramHeaderBytes + body, TagBytes),
+                    plaintext[..body],
+                    packet[..AgentProtocol.DatagramHeaderBytes]);
+            }
         }
         catch (AuthenticationTagMismatchException)
         {
@@ -231,11 +256,12 @@ public sealed class AgentDatagramCrypto : IDisposable
 /// The body of a datagram, inside the AEAD.
 /// </summary>
 /// <remarks>
-/// A relayed datagram names a channel as well as a destination. The channel is the client's
-/// own handle for one (process, destination) pair: the agent keeps a socket per channel, so
-/// a game's source port at the far end stays stable for as long as it is playing, and the
-/// answer comes back with the channel already on it rather than having to be matched by
-/// address.
+/// A relayed datagram names a channel as well as an address: the destination on the way out,
+/// the sender on the way back. The channel is the client's own handle: the agent keeps a socket
+/// per channel, so a game's source port at the far end stays stable for as long as it is
+/// playing, and the answer comes back with the channel already on it. An ordinary channel
+/// stands for one (process, destination) pair; a full-cone one (<see cref="AgentDatagramKind.ConeRelay"/>)
+/// for one of the client's sockets, whatever it sends to and whoever sends to it.
 /// </remarks>
 public static class AgentDatagram
 {
@@ -245,7 +271,9 @@ public static class AgentDatagram
     public static int MaxPacketBytes =>
         AgentProtocol.DatagramOverheadBytes + MaxRelayHeaderBytes + AgentProtocol.MaxDatagramPayload;
 
-    public static int WriteRelay(Span<byte> destination, ushort channel, IPEndPoint target, ReadOnlySpan<byte> payload)
+    /// <param name="cone">Write it as <see cref="AgentDatagramKind.ConeRelay"/>, for a full-cone channel.</param>
+    public static int WriteRelay(
+        Span<byte> destination, ushort channel, IPEndPoint target, ReadOnlySpan<byte> payload, bool cone = false)
     {
         var address = target.Address.GetAddressBytes();
         var length = 4 + address.Length + 2 + payload.Length;
@@ -254,7 +282,7 @@ public static class AgentDatagram
             throw new ArgumentException("the destination buffer is too small", nameof(destination));
         }
 
-        destination[0] = (byte)AgentDatagramKind.Relay;
+        destination[0] = (byte)(cone ? AgentDatagramKind.ConeRelay : AgentDatagramKind.Relay);
         BinaryPrimitives.WriteUInt16BigEndian(destination[1..], channel);
         destination[3] = target.AddressFamily == AddressFamily.InterNetworkV6 ? (byte)0x04 : (byte)0x01;
         address.CopyTo(destination[4..]);
@@ -273,7 +301,7 @@ public static class AgentDatagram
     public static AgentDatagramKind KindOf(ReadOnlySpan<byte> body) =>
         body.Length == 0 ? default : (AgentDatagramKind)body[0];
 
-    /// <summary>Reads a relay body, without copying the payload.</summary>
+    /// <summary>Reads a relay body of either kind, without copying the payload.</summary>
     public static bool TryReadRelay(
         ReadOnlySpan<byte> body, out ushort channel, out IPEndPoint? target, out ReadOnlySpan<byte> payload)
     {
@@ -281,7 +309,7 @@ public static class AgentDatagram
         target = null;
         payload = default;
 
-        if (body.Length < 4 || body[0] != (byte)AgentDatagramKind.Relay)
+        if (body.Length < 4 || body[0] is not ((byte)AgentDatagramKind.Relay or (byte)AgentDatagramKind.ConeRelay))
         {
             return false;
         }

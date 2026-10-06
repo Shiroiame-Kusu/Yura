@@ -79,7 +79,9 @@ public sealed partial class ProxyRowViewModel : ObservableObject
                 : Loc.Current["Common.NotMeasured"];
             return string.Format(CultureInfo.CurrentCulture, Loc.Current["Proxy.Agent.Up"],
                 Agent.AgentName ?? Agent.Name, round,
-                Loc.Current[Agent.Udp ? "Proxy.Agent.UdpYes" : "Proxy.Agent.UdpNo"]);
+                Loc.Current[Agent.Udp
+                    ? Agent.FullCone ? "Proxy.Agent.UdpCone" : "Proxy.Agent.UdpYes"
+                    : "Proxy.Agent.UdpNo"]);
         }
     }
 
@@ -610,6 +612,16 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
     /// <summary>Raised after a proxy is saved, so the page can refresh what depends on it.</summary>
     public event EventHandler? Saved;
 
+    /// <summary>
+    /// Raised with the sentence to show when a secret service exists and still refused a
+    /// secret, which then lasts only as long as the app does.
+    /// </summary>
+    /// <remarks>
+    /// Out of the editor, because the editor closes on save. When there is no secret service at
+    /// all the editor has already said the secret is kept for this session only.
+    /// </remarks>
+    public event EventHandler<string>? SecretNotStored;
+
     /// <summary>Set by the view: opens a file picker and returns the chosen file's text.</summary>
     public Func<CancellationToken, Task<string?>>? PickConfigurationFile { get; set; }
 
@@ -619,10 +631,13 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
     /// </summary>
     public string SecretStoreDescription => _secrets.IsAvailable
         ? string.Format(CultureInfo.CurrentCulture, Loc.Current[IsWireGuard ? "Proxy.WireGuard.SecretHint" : "Proxy.SecretHint"],
-            Loc.Current.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
-                ? Loc.Current["Proxy.SecretStore"]
-                : _secrets.Description)
+            SecretStoreName)
         : Loc.Current[IsWireGuard ? "Proxy.WireGuard.SecretHintUnavailable" : "Proxy.SecretHintUnavailable"];
+
+    /// <summary>Where secrets go, as a phrase in the current language.</summary>
+    private string SecretStoreName => Loc.Current.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
+        ? Loc.Current["Proxy.SecretStore"]
+        : _secrets.Description;
 
     /// <summary>Shown when a saved password exists but is not displayed back.</summary>
     public string PasswordPlaceholder => _passwordAlreadyStored
@@ -1411,14 +1426,21 @@ public sealed partial class ProxyEditorViewModel : ObservableObject
         // Secrets go to the secret store, never into the configuration file. An empty box on
         // an existing proxy means "keep what is saved", not "clear it".
         var primary = PrimarySecret;
+        var stored = true;
         if (!string.IsNullOrEmpty(primary))
         {
-            await _secrets.SetAsync(endpoint.Id.ToString(), primary.Trim()).ConfigureAwait(true);
+            stored &= await _secrets.SetAsync(endpoint.Id.ToString(), primary.Trim()).ConfigureAwait(true);
         }
 
         if (IsWireGuard && !string.IsNullOrEmpty(PresharedKey))
         {
-            await _secrets.SetAsync(PresharedReference(endpoint.Id), PresharedKey.Trim()).ConfigureAwait(true);
+            stored &= await _secrets.SetAsync(PresharedReference(endpoint.Id), PresharedKey.Trim()).ConfigureAwait(true);
+        }
+
+        if (!stored && _secrets.IsAvailable)
+        {
+            SecretNotStored?.Invoke(this, string.Format(CultureInfo.CurrentCulture,
+                Loc.Current["Proxy.SecretNotStored"], endpoint.Name, SecretStoreName));
         }
 
         var existing = _rules.Proxies.FirstOrDefault(p => p.Id == endpoint.Id);

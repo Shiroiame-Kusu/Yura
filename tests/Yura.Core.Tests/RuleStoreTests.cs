@@ -147,6 +147,58 @@ public sealed class RuleStoreTests
     }
 
     [Fact]
+    public void Destinations_with_the_same_content_are_the_same_destination()
+    {
+        // A record compares its lists by reference, so two selectors built from the same ports
+        // were different — and every rule restored from the configuration had a destination
+        // unequal to Any, because the round trip builds new lists.
+        Assert.Equal(new DestinationSelector { Ports = [new Yura.Core.Net.PortRange(443, 443)] },
+            new DestinationSelector { Ports = [new Yura.Core.Net.PortRange(443, 443)] });
+        Assert.Equal(DestinationSelector.Any, Yura.Core.Ipc.RuleDto.From(Rule(1, "curl", RuleAction.Direct.Instance)).ToRule().Destination);
+        Assert.Equal(DestinationSelector.Any.GetHashCode(), new DestinationSelector().GetHashCode());
+        Assert.NotEqual(new DestinationSelector { Ports = [new Yura.Core.Net.PortRange(443, 443)] },
+            new DestinationSelector { Ports = [new Yura.Core.Net.PortRange(80, 80)] });
+    }
+
+    [Fact]
+    public void A_rule_restored_from_the_configuration_is_replaced_by_a_new_selection()
+    {
+        var store = Populated();
+        var process = Process();
+        var saved = store.BuildRule(process, RuleScopeChoice.Executable, new RuleAction.Proxy(ProxyA), false);
+        store.LoadPersisted([Yura.Core.Ipc.RuleDto.From(saved).ToRule()]);
+
+        var replacement = store.BuildRule(process, RuleScopeChoice.Executable, new RuleAction.Proxy(ProxyB), false);
+
+        // Found before it is installed, so the new rule can take its place in the daemon.
+        Assert.Equal(saved.Id, store.FindSupersededBy(replacement)?.Id);
+        var superseded = store.Add(replacement);
+
+        Assert.Equal(saved.Id, Assert.Single(superseded).Id);
+        Assert.Equal(new RuleAction.Proxy(ProxyB), Assert.Single(store.Rules).Action);
+    }
+
+    [Fact]
+    public void A_rule_put_in_place_of_the_one_it_replaces_needs_nothing_removed()
+    {
+        var store = Populated();
+        var process = Process();
+        var first = store.BuildRule(process, RuleScopeChoice.Executable, new RuleAction.Proxy(ProxyA), false);
+        store.Add(first);
+
+        var second = store.BuildRule(process, RuleScopeChoice.Executable, RuleAction.Direct.Instance, false) with
+        {
+            Id = first.Id,
+            Order = first.Order,
+        };
+
+        Assert.Empty(store.Add(second));
+        var kept = Assert.Single(store.Rules);
+        Assert.Equal(first.Id, kept.Id);
+        Assert.Equal(RuleAction.Direct.Instance, kept.Action);
+    }
+
+    [Fact]
     public void Two_rules_on_one_process_with_different_destinations_both_survive()
     {
         var store = Populated();

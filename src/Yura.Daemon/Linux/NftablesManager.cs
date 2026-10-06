@@ -96,7 +96,7 @@ public sealed class NftablesManager
 
         foreach (var slot in slots)
         {
-            if (!TryRenderBaseMatch(slot, out var baseMatch, out var reason))
+            if (!TryRenderBaseMatch(slot, out var baseMatch, out var family, out var reason))
             {
                 skipped?.Add($"{slot.Rule.Name}: {reason}");
                 sb.Append(CultureInfo.InvariantCulture, $"    # slot {slot.Name} ({slot.Rule.Name}) skipped: {reason}\n");
@@ -125,12 +125,12 @@ public sealed class NftablesManager
                 foreach (var group in slot.Groups)
                 {
                     var match = $"{baseMatch} socket cgroupv2 level {CgroupManager.Level} \"{CgroupManager.RelativePathFor(group.Name)}\"";
-                    AppendDisposition(sb, slot, match, options);
+                    AppendDisposition(sb, slot, match, family, options);
                 }
             }
             else
             {
-                AppendDisposition(sb, slot, baseMatch, options);
+                AppendDisposition(sb, slot, baseMatch, family, options);
             }
         }
 
@@ -152,7 +152,10 @@ public sealed class NftablesManager
         return sb.ToString();
     }
 
-    private static void AppendDisposition(StringBuilder sb, RuleSlot slot, string match, DaemonOptions options)
+    /// <param name="family">
+    /// "ip" or "ip6" when the match already names destinations of one family, null otherwise.
+    /// </param>
+    private static void AppendDisposition(StringBuilder sb, RuleSlot slot, string match, string? family, DaemonOptions options)
     {
         switch (slot.Disposition)
         {
@@ -179,10 +182,17 @@ public sealed class NftablesManager
                 // And what cannot be captured is refused rather than let out unrouted: a
                 // connection that quietly avoids the route is worse than one that fails, and
                 // an application that meets a closed door on IPv6 tries IPv4 a moment later.
-                sb.Append(CultureInfo.InvariantCulture,
-                    $"    meta nfproto ipv6 {match} meta l4proto tcp counter reject with tcp reset\n");
-                sb.Append(CultureInfo.InvariantCulture,
-                    $"    meta nfproto ipv6 {match} counter reject\n");
+                // Not when the rule names IPv4 destinations: its match already contains
+                // 'ip daddr', which no IPv6 packet can meet, and nft refuses the combination
+                // outright — taking the whole ruleset with it.
+                if (family != "ip")
+                {
+                    sb.Append(CultureInfo.InvariantCulture,
+                        $"    meta nfproto ipv6 {match} meta l4proto tcp counter reject with tcp reset\n");
+                    sb.Append(CultureInfo.InvariantCulture,
+                        $"    meta nfproto ipv6 {match} counter reject\n");
+                }
+
                 break;
             case SlotDisposition.Block:
                 sb.Append(CultureInfo.InvariantCulture,
@@ -201,9 +211,11 @@ public sealed class NftablesManager
     /// express the rule at all. Host names are deliberately left out: they are matched by
     /// the listener, which is why any rule that names one is a Capture slot.
     /// </summary>
-    private static bool TryRenderBaseMatch(RuleSlot slot, out string match, out string reason)
+    /// <param name="family">"ip" or "ip6" when the match names destinations of that family only.</param>
+    private static bool TryRenderBaseMatch(RuleSlot slot, out string match, out string? family, out string reason)
     {
         match = string.Empty;
+        family = null;
         reason = string.Empty;
 
         var destination = slot.Rule.Destination;
@@ -242,7 +254,7 @@ public sealed class NftablesManager
                 return false;
             }
 
-            var family = v6.Count > 0 ? "ip6" : "ip";
+            family = v6.Count > 0 ? "ip6" : "ip";
             var set = string.Join(", ", destination.Networks.Select(n =>
                 n.PrefixLength == (n.BaseAddress.AddressFamily == AddressFamily.InterNetwork ? 32 : 128)
                     ? n.BaseAddress.ToString()

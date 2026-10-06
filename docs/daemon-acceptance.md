@@ -113,11 +113,28 @@ harness proves everything else — with a server that only one path can reach:
 | --- | --- |
 | The direct path is measured, not guessed | `open`, `behindNat: false`, endpoint-independent mapping; the address a peer would be told is this machine's own |
 | Both STUN servers were really asked | One binding request logged at each |
-| A SOCKS5 route is measured through its UDP association | `moderate`: one mapping for both servers, and `behindNat` is null because the socket facing them is the proxy's |
-| The proxy's own log shows it carried the probes | Two `udp_send` entries naming the STUN ports |
-| **An agent route is measured from the agent** | The mapped address is inside the agent's network namespace — nothing on this machine can reach it, so it can only have come from the agent |
-| **And it is honest about what that costs** | `strict`, `addressAndPortDependent`: a channel is one destination, so two peers are two sockets at the agent and see two different source ports |
+| A SOCKS5 route is measured the way the forwarder uses it | `strict`, `addressAndPortDependent`: one association per destination, as the forwarder opens them, and the test proxy gives each its own relay socket; `behindNat` is null because the socket facing the servers is the proxy's ¹ |
+| The proxy's own log shows it carried the probes | `udp_send` entries naming the STUN ports, over at least two associations ¹ |
+| **An agent route is measured from the agent** | Both servers live only inside the agent's network namespace, on two different addresses, so whatever they report can only have come from the agent; the mapped address is the agent's own ² |
+| **And it keeps one address for every peer** | `moderate`, `endpointIndependent`: full-cone UDP gives the probe one socket at the agent for both servers. Moderate rather than Open only because the fixture does not answer the filtering question ² |
 | A chain is reported as carrying no UDP | `blocked`, with "carries TCP only" — a definite answer, not an unknown |
+
+¹ Changed with the NAT test itself, and verified on 2026-10-06: `strict`, with two STUN
+datagrams through two associations. Before the change this row reported `moderate`: both
+probes went down one association, a mapping no game routed through the proxy ever gets, since
+the forwarder relays each destination over an association of its own.
+
+² Changed with full-cone UDP, and verified on 2026-10-06: `moderate`, both servers seeing the
+agent at `10.78.1.2:40092` — one address, from the default full-cone range. Before full cone
+this row reported `strict`, `addressAndPortDependent` — a channel per destination, a port per
+peer — with both servers on one address. The second server now has an address of its own, since two ports of one address
+agreeing about a mapping say nothing about whether it depends on the address; and the agent is
+told its own address with `--own-address`, because this fixture puts its "remote" servers on
+the namespace's own loopback, which the agent otherwise refuses to relay to. What this table
+does not show is a peer the game never sent to getting through. The agent's half of that is
+proved against a real agent in `FullConeTests`, and the daemon's routing of it in
+`AgentConeTests`; the last step — the daemon handing the datagram to the game from the peer's
+address — needs root and a second client to play the peer, and is not exercised anywhere yet.
 
 The fixture (`spikes/lib/stun_server.py`) answers binding requests and logs every query, and
 deliberately ignores `CHANGE-REQUEST`: it exists to pin the mapping behaviour, and simulating
@@ -160,18 +177,25 @@ Two mechanisms narrow it, and the daemon uses both:
 
 - The kernel's **process connector** delivers the fork event, and it is handled inline on the
   netlink thread — no queue, no lock, no `/proc` read, one write to `cgroup.procs`.
-- A **guard thread** polls the cgroups of excluding rules every millisecond and evicts anything
-  that is not the rule's own process, which bounds the window to something Yura controls
-  rather than to the scheduler's whim.
+- A **guard thread** polls the cgroups of excluding rules and evicts anything that is not the
+  rule's own process, which bounds the window to something Yura controls rather than to the
+  scheduler's whim. It polls every millisecond from the moment a guarded process forks and for
+  as long as it keeps finding children to evict, backs off to every 50 ms when it finds none,
+  and sleeps until woken while no rule excludes children. Polling every millisecond regardless
+  kept a core from idling for as long as such a rule was installed — the default for "proxy
+  this instance".
 
 What remains: a child that connects in roughly its first millisecond of life keeps the route
 it inherited. The suite measures it. With a shell forking `curl` in a tight loop — the worst
-case, since `curl` does nothing between `exec` and `connect` — **30 of 31 children still
+case, since `curl` does nothing between `exec` and `connect` — **31 of 32 children still
 reached the proxy** while the daemon was simultaneously servicing the rest of the suite. In
 isolation the same loop leaks about one in ten. A child that does anything at all first, which
 is every real application, is excluded reliably: the suite asserts that case (0 of 3 children
-proxied, 75 children moved out) and measures the immediate one separately, so a regression in
-the fast path shows up as a number rather than as a passing test.
+proxied, every child the kernel reported moved out) and measures the immediate one separately,
+so a regression in the fast path shows up as a number rather than as a passing test. Those
+figures are from the guard as it is now — polling every millisecond only once a guarded process
+forks — and match the 30 of 31 measured when it polled every millisecond regardless: a burst of
+forks keeps it at full rate, which is the case measured.
 
 Closing it properly needs a hook at socket creation rather than at fork — a
 `cgroup/sock_create` eBPF program — which is a different mechanism, not a refinement of this

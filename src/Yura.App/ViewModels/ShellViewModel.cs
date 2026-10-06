@@ -13,8 +13,35 @@ using Yura.Core.Rules;
 namespace Yura.App.ViewModels;
 
 /// <summary>One entry in the left navigation.</summary>
-public sealed record NavigationItem(string Key, string LabelKey, FluentIcons.Common.Symbol Icon)
+/// <remarks>
+/// Observable because its label is. As a record read once, the navigation kept the language it
+/// started in until the app was restarted.
+/// </remarks>
+public sealed class NavigationItem : ObservableObject
 {
+    public NavigationItem(string key, string labelKey, FluentIcons.Common.Symbol icon)
+    {
+        Key = key;
+        LabelKey = labelKey;
+        Icon = icon;
+
+        // The items live as long as the shell, which lives as long as the application and
+        // Loc.Current, so the subscription never needs undoing.
+        Loc.Current.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(Loc.Language))
+            {
+                OnPropertyChanged(nameof(Label));
+            }
+        };
+    }
+
+    public string Key { get; }
+
+    public string LabelKey { get; }
+
+    public FluentIcons.Common.Symbol Icon { get; }
+
     public string Label => Loc.Current[LabelKey];
 }
 
@@ -26,6 +53,21 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
     private readonly ConfigStore _config;
     private readonly DispatcherTimer _saveDebounce;
     private readonly DispatcherTimer _pushDebounce;
+    private readonly DispatcherTimer _heartbeat;
+
+    /// <summary>The push to the daemon under way, if one is. See <see cref="SyncAsync"/>.</summary>
+    private Task? _sync;
+
+    /// <summary>Set when the push under way went out of date before it finished.</summary>
+    private bool _syncAgain;
+
+    /// <summary>The daemon state the shell last acted on, to tell a connection from a repeat.</summary>
+    private DaemonState _daemonState;
+
+    private bool _heartbeatInFlight;
+
+    /// <summary>The thread the shell was built on, which is the UI thread. See <see cref="OnUiThread"/>.</summary>
+    private readonly int _uiThread = Environment.CurrentManagedThreadId;
 
     /// <summary>True while the banner shows a tunnel warning, so it can be cleared when the exit comes up.</summary>
     private bool _tunnelWarningShown;
@@ -120,6 +162,24 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
                 await PushProxiesToDaemonAsync().ConfigureAwait(true);
             }
         };
+
+        // A secret the secret service would not take lasts only as long as the app. The editor
+        // closes on save, so the warning goes where configuration problems are shown.
+        Proxies.Editor.SecretNotStored += (_, message) => ConfigWarning = message;
+
+        // The daemon comes and goes on its own — started after the app, restarted by an
+        // upgrade, or by systemd after a crash — and holds nothing across a restart. Each time
+        // it appears it has to be handed everything again, and only the app can do that.
+        _daemonState = _daemon.State;
+        _daemon.StateChanged += OnDaemonStateChangedOnAnyThread;
+        _daemon.InstanceChanged += OnDaemonRestartedOnAnyThread;
+
+        // Pages ask the daemon things only while they are showing, and some never do. Without
+        // a request of its own the shell could sit on such a page while the daemon restarted
+        // behind it, and go on calling rules active that no kernel held.
+        _heartbeat = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _heartbeat.Tick += async (_, _) => await HeartbeatAsync().ConfigureAwait(true);
+        _heartbeat.Start();
     }
 
     private void SchedulePush()
@@ -381,12 +441,17 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
     public async Task RefreshDaemonStateAsync()
     {
         await _daemon.ConnectAsync().ConfigureAwait(true);
+        RaiseDaemonState();
 
         if (IsDaemonConnected)
         {
-            await PushConfigurationToDaemonAsync().ConfigureAwait(true);
+            await SyncAsync().ConfigureAwait(true);
         }
+    }
 
+    /// <summary>Re-reads everything the shell and the pages show about the daemon.</summary>
+    private void RaiseDaemonState()
+    {
         OnPropertyChanged(nameof(IsDaemonConnected));
         OnPropertyChanged(nameof(DaemonStatusText));
         OnPropertyChanged(nameof(DaemonBannerDetail));
@@ -395,8 +460,127 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
         Games.NotifyDaemonStateChanged();
     }
 
+    private void OnDaemonStateChangedOnAnyThread(object? sender, DaemonState state) =>
+        OnUiThread(() => OnDaemonStateChanged(state));
+
+    private void OnDaemonRestartedOnAnyThread(object? sender, EventArgs e) => OnUiThread(OnDaemonRestarted);
+
+    /// <summary>What the daemon appearing or going away means for the rest of the app.</summary>
+    /// <remarks>
+    /// Nothing listened to this before. A daemon that restarted, or came up after the app, was
+    /// handed no proxies and no rules until someone pressed Reconnect, while every page went on
+    /// showing the rules as active and the banner went on saying whatever it said last.
+    /// </remarks>
+    private void OnDaemonStateChanged(DaemonState state)
+    {
+        var previous = _daemonState;
+        _daemonState = state;
+        RaiseDaemonState();
+
+        if (state == DaemonState.Connected && previous != DaemonState.Connected)
+        {
+            // Restarted or only out of reach for a moment, pushing everything is right either
+            // way: a rule the daemon still holds is replaced by itself.
+            _ = SyncAsync();
+        }
+        else if (state == DaemonState.Disconnected && previous != DaemonState.Disconnected)
+        {
+            // Nothing is confirmed while no daemon answers; rules read as pending until one
+            // confirms them again.
+            Rules.MarkAllPending();
+        }
+    }
+
+    /// <summary>An answer came from a new run of the daemon, which holds nothing it was given.</summary>
+    private void OnDaemonRestarted()
+    {
+        Rules.MarkAllPending();
+
+        // Again even when a push is under way: it may have started before the restart, and
+        // what it pushed so far went to the process that has gone.
+        _ = SyncAsync(again: true);
+    }
+
+    /// <summary>
+    /// Hands the daemon everything it should hold, one push at a time.
+    /// </summary>
+    /// <remarks>
+    /// A request while a push is under way waits for that push rather than starting a second
+    /// one beside it. <paramref name="again"/> asks for one more push after it, for when the
+    /// one under way has gone out of date.
+    /// </remarks>
+    private Task SyncAsync(bool again = false)
+    {
+        if (_sync is { IsCompleted: false } running)
+        {
+            _syncAgain |= again;
+            return running;
+        }
+
+        _sync = RunSyncAsync();
+        return _sync;
+    }
+
+    private async Task RunSyncAsync()
+    {
+        do
+        {
+            _syncAgain = false;
+            if (!IsDaemonConnected)
+            {
+                // The next connection pushes it all.
+                return;
+            }
+
+            await PushConfigurationToDaemonAsync().ConfigureAwait(true);
+        }
+        while (_syncAgain);
+    }
+
+    /// <summary>One cheap request every few seconds, for what its answer says about the daemon.</summary>
+    private async Task HeartbeatAsync()
+    {
+        if (_heartbeatInFlight)
+        {
+            return;
+        }
+
+        _heartbeatInFlight = true;
+        try
+        {
+            await _daemon.PingAsync().ConfigureAwait(true);
+        }
+        finally
+        {
+            _heartbeatInFlight = false;
+        }
+    }
+
+    /// <summary>Runs on the UI thread. The daemon client raises its events on whichever thread got the answer.</summary>
+    /// <remarks>
+    /// Compared with the thread that built the shell rather than asked of the dispatcher: the
+    /// two agree in the app, and only the first is still true where no Avalonia loop runs, as in
+    /// a test, where the dispatcher belongs to whichever thread touched it first.
+    /// </remarks>
+    private void OnUiThread(Action action)
+    {
+        if (Environment.CurrentManagedThreadId == _uiThread)
+        {
+            action();
+        }
+        else
+        {
+            Dispatcher.UIThread.Post(action);
+        }
+    }
+
     private async Task PushConfigurationToDaemonAsync()
     {
+        // Listed before anything is pushed and pruned after. A rule a page installs while this
+        // runs is in the daemon a moment before it is in the app's list, and pruned from a
+        // listing taken in that moment it would leave the kernel while the page showed it active.
+        var installed = await _daemon.GetInstalledRulesAsync().ConfigureAwait(true);
+
         await PushProxiesToDaemonAsync().ConfigureAwait(true);
         await _daemon.SetDnsPolicyAsync(DnsPolicy).ConfigureAwait(true);
 
@@ -412,6 +596,13 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
                 continue;
             }
 
+            if (!result.Answered)
+            {
+                // The daemon went away part-way through. A rule it never saw is not a rule it
+                // refused, and the next connection pushes everything again.
+                return;
+            }
+
             if (rule.Lifetime == RuleLifetime.Persistent)
             {
                 ConfigWarning = $"Saved rule “{rule.Name}” could not be reapplied: {result.FailureReason}";
@@ -425,7 +616,7 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
             }
         }
 
-        await PruneStrayDaemonRulesAsync().ConfigureAwait(true);
+        await PruneStrayDaemonRulesAsync(installed).ConfigureAwait(true);
     }
 
     /// <summary>
@@ -437,9 +628,8 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
     /// previous app run exited between installing a rule and replacing it, and it happened
     /// systematically until superseded rules were removed at the point they are replaced.
     /// </remarks>
-    private async Task PruneStrayDaemonRulesAsync()
+    private async Task PruneStrayDaemonRulesAsync(IReadOnlyList<(Guid Id, string Name)> installed)
     {
-        var installed = await _daemon.GetInstalledRulesAsync().ConfigureAwait(true);
         var known = Rules.Rules.Select(r => r.Id).ToHashSet();
         var strays = installed.Where(r => !known.Contains(r.Id)).ToList();
 
@@ -512,11 +702,52 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
     partial void OnIsChineseChanged(bool value)
     {
         Loc.Current.Language = value ? "zh-Hans" : "en";
+
+        // Strings bound with {loc:Tr} follow on their own. Everything a view model puts
+        // together has to be read again, on every page — only the Proxies page used to be told,
+        // and the rest kept the previous language until something else changed them.
         OnPropertyChanged(nameof(DaemonStatusText));
         OnPropertyChanged(nameof(DaemonBannerDetail));
         Settings.NotifyShellChanged();
+        Settings.NotifyLanguageChanged();
+        Processes.NotifyLanguageChanged();
+        Games.NotifyLanguageChanged();
+        Connections.NotifyLanguageChanged();
         Proxies.NotifyLanguageChanged();
+        RulesPage.NotifyLanguageChanged();
+        Diagnostics.NotifyLanguageChanged();
         ScheduleSave();
+    }
+
+    /// <summary>
+    /// Applies what the command line asked for over what the configuration says, without
+    /// saving it.
+    /// </summary>
+    /// <remarks>
+    /// Null leaves the saved choice alone. These used to be set by an object initializer, which
+    /// runs after the constructor has loaded the configuration: the command line's defaults —
+    /// dark, English — replaced the user's saved theme and language on every launch, and were
+    /// then saved over them.
+    /// </remarks>
+    public void ApplyStartupOverrides(bool? dark, bool? chinese)
+    {
+        _applyingLoadedConfig = true;
+        try
+        {
+            if (dark is { } isDark)
+            {
+                IsDarkTheme = isDark;
+            }
+
+            if (chinese is { } isChinese)
+            {
+                IsChinese = isChinese;
+            }
+        }
+        finally
+        {
+            _applyingLoadedConfig = false;
+        }
     }
 
     /// <summary>
@@ -548,6 +779,9 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
 
     public void Dispose()
     {
+        _daemon.StateChanged -= OnDaemonStateChangedOnAnyThread;
+        _daemon.InstanceChanged -= OnDaemonRestartedOnAnyThread;
+        _heartbeat.Stop();
         _saveDebounce.Stop();
         _pushDebounce.Stop();
         Processes.Dispose();

@@ -31,7 +31,11 @@ internal sealed class AgentHarness : IAsyncDisposable
 
     public List<string> Log { get; } = [];
 
-    public static AgentHarness Start(bool udp = true, DestinationPolicy? policy = null)
+    /// <summary>The ports these tests give full-cone channels, away from a real agent's default.</summary>
+    public static readonly Core.Net.PortRange TestConePorts = new(47000, 47999);
+
+    public static AgentHarness Start(
+        bool udp = true, DestinationPolicy? policy = null, bool fullCone = true, Core.Net.PortRange? conePorts = null)
     {
         var state = Path.Combine(Path.GetTempPath(), "yura-agent-test-" + Guid.NewGuid().ToString("N"));
         var identity = AgentIdentity.LoadOrCreate(state, "test-agent");
@@ -45,6 +49,8 @@ internal sealed class AgentHarness : IAsyncDisposable
                 // Every destination in these tests is on loopback, which the default policy
                 // refuses on purpose.
                 Policy = policy ?? new DestinationPolicy { AllowPrivate = true },
+                FullCone = fullCone,
+                ConePorts = conePorts ?? TestConePorts,
             },
             identity,
             message => harness?.Log.Add(message));

@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Authentication;
 using Yura.Core.Agent;
+using Yura.Core.Net;
 
 namespace Yura.Agent;
 
@@ -30,6 +31,31 @@ public sealed record AgentOptions
     public int MaxChannelsPerSession { get; init; } = 256;
 
     public TimeSpan ChannelIdleTimeout { get; init; } = TimeSpan.FromSeconds(90);
+
+    /// <summary>
+    /// Whether a client may have full-cone UDP. On by default: it is what makes a peer-to-peer
+    /// game reachable through the agent. See <see cref="AgentProtocol.Features.FullCone"/>.
+    /// </summary>
+    public bool FullCone { get; init; } = true;
+
+    /// <summary>
+    /// The ports full-cone channels are given, which is what a firewall in front of the agent
+    /// has to let in for peers to reach a game. When every one is taken, a channel gets a port
+    /// the kernel chooses instead.
+    /// </summary>
+    public PortRange ConePorts { get; init; } = DefaultConePorts;
+
+    public static readonly PortRange DefaultConePorts = new(40000, 40999);
+
+    /// <summary>
+    /// How long a full-cone channel keeps its port after the client last sent on it.
+    /// </summary>
+    /// <remarks>
+    /// The mapping a game advertises to its peers, so not the ninety seconds an ordinary channel
+    /// gets; see <see cref="AgentProtocol.ConeMappingLifetime"/>. Only the client's own traffic
+    /// counts, so nobody else can hold the port open.
+    /// </remarks>
+    public TimeSpan ConeIdleTimeout { get; init; } = AgentProtocol.ConeMappingLifetime;
 
     /// <summary>How long the control connection may be silent before it is dropped.</summary>
     public TimeSpan ControlIdleTimeout { get; init; } = TimeSpan.FromSeconds(180);
@@ -69,7 +95,9 @@ public sealed class AgentServer : IAsyncDisposable
 
     private Socket? _listener;
     private Socket? _datagrams;
-    private DestinationPolicy _policy = DestinationPolicy.Default;
+
+    // Replaced, never mutated: the machine's own addresses are refreshed while it runs.
+    private volatile DestinationPolicy _policy = DestinationPolicy.Default;
     private IPAddress? _resolver;
     private long _streams;
     private long _bytesUp;
@@ -100,6 +128,7 @@ public sealed class AgentServer : IAsyncDisposable
         // address the policy lets through on port 53, so it must not change under a session.
         _resolver = _options.Policy.Resolver ?? ReadResolver();
         _policy = _options.Policy with { Resolver = _resolver };
+        RefreshLocalAddresses();
 
         var family = _options.Listen.AddressFamily;
         _listener = new Socket(family, SocketType.Stream, ProtocolType.Tcp);
@@ -291,14 +320,31 @@ public sealed class AgentServer : IAsyncDisposable
             _log($"{peer}: client asked for udp, which this agent was started without");
         }
 
-        var session = Session.Create(peer, hello.Label);
+        // Granted per session, and used per channel: the client still chooses, for each one,
+        // whether it stands for a socket or for one destination.
+        var cone = hello.Wanted.HasFlag(AgentProtocol.Features.FullCone) && _options.FullCone && UdpAvailable;
+        var session = Session.Create(peer, hello.Label, cone);
         if (!_sessions.TryAdd(session.Key, session))
         {
             await RejectAsync(stream, AgentRejection.TooMany, "Session id collision.", ct).ConfigureAwait(false);
             return;
         }
 
-        _log($"session {session.Key:x16} up for {peer} ({Describe(hello.Label)})");
+        _log($"session {session.Key:x16} up for {peer} ({Describe(hello.Label)})" +
+             (cone ? $", full-cone udp on ports {_options.ConePorts}" : string.Empty));
+
+        // Frames go out from two places — this loop, and the task measuring probes — and must
+        // not interleave on the wire.
+        using var writing = new SemaphoreSlim(1, 1);
+
+        // Probes are measured off this loop, one at a time and so answered in the order they
+        // were asked. A measurement takes seconds per sample, and measured here it held every
+        // ping behind it: the client's ping timed out and closed the session, and every UDP
+        // flow on it with the session.
+        var probes = System.Threading.Channels.Channel.CreateBounded<AgentProbeRequest>(
+            new System.Threading.Channels.BoundedChannelOptions(8) { SingleReader = true, SingleWriter = true });
+        using var ending = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var prober = AnswerProbesAsync(stream, probes.Reader, writing, ending.Token);
 
         try
         {
@@ -307,13 +353,12 @@ public sealed class AgentServer : IAsyncDisposable
                 session.Master,
                 DatagramPort,
                 AgentProtocol.MaxDatagramPayload,
-                Features,
+                Features | (session.Cone ? AgentProtocol.Features.FullCone : AgentProtocol.Features.None),
                 typeof(AgentServer).Assembly.GetName().Version?.ToString(3) ?? "0",
                 _identity.Name,
                 _resolver?.ToString() ?? string.Empty);
 
-            await AgentProtocol.WriteFrameAsync(stream, AgentFrameKind.Welcome, welcome.Encode(), ct)
-                .ConfigureAwait(false);
+            await WriteFrameAsync(stream, writing, AgentFrameKind.Welcome, welcome.Encode(), ct).ConfigureAwait(false);
 
             while (!ct.IsCancellationRequested)
             {
@@ -326,19 +371,16 @@ public sealed class AgentServer : IAsyncDisposable
                     case AgentFrameKind.Ping:
                         // Echoed unchanged: the client is timing its own round trip, and the
                         // agent's clock has nothing to do with it.
-                        await AgentProtocol.WriteFrameAsync(stream, AgentFrameKind.Pong, payload, ct)
-                            .ConfigureAwait(false);
+                        await WriteFrameAsync(stream, writing, AgentFrameKind.Pong, payload, ct).ConfigureAwait(false);
                         break;
 
                     case AgentFrameKind.Probe:
-                        var reply = await MeasureAsync(AgentProbeRequest.Decode(payload), ct).ConfigureAwait(false);
-                        await AgentProtocol.WriteFrameAsync(stream, AgentFrameKind.Probed, reply.Encode(), ct)
-                            .ConfigureAwait(false);
+                        await probes.Writer.WriteAsync(AgentProbeRequest.Decode(payload), idle.Token).ConfigureAwait(false);
                         break;
 
                     case AgentFrameKind.Stats:
-                        await AgentProtocol.WriteFrameAsync(stream, AgentFrameKind.StatsReply,
-                            Snapshot().Encode(), ct).ConfigureAwait(false);
+                        await WriteFrameAsync(stream, writing, AgentFrameKind.StatsReply, Snapshot().Encode(), ct)
+                            .ConfigureAwait(false);
                         break;
 
                     default:
@@ -348,9 +390,54 @@ public sealed class AgentServer : IAsyncDisposable
         }
         finally
         {
+            probes.Writer.TryComplete();
+            await ending.CancelAsync().ConfigureAwait(false);
+            try
+            {
+                await prober.ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Its failures are the connection's, which is ending anyway.
+            }
+
             _sessions.TryRemove(session.Key, out _);
             await session.DisposeAsync().ConfigureAwait(false);
             _log($"session {session.Key:x16} down for {peer}");
+        }
+    }
+
+    /// <summary>Measures each probe in turn and sends its answer, for as long as the session lasts.</summary>
+    private async Task AnswerProbesAsync(
+        Stream stream, System.Threading.Channels.ChannelReader<AgentProbeRequest> requests, SemaphoreSlim writing,
+        CancellationToken ct)
+    {
+        try
+        {
+            await foreach (var request in requests.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                var reply = await MeasureAsync(request, ct).ConfigureAwait(false);
+                await WriteFrameAsync(stream, writing, AgentFrameKind.Probed, reply.Encode(), ct).ConfigureAwait(false);
+            }
+        }
+        catch (Exception e) when (e is IOException or ObjectDisposedException or OperationCanceledException
+                                     or AgentProtocolException or SocketException)
+        {
+            // The connection is going; the read loop reports that.
+        }
+    }
+
+    private static async Task WriteFrameAsync(
+        Stream stream, SemaphoreSlim writing, AgentFrameKind kind, byte[] payload, CancellationToken ct)
+    {
+        await writing.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await AgentProtocol.WriteFrameAsync(stream, kind, payload, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            writing.Release();
         }
     }
 
@@ -662,8 +749,10 @@ public sealed class AgentServer : IAsyncDisposable
                 return;
             }
 
-            case AgentDatagramKind.Relay:
+            case AgentDatagramKind.Relay or AgentDatagramKind.ConeRelay:
             {
+                var wantsCone = AgentDatagram.KindOf(body.Span) == AgentDatagramKind.ConeRelay;
+
                 // Read out of the span before anything is awaited: a span cannot survive an
                 // await, and copying the payload is what the send needs anyway.
                 ushort channelId;
@@ -679,22 +768,55 @@ public sealed class AgentServer : IAsyncDisposable
                     payload = raw.ToArray();
                 }
 
-                var channel = await ChannelForAsync(socket, session, channelId, target, ct).ConfigureAwait(false);
-                if (channel is null)
+                var channel = await ChannelForAsync(socket, session, channelId, target, wantsCone, ct).ConfigureAwait(false);
+                if (channel is not null && channel is ConeChannel != wantsCone)
                 {
+                    // A channel is what its first datagram made it. One of the other kind with
+                    // the same number is a client confused about its own channels, and is
+                    // dropped rather than guessed at.
+                    _log($"session {session.Key:x16}: channel {channelId} is " +
+                         $"{(channel is ConeChannel ? "full-cone" : "bound to one destination")}; " +
+                         "a datagram of the other kind on it was dropped");
                     return;
                 }
 
-                if (!channel.Target.Equals(target))
+                switch (channel)
                 {
-                    // A channel is one destination for its lifetime; its socket is connected to
-                    // that destination, which is what stops anything else being injected into it.
-                    _log($"session {session.Key:x16}: channel {channelId} is bound to {channel.Target}, " +
-                         $"not {target}; datagram dropped");
-                    return;
+                    case ConeChannel cone:
+                        // A full-cone channel may send anywhere the policy allows, decided once
+                        // per destination.
+                        if (!cone.MaySendTo(target, _policy, out var refusal))
+                        {
+                            if (refusal is not null)
+                            {
+                                Interlocked.Increment(ref _rejected);
+                                _log($"session {session.Key:x16}: refused udp to {target}: {refusal}");
+                            }
+
+                            return;
+                        }
+
+                        await cone.SendAsync(target, payload, ct).ConfigureAwait(false);
+                        break;
+
+                    case DestinationChannel fixedChannel:
+                        if (!fixedChannel.Target.Equals(target))
+                        {
+                            // A channel is one destination for its lifetime; its socket is
+                            // connected to that destination, which is what stops anything else
+                            // being injected into it.
+                            _log($"session {session.Key:x16}: channel {channelId} is bound to {fixedChannel.Target}, " +
+                                 $"not {target}; datagram dropped");
+                            return;
+                        }
+
+                        await fixedChannel.SendAsync(payload, ct).ConfigureAwait(false);
+                        break;
+
+                    default:
+                        return;
                 }
 
-                await channel.SendAsync(payload, ct).ConfigureAwait(false);
                 Interlocked.Add(ref _bytesUp, payload.Length);
                 return;
             }
@@ -705,7 +827,7 @@ public sealed class AgentServer : IAsyncDisposable
     }
 
     private async Task<Channel?> ChannelForAsync(
-        Socket socket, Session session, ushort id, IPEndPoint target, CancellationToken ct)
+        Socket socket, Session session, ushort id, IPEndPoint target, bool cone, CancellationToken ct)
     {
         if (session.Channels.TryGetValue(id, out var existing))
         {
@@ -718,26 +840,53 @@ public sealed class AgentServer : IAsyncDisposable
             return null;
         }
 
-        if (_policy.Refuse(target) is { } refusal)
+        Channel channel;
+        if (cone)
         {
-            Interlocked.Increment(ref _rejected);
-            _log($"session {session.Key:x16}: refused udp to {target}: {refusal}");
-            return null;
+            if (!session.Cone)
+            {
+                // Not granted — this agent was started with --no-full-cone, or the client did
+                // not ask — so the client should not be sending these.
+                _log($"session {session.Key:x16}: full-cone channel {id} refused: not granted to this session");
+                return null;
+            }
+
+            // Every destination is checked as it is sent to, not only the first.
+            var opened = ConeChannel.Open(id, _options);
+            if (!opened.InRange)
+            {
+                _log($"session {session.Key:x16}: every full-cone port in {_options.ConePorts} is in use; " +
+                     $"channel {id} is on port {opened.Port}, which a firewall that opens only the range will keep peers from");
+            }
+
+            channel = opened;
+        }
+        else
+        {
+            if (_policy.Refuse(target) is { } refusal)
+            {
+                Interlocked.Increment(ref _rejected);
+                _log($"session {session.Key:x16}: refused udp to {target}: {refusal}");
+                return null;
+            }
+
+            channel = new DestinationChannel(id, target);
         }
 
-        var channel = new Channel(id, target);
         if (!session.Channels.TryAdd(id, channel))
         {
             await channel.DisposeAsync().ConfigureAwait(false);
             return session.Channels.GetValueOrDefault(id);
         }
 
-        _ = PumpChannelAsync(socket, session, channel, ct);
+        _ = channel is ConeChannel coneChannel
+            ? PumpConeAsync(socket, session, coneChannel, ct)
+            : PumpChannelAsync(socket, session, (DestinationChannel)channel, ct);
         return channel;
     }
 
     /// <summary>Carries one channel's answers back to the client, sealed and labelled.</summary>
-    private async Task PumpChannelAsync(Socket socket, Session session, Channel channel, CancellationToken ct)
+    private async Task PumpChannelAsync(Socket socket, Session session, DestinationChannel channel, CancellationToken ct)
     {
         var buffer = new byte[AgentProtocol.MaxDatagramPayload];
         var plain = new byte[AgentDatagram.MaxRelayHeaderBytes + AgentProtocol.MaxDatagramPayload];
@@ -749,6 +898,10 @@ public sealed class AgentServer : IAsyncDisposable
             {
                 received = await channel.Socket.ReceiveAsync(buffer, ct).ConfigureAwait(false);
             }
+            catch (SocketException e) when (IsPassing(e))
+            {
+                continue;
+            }
             catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
             {
                 return;
@@ -757,17 +910,100 @@ public sealed class AgentServer : IAsyncDisposable
             channel.Touch();
             session.Touch();
             var length = AgentDatagram.WriteRelay(plain, channel.Id, channel.Target, buffer.AsSpan(0, received));
-            try
-            {
-                await SendSealedAsync(socket, session, plain.AsMemory(0, length), ct).ConfigureAwait(false);
-                Interlocked.Add(ref _bytesDown, received);
-            }
-            catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
+            if (!await RelayToClientAsync(socket, session, plain.AsMemory(0, length), received, ct).ConfigureAwait(false))
             {
                 return;
             }
         }
     }
+
+    /// <summary>
+    /// Carries everything a full-cone channel hears back to the client, labelled with who sent it.
+    /// </summary>
+    /// <remarks>
+    /// The sender is checked against the same policy as a destination, so the agent's own
+    /// network cannot write into a client's game; and receiving does not keep the channel, so
+    /// whoever is sending cannot hold its port open once the client has gone quiet.
+    /// </remarks>
+    private async Task PumpConeAsync(Socket socket, Session session, ConeChannel channel, CancellationToken ct)
+    {
+        var buffer = new byte[AgentProtocol.MaxDatagramPayload];
+        var plain = new byte[AgentDatagram.MaxRelayHeaderBytes + AgentProtocol.MaxDatagramPayload];
+        var any = new IPEndPoint(
+            channel.Socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0);
+
+        while (!ct.IsCancellationRequested)
+        {
+            SocketReceiveFromResult received;
+            try
+            {
+                received = await channel.Socket.ReceiveFromAsync(buffer, SocketFlags.None, any, ct).ConfigureAwait(false);
+            }
+            catch (SocketException e) when (IsPassing(e))
+            {
+                continue;
+            }
+            catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
+            {
+                return;
+            }
+
+            if (received.RemoteEndPoint is not IPEndPoint raw)
+            {
+                continue;
+            }
+
+            // A dual-stack socket reports an IPv4 sender as ::ffff:a.b.c.d; the client sent to,
+            // and expects to hear from, the plain IPv4 address.
+            var from = raw.Address.IsIPv4MappedToIPv6 ? new IPEndPoint(raw.Address.MapToIPv4(), raw.Port) : raw;
+            if (!channel.MayHearFrom(from, _policy))
+            {
+                continue;
+            }
+
+            var length = AgentDatagram.WriteRelay(
+                plain, channel.Id, from, buffer.AsSpan(0, received.ReceivedBytes), cone: true);
+            if (!await RelayToClientAsync(socket, session, plain.AsMemory(0, length), received.ReceivedBytes, ct)
+                    .ConfigureAwait(false))
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>Seals one relayed datagram to the client; false once there is nobody to send to.</summary>
+    private async Task<bool> RelayToClientAsync(
+        Socket socket, Session session, ReadOnlyMemory<byte> plain, int payloadBytes, CancellationToken ct)
+    {
+        try
+        {
+            await SendSealedAsync(socket, session, plain, ct).ConfigureAwait(false);
+            Interlocked.Add(ref _bytesDown, payloadBytes);
+            return true;
+        }
+        catch (SocketException)
+        {
+            // One datagram lost on the way to the client — a full send buffer, a route that
+            // flapped. UDP is allowed to lose it; the channel is not worth ending over it.
+            return true;
+        }
+        catch (Exception e) when (e is ObjectDisposedException or OperationCanceledException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// An error a UDP socket reports and then carries on from: an ICMP answer to something it
+    /// sent earlier.
+    /// </summary>
+    /// <remarks>
+    /// Ending the channel's pump on one meant a game server that restarted — answering "port
+    /// unreachable" for a second — left the channel deaf for the rest of the session.
+    /// </remarks>
+    private static bool IsPassing(SocketException e) => e.SocketErrorCode is SocketError.ConnectionRefused
+        or SocketError.ConnectionReset or SocketError.HostUnreachable or SocketError.NetworkUnreachable
+        or SocketError.TimedOut;
 
     private static async Task SendSealedAsync(
         Socket socket, Session session, ReadOnlyMemory<byte> plain, CancellationToken ct)
@@ -788,6 +1024,7 @@ public sealed class AgentServer : IAsyncDisposable
     /// </summary>
     private async Task ExpireChannelsAsync(CancellationToken ct)
     {
+        var rounds = 0;
         while (!ct.IsCancellationRequested)
         {
             try
@@ -799,12 +1036,19 @@ public sealed class AgentServer : IAsyncDisposable
                 return;
             }
 
-            var cutoff = DateTimeOffset.UtcNow - _options.ChannelIdleTimeout;
+            // A minute is soon enough to notice an address the machine gained or lost.
+            if (++rounds % 4 == 0)
+            {
+                RefreshLocalAddresses();
+            }
+
+            var now = DateTimeOffset.UtcNow;
             foreach (var session in _sessions.Values)
             {
                 foreach (var (id, channel) in session.Channels)
                 {
-                    if (channel.LastActivityUtc <= cutoff && session.Channels.TryRemove(id, out var removed))
+                    var idle = channel is ConeChannel ? _options.ConeIdleTimeout : _options.ChannelIdleTimeout;
+                    if (channel.LastActivityUtc <= now - idle && session.Channels.TryRemove(id, out var removed))
                     {
                         await removed.DisposeAsync().ConfigureAwait(false);
                     }
@@ -814,6 +1058,17 @@ public sealed class AgentServer : IAsyncDisposable
     }
 
     private static string Describe(string label) => label.Length == 0 ? "no label" : label;
+
+    /// <summary>
+    /// Re-reads the machine's own addresses into the policy, unless the operator gave a list.
+    /// </summary>
+    private void RefreshLocalAddresses()
+    {
+        if (_options.Policy.LocalAddresses.Count == 0)
+        {
+            _policy = _policy with { LocalAddresses = DestinationPolicy.ReadLocalAddresses() };
+        }
+    }
 
     /// <summary>
     /// The first nameserver in <c>/etc/resolv.conf</c>, or null when there is none to offer.
@@ -876,17 +1131,18 @@ public sealed class AgentServer : IAsyncDisposable
     /// <summary>One client: its keys, where its datagrams come from, and its channels.</summary>
     private sealed class Session : IAsyncDisposable
     {
-        private Session(ulong key, byte[] id, byte[] master, IPAddress control, string label)
+        private Session(ulong key, byte[] id, byte[] master, IPAddress control, string label, bool cone)
         {
             Key = key;
             Id = id;
             Master = master;
             Control = control;
             Label = label;
+            Cone = cone;
             Crypto = AgentDatagramCrypto.ForAgent(id, master);
         }
 
-        public static Session Create(IPAddress control, string label)
+        public static Session Create(IPAddress control, string label, bool cone)
         {
             var id = RandomNumberGenerator.GetBytes(AgentProtocol.SessionIdBytes);
             return new Session(
@@ -894,8 +1150,12 @@ public sealed class AgentServer : IAsyncDisposable
                 id,
                 RandomNumberGenerator.GetBytes(AgentProtocol.KeyBytes),
                 control,
-                label);
+                label,
+                cone);
         }
+
+        /// <summary>True when the session was granted full-cone UDP: its channels are the client's sockets.</summary>
+        public bool Cone { get; }
 
         public ulong Key { get; }
 
@@ -931,6 +1191,24 @@ public sealed class AgentServer : IAsyncDisposable
         }
     }
 
+    /// <summary>One datagram channel's socket at the agent, and when it was last used.</summary>
+    private abstract class Channel(ushort id, Socket socket) : IAsyncDisposable
+    {
+        public ushort Id { get; } = id;
+
+        public Socket Socket { get; } = socket;
+
+        public DateTimeOffset LastActivityUtc { get; private set; } = DateTimeOffset.UtcNow;
+
+        public void Touch() => LastActivityUtc = DateTimeOffset.UtcNow;
+
+        public ValueTask DisposeAsync()
+        {
+            Socket.Dispose();
+            return ValueTask.CompletedTask;
+        }
+    }
+
     /// <summary>
     /// One UDP conversation: a socket of its own, connected to the destination.
     /// </summary>
@@ -938,27 +1216,29 @@ public sealed class AgentServer : IAsyncDisposable
     /// A socket per channel rather than one shared socket, for two reasons. The source port a
     /// game sees stays the same for as long as it is playing, which some game servers care
     /// about; and connecting the socket makes the kernel drop anything that did not come from
-    /// that destination, so nothing else can be injected into the channel.
+    /// that destination, so nothing else can be injected into the channel. What it costs is
+    /// peer-to-peer: each peer sees a different port, which a game calls a Strict NAT. A
+    /// session that asked for full cone gets <see cref="ConeChannel"/> instead.
     /// </remarks>
-    private sealed class Channel : IAsyncDisposable
+    private sealed class DestinationChannel(ushort id, IPEndPoint target) : Channel(id, Connected(target))
     {
-        public Channel(ushort id, IPEndPoint target)
+        public IPEndPoint Target { get; } = target;
+
+        private static Socket Connected(IPEndPoint target)
         {
-            Id = id;
-            Target = target;
-            Socket = new Socket(target.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
-            Socket.Connect(target);
+            var socket = new Socket(target.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            try
+            {
+                socket.Connect(target);
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
+
+            return socket;
         }
-
-        public ushort Id { get; }
-
-        public IPEndPoint Target { get; }
-
-        public Socket Socket { get; }
-
-        public DateTimeOffset LastActivityUtc { get; private set; } = DateTimeOffset.UtcNow;
-
-        public void Touch() => LastActivityUtc = DateTimeOffset.UtcNow;
 
         public async Task SendAsync(byte[] payload, CancellationToken ct)
         {
@@ -972,11 +1252,144 @@ public sealed class AgentServer : IAsyncDisposable
                 // A refused datagram is what UDP does; the game retries.
             }
         }
+    }
 
-        public ValueTask DisposeAsync()
+    /// <summary>
+    /// One of a client's sockets, in a full-cone session: one address here for every peer it
+    /// sends to, open to anyone who sends to that address.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// That is what a peer-to-peer game needs. The address its matchmaking server sees is the
+    /// address every other player is told, and a player the game has never sent to can still
+    /// get through — what a game calls an Open NAT, where a socket per destination is a Strict
+    /// one. Whether strangers really can get through is up to the firewall in front of the
+    /// agent: one that lets in <see cref="AgentOptions.ConePorts"/> makes it Open, and a
+    /// stateful one that does not still leaves it Moderate, which hole punching copes with.
+    /// </para>
+    /// <para>
+    /// The agent's policy holds both ways, decided once per address: for each destination a
+    /// client sends to, and for each sender a client hears from. And only the client's own
+    /// traffic keeps the port, so nobody else can hold it open after the client goes quiet.
+    /// </para>
+    /// </remarks>
+    private sealed class ConeChannel : Channel
+    {
+        /// <summary>Decisions kept per channel before they are made afresh, so a crowd cannot grow it.</summary>
+        private const int MaxRemembered = 4096;
+
+        // Each touched by one task only — destinations by the datagram loop, senders by this
+        // channel's pump — so neither needs a lock.
+        private readonly Dictionary<IPEndPoint, bool> _destinations = [];
+        private readonly Dictionary<IPEndPoint, bool> _senders = [];
+        private DestinationPolicy? _destinationsUnder;
+        private DestinationPolicy? _sendersUnder;
+
+        private ConeChannel(ushort id, Socket socket, bool inRange)
+            : base(id, socket) => InRange = inRange;
+
+        /// <summary>
+        /// False when every port in the configured range was taken and the kernel chose one: it
+        /// relays the same, but a firewall that opens only the range keeps peers from it.
+        /// </summary>
+        public bool InRange { get; }
+
+        public int Port => ((IPEndPoint)Socket.LocalEndPoint!).Port;
+
+        public static ConeChannel Open(ushort id, AgentOptions options)
         {
-            Socket.Dispose();
-            return ValueTask.CompletedTask;
+            var range = options.ConePorts;
+            var count = Math.Max(0, range.To - range.From + 1);
+            var start = count == 0 ? 0 : Random.Shared.Next(count);
+            for (var i = 0; i < count; i++)
+            {
+                var socket = NewSocket(options.Listen);
+                try
+                {
+                    socket.Bind(new IPEndPoint(options.Listen, range.From + (start + i) % count));
+                    return new ConeChannel(id, socket, inRange: true);
+                }
+                catch (SocketException e) when (e.SocketErrorCode == SocketError.AddressAlreadyInUse)
+                {
+                    socket.Dispose();
+                }
+                catch
+                {
+                    socket.Dispose();
+                    throw;
+                }
+            }
+
+            var fallback = NewSocket(options.Listen);
+            try
+            {
+                fallback.Bind(new IPEndPoint(options.Listen, 0));
+            }
+            catch
+            {
+                fallback.Dispose();
+                throw;
+            }
+
+            return new ConeChannel(id, fallback, inRange: false);
+        }
+
+        private static Socket NewSocket(IPAddress listen)
+        {
+            var socket = new Socket(listen.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            if (listen.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                // Peers of either family on one port, as the agent's own sockets are.
+                socket.DualMode = true;
+            }
+
+            return socket;
+        }
+
+        /// <summary>Whether this channel may send there.</summary>
+        /// <param name="refusal">Why not, the first time only, so a refusal is logged once.</param>
+        public bool MaySendTo(IPEndPoint destination, DestinationPolicy policy, out string? refusal) =>
+            Decide(_destinations, ref _destinationsUnder, policy, destination, out refusal);
+
+        /// <summary>Whether what this sender sent may be passed to the client.</summary>
+        public bool MayHearFrom(IPEndPoint sender, DestinationPolicy policy) =>
+            Decide(_senders, ref _sendersUnder, policy, sender, out _);
+
+        private static bool Decide(
+            Dictionary<IPEndPoint, bool> decided, ref DestinationPolicy? decidedUnder, DestinationPolicy policy,
+            IPEndPoint endpoint, out string? refusal)
+        {
+            refusal = null;
+            if (!ReferenceEquals(decidedUnder, policy) || decided.Count >= MaxRemembered)
+            {
+                // The policy changed — the machine's addresses are re-read every minute — or the
+                // channel has heard from a crowd: decide afresh.
+                decided.Clear();
+                decidedUnder = policy;
+            }
+
+            if (decided.TryGetValue(endpoint, out var allowed))
+            {
+                return allowed;
+            }
+
+            refusal = policy.Refuse(endpoint);
+            decided[endpoint] = refusal is null;
+            return refusal is null;
+        }
+
+        public async Task SendAsync(IPEndPoint destination, byte[] payload, CancellationToken ct)
+        {
+            // Only the client's own traffic keeps the port.
+            Touch();
+            try
+            {
+                await Socket.SendToAsync(payload, SocketFlags.None, destination, ct).ConfigureAwait(false);
+            }
+            catch (Exception e) when (e is SocketException or ObjectDisposedException or OperationCanceledException)
+            {
+                // A refused datagram is what UDP does; the game retries.
+            }
         }
     }
 }

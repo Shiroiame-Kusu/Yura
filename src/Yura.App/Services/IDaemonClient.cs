@@ -44,6 +44,17 @@ public sealed record RuleApplyResult
 
     /// <summary>Things the daemon could not do, that did not stop the rule being installed.</summary>
     public IReadOnlyList<string> Warnings { get; init; } = [];
+
+    /// <summary>
+    /// False when no answer came back at all: the daemon was unreachable, not unwilling.
+    /// </summary>
+    /// <remarks>
+    /// The difference decides what a failure means. A daemon that answered no to a rule for a
+    /// process that has gone means the rule is finished with; a daemon that could not be reached
+    /// says nothing about the rule, and dropping it on that account lost the user's choice to a
+    /// moment's disconnection.
+    /// </remarks>
+    public bool Answered { get; init; } = true;
 }
 
 /// <summary>What the daemon reports about itself, for the Diagnostics page.</summary>
@@ -107,6 +118,10 @@ public sealed record TunnelStatus(
 /// The control session. TCP flows do not need it — each opens its own connection — so an
 /// agent that is not connected is degraded rather than unusable, and the UI says which.
 /// </param>
+/// <param name="FullCone">
+/// UDP through the agent keeps one address for every peer and can be reached by anyone, which is
+/// what a peer-to-peer game needs. Without it each peer sees a different port: a Strict NAT.
+/// </param>
 public sealed record AgentStatus(
     Guid ProxyId,
     string Name,
@@ -116,7 +131,8 @@ public sealed record AgentStatus(
     double? RoundTripMilliseconds,
     bool Udp,
     string? Resolver,
-    string? Failure);
+    string? Failure,
+    bool FullCone = false);
 
 /// <summary>
 /// The unprivileged app's only channel to the privileged daemon.
@@ -133,12 +149,29 @@ public interface IDaemonClient
 {
     DaemonState State { get; }
 
+    /// <summary>Raised on any thread when <see cref="State"/> changes.</summary>
     event EventHandler<DaemonState>? StateChanged;
+
+    /// <summary>
+    /// Raised on any thread when an answer comes from a different run of the daemon than the
+    /// last one did: it restarted, and holds none of the proxies and rules it was given.
+    /// </summary>
+    /// <remarks>
+    /// Not implied by <see cref="StateChanged"/>. A daemon restarted under systemd is back
+    /// within two seconds, and the app may never have asked it anything while it was away.
+    /// </remarks>
+    event EventHandler? InstanceChanged;
 
     /// <summary>Human-readable reason the daemon is unreachable, when it is.</summary>
     string? UnavailableReason { get; }
 
     Task ConnectAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Asks whether the daemon is there, as cheaply as it can be asked. Keeps
+    /// <see cref="State"/> current, and notices a restart, without anything else being polled.
+    /// </summary>
+    Task<bool> PingAsync(CancellationToken cancellationToken = default);
 
     Task<DaemonStatus?> GetStatusAsync(CancellationToken cancellationToken = default);
 
@@ -236,10 +269,18 @@ public sealed class DisconnectedDaemonClient : IDaemonClient
         remove { }
     }
 
+    public event EventHandler? InstanceChanged
+    {
+        add { }
+        remove { }
+    }
+
     public string? UnavailableReason =>
         $"No daemon is listening on {_socketPath}. Install it from Settings, or start it with: sudo systemctl start yura-daemon";
 
     public Task ConnectAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+    public Task<bool> PingAsync(CancellationToken cancellationToken = default) => Task.FromResult(false);
 
     public Task<DaemonStatus?> GetStatusAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult<DaemonStatus?>(null);
@@ -301,5 +342,6 @@ public sealed class DisconnectedDaemonClient : IDaemonClient
         Succeeded = false,
         FailureReason = "The daemon is not running, so the rule was not applied.",
         Diagnostics = UnavailableReason,
+        Answered = false,
     };
 }

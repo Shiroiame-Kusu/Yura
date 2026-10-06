@@ -87,6 +87,42 @@ public sealed class ProcProcessSourceTests
     }
 
     [Fact]
+    public void The_environment_is_read_only_when_asked_for_and_the_wine_target_never_needs_it()
+    {
+        // The daemon rescans every process every two seconds, and reading each one's environment
+        // costs a file per process. It reads them only while a rule matches on a Wine prefix,
+        // which is the one thing that lives there; the Windows executable a game rule matches
+        // comes from the command line and must be found either way.
+        // A shell that stays alive with a Windows executable on its command line; the trailing
+        // ':' stops it handing itself over to sleep.
+        var start = new System.Diagnostics.ProcessStartInfo("/bin/sh", ["-c", "sleep 30; :", "Game.exe"])
+        {
+            UseShellExecute = false,
+        };
+        start.Environment["SteamAppId"] = "1245620";
+        start.Environment["WINEPREFIX"] = "/tmp/yura-test-prefix";
+        using var child = System.Diagnostics.Process.Start(start)!;
+        try
+        {
+            var read = new ProcProcessSource().TryRead(child.Id);
+            var unread = new ProcProcessSource { ReadEnvironment = false }.TryRead(child.Id);
+
+            Assert.NotNull(read);
+            Assert.NotNull(unread);
+            Assert.Equal("1245620", read.SteamAppId);
+            Assert.Equal("/tmp/yura-test-prefix", read.Wine?.Prefix);
+            Assert.Null(unread.SteamAppId);
+            Assert.Null(unread.Wine?.Prefix);
+            Assert.Equal("Game.exe", read.Wine?.TargetExecutable);
+            Assert.Equal("Game.exe", unread.Wine?.TargetExecutable);
+        }
+        finally
+        {
+            child.Kill(entireProcessTree: true);
+        }
+    }
+
+    [Fact]
     public void Connection_count_is_null_not_zero_when_unavailable()
     {
         // The unprivileged /proc reader does not own socket attribution; reporting 0 would

@@ -39,6 +39,12 @@ public sealed record AgentClientOptions
 
     public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// Ask for full-cone UDP, so a game routed through the agent can be reached by its peers.
+    /// See <see cref="AgentProtocol.Features.FullCone"/>.
+    /// </summary>
+    public bool FullCone { get; init; }
+
     public static AgentClientOptions From(AgentConnection connection, string? label = null) => new()
     {
         Host = connection.Host,
@@ -150,6 +156,12 @@ public static class AgentClient
             }
 
             var wanted = AgentProtocol.Features.Udp | AgentProtocol.Features.Probe | AgentProtocol.Features.Resolve;
+            if (options.FullCone && role == AgentRole.Control)
+            {
+                // A session's property, so only the control connection that makes one asks.
+                wanted |= AgentProtocol.Features.FullCone;
+            }
+
             await AgentProtocol.WriteFrameAsync(tls, AgentFrameKind.Hello,
                 new AgentHello(role, token, wanted, options.Label).Encode(), ct).ConfigureAwait(false);
 
@@ -284,12 +296,13 @@ public sealed class AgentSession : IAsyncDisposable
     private readonly SslStream _control;
     private readonly CancellationTokenSource _closing = new();
     private readonly ConcurrentDictionary<AgentFrameKind, ConcurrentQueue<TaskCompletionSource<byte[]>>> _waiting = new();
-    private readonly ConcurrentDictionary<ushort, Action<IPEndPoint, ReadOnlyMemory<byte>>> _channels = new();
+    private readonly ConcurrentDictionary<ushort, OpenChannelEntry> _channels = new();
     private readonly SemaphoreSlim _writing = new(1, 1);
     private AgentDatagramCrypto? _crypto;
     private Socket? _datagrams;
     private TaskCompletionSource<byte[]>? _echo;
     private int _nextChannel;
+    private int _probing;
 
     private AgentSession(AgentClientOptions options, Socket socket, SslStream control, AgentWelcome welcome)
     {
@@ -305,6 +318,12 @@ public sealed class AgentSession : IAsyncDisposable
 
     /// <summary>True when the agent offered the datagram channel and it has been set up.</summary>
     public bool UdpAvailable => _datagrams is not null;
+
+    /// <summary>
+    /// True when the agent granted full-cone UDP: a channel then stands for one of our sockets,
+    /// may send to any destination, and hears from anyone, each answer labelled with its source.
+    /// </summary>
+    public bool FullCone => UdpAvailable && Welcome.Available.HasFlag(AgentProtocol.Features.FullCone);
 
     /// <summary>Null while the session is up; the reason once it is not.</summary>
     public string? Failure { get; private set; }
@@ -406,8 +425,12 @@ public sealed class AgentSession : IAsyncDisposable
         }
     }
 
+    /// <param name="timeout">
+    /// How long the answer may take, when that is not the session's usual timeout: a probe waits
+    /// for the agent to finish measuring, which can take several seconds per sample.
+    /// </param>
     private async Task<byte[]> RequestAsync(
-        AgentFrameKind send, byte[] payload, AgentFrameKind expect, CancellationToken ct)
+        AgentFrameKind send, byte[] payload, AgentFrameKind expect, CancellationToken ct, TimeSpan? timeout = null)
     {
         if (Failure is { } failure)
         {
@@ -415,15 +438,21 @@ public sealed class AgentSession : IAsyncDisposable
         }
 
         var completion = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _waiting.GetOrAdd(expect, _ => new ConcurrentQueue<TaskCompletionSource<byte[]>>()).Enqueue(completion);
 
         await _writing.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            // Queued while holding the write lock, so the order of the queue is the order the
+            // requests went out in — which is the order the agent answers them. Queued before
+            // taking it, a second caller could write first and be handed the first's answer.
+            _waiting.GetOrAdd(expect, _ => new ConcurrentQueue<TaskCompletionSource<byte[]>>()).Enqueue(completion);
             await AgentProtocol.WriteFrameAsync(_control, send, payload, ct).ConfigureAwait(false);
         }
-        catch (Exception e) when (e is IOException or ObjectDisposedException or AgentProtocolException)
+        catch (Exception e) when (e is IOException or ObjectDisposedException or AgentProtocolException
+                                     or OperationCanceledException)
         {
+            // Cancelled part way through a frame is as final as a broken connection: whatever
+            // was written is half a frame, and nothing after it can be read correctly.
             completion.TrySetException(e);
             Close("The connection to the agent was lost.");
             throw;
@@ -433,9 +462,9 @@ public sealed class AgentSession : IAsyncDisposable
             _writing.Release();
         }
 
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct, _closing.Token);
-        timeout.CancelAfter(_options.Timeout);
-        await using var registration = timeout.Token.Register(() =>
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(ct, _closing.Token);
+        limit.CancelAfter(timeout ?? _options.Timeout);
+        await using var registration = limit.Token.Register(() =>
             completion.TrySetException(new TimeoutException($"the agent did not answer with a {expect} frame")));
 
         try
@@ -472,15 +501,33 @@ public sealed class AgentSession : IAsyncDisposable
     public TimeSpan? LastRoundTrip { get; private set; }
 
     /// <summary>Asks the agent to measure a destination from where it is.</summary>
+    /// <remarks>
+    /// Waits as long as the measurement can take rather than the session's usual timeout. The
+    /// agent gives every sample a few seconds to connect, so a destination that drops the
+    /// connection attempts — a UDP-only game server, typically — takes it well past ten
+    /// seconds to answer, and a timeout here closes the session that every UDP flow through
+    /// the agent depends on.
+    /// </remarks>
     public async Task<AgentProbeReply> ProbeAsync(AgentAddress target, byte samples, CancellationToken ct = default)
     {
         var id = (uint)Random.Shared.Next();
-        var reply = AgentProbeReply.Decode(await RequestAsync(
-            AgentFrameKind.Probe,
-            new AgentProbeRequest(id, samples, target).Encode(),
-            AgentFrameKind.Probed,
-            ct).ConfigureAwait(false));
+        Interlocked.Increment(ref _probing);
+        byte[] answer;
+        try
+        {
+            answer = await RequestAsync(
+                AgentFrameKind.Probe,
+                new AgentProbeRequest(id, samples, target).Encode(),
+                AgentFrameKind.Probed,
+                ct,
+                ProbeTimeout(samples)).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _probing);
+        }
 
+        var reply = AgentProbeReply.Decode(answer);
         if (reply.RequestId != id)
         {
             throw new AgentProtocolException("the agent answered a probe that was not the one asked");
@@ -488,6 +535,13 @@ public sealed class AgentSession : IAsyncDisposable
 
         return reply;
     }
+
+    /// <summary>
+    /// How long a probe of this many samples may take: the agent's connect timeout for each
+    /// sample and the gaps between them, which it clamps to ten, plus the usual allowance.
+    /// </summary>
+    private TimeSpan ProbeTimeout(byte samples) =>
+        TimeSpan.FromSeconds(3.5 * Math.Clamp((int)samples, 1, 10)) + _options.Timeout;
 
     public async Task<AgentStats> StatsAsync(CancellationToken ct = default) =>
         AgentStats.Decode(await RequestAsync(AgentFrameKind.Stats, [], AgentFrameKind.StatsReply, ct)
@@ -500,6 +554,16 @@ public sealed class AgentSession : IAsyncDisposable
             try
             {
                 await Task.Delay(PingInterval, ct).ConfigureAwait(false);
+
+                // An agent that answers its control frames one at a time holds a ping behind a
+                // measurement until the measurement is done, and a ping that waits that long
+                // would time out and take the session with it. The probe's own answer is proof
+                // enough that the agent is there.
+                if (Volatile.Read(ref _probing) > 0)
+                {
+                    continue;
+                }
+
                 await PingAsync(ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -521,15 +585,24 @@ public sealed class AgentSession : IAsyncDisposable
     /// Reserves a channel for one conversation, and says where its answers go.
     /// </summary>
     /// <remarks>
-    /// One channel per (process, destination) pair. The agent keeps a socket per channel, so
-    /// the game's apparent source port at the far end stays put for as long as it is playing.
+    /// The agent keeps a socket per channel, so the game's apparent source port at the far end
+    /// stays put for as long as it is playing. An ordinary channel stands for one destination,
+    /// and the agent drops a datagram on it for any other. A full-cone one — only in a session
+    /// granted <see cref="FullCone"/> — stands for one of our sockets: it may send anywhere, and
+    /// hears from anyone. The handler is given the source of every datagram either way.
     /// </remarks>
-    public ushort OpenChannel(Action<IPEndPoint, ReadOnlyMemory<byte>> onDatagram)
+    /// <param name="fullCone">Open a full-cone channel.</param>
+    public ushort OpenChannel(Action<IPEndPoint, ReadOnlyMemory<byte>> onDatagram, bool fullCone = false)
     {
+        if (fullCone && !FullCone)
+        {
+            throw new AgentProtocolException("this agent session has no full-cone UDP");
+        }
+
         for (var attempt = 0; attempt < 65536; attempt++)
         {
             var id = (ushort)Interlocked.Increment(ref _nextChannel);
-            if (id != 0 && _channels.TryAdd(id, onDatagram))
+            if (id != 0 && _channels.TryAdd(id, new OpenChannelEntry(onDatagram, fullCone)))
             {
                 return id;
             }
@@ -537,6 +610,8 @@ public sealed class AgentSession : IAsyncDisposable
 
         throw new AgentProtocolException("every datagram channel is in use");
     }
+
+    private readonly record struct OpenChannelEntry(Action<IPEndPoint, ReadOnlyMemory<byte>> Handler, bool Cone);
 
     public void CloseChannel(ushort channel) => _channels.TryRemove(channel, out _);
 
@@ -556,8 +631,11 @@ public sealed class AgentSession : IAsyncDisposable
                 $"a {payload.Length}-byte datagram is over the agent's limit of {Welcome.MaxDatagramPayload}");
         }
 
+        // A channel this session never opened, or has closed, goes out as an ordinary one: the
+        // agent decides what a channel is by its first datagram, and only ours can make it cone.
+        var cone = _channels.TryGetValue(channel, out var entry) && entry.Cone;
         var plain = new byte[AgentDatagram.MaxRelayHeaderBytes + payload.Length];
-        var length = AgentDatagram.WriteRelay(plain, channel, target, payload.Span);
+        var length = AgentDatagram.WriteRelay(plain, channel, target, payload.Span, cone);
         var packet = new byte[AgentDatagramCrypto.SealedSize(length)];
         var sealedLength = crypto.Seal(plain.AsSpan(0, length), packet);
         await socket.SendAsync(packet.AsMemory(0, sealedLength), SocketFlags.None, ct).ConfigureAwait(false);
@@ -634,11 +712,11 @@ public sealed class AgentSession : IAsyncDisposable
                     _echo?.TrySetResult(body[1..].ToArray());
                     break;
 
-                case AgentDatagramKind.Relay:
+                case AgentDatagramKind.Relay or AgentDatagramKind.ConeRelay:
                     if (AgentDatagram.TryReadRelay(body, out var channel, out var from, out var payload) &&
-                        from is not null && _channels.TryGetValue(channel, out var handler))
+                        from is not null && _channels.TryGetValue(channel, out var entry))
                     {
-                        handler(from, payload.ToArray());
+                        entry.Handler(from, payload.ToArray());
                     }
 
                     break;

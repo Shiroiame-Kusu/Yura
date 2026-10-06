@@ -10,9 +10,11 @@ public sealed record StartupOptions
 
     public int Height { get; init; } = 800;
 
-    public string Theme { get; init; } = "dark";
+    /// <summary><c>light</c> or <c>dark</c>; null keeps the theme saved in the configuration.</summary>
+    public string? Theme { get; init; }
 
-    public string Language { get; init; } = "en";
+    /// <summary><c>en</c> or <c>zh-Hans</c>; null keeps the language saved in the configuration.</summary>
+    public string? Language { get; init; }
 
     /// <summary>Page to select on launch: processes, games, proxies, …</summary>
     public string Page { get; init; } = "processes";
