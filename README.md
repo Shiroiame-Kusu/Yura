@@ -177,17 +177,30 @@ An agent is Yura's own relay: put it on a machine near the game's servers and se
 leave from there instead of from your own connection, over UDP as well as TCP.
 
 ```bash
+./deploy-agent.sh 203.0.113.10                   # as root over SSH, with your keys
+./deploy-agent.sh 203.0.113.10:2222 'password'   # with a password, on another SSH port
+```
+
+The script builds the agent for the server's architecture as one self-contained file, so the
+server needs no .NET. It copies the file over and runs `yura-agent install` there. That writes a
+hardened systemd unit, starts it, waits until it accepts connections, and prints one connect
+string. Paste that into Yura → Proxies → **Add agent**. The token in it goes to the secret
+store, and the key fingerprint, which identifies the agent in place of a certificate authority,
+goes to the configuration file.
+
+A user other than root works if it has sudo (`ubuntu@203.0.113.10`), and `-i key` takes a key
+file; `./deploy-agent.sh --help` has the rest. Running it again upgrades the agent in place and
+keeps the connect string. By hand, the same thing is:
+
+```bash
 tools/publish-agent.sh linux-x64          # one self-contained file; no .NET on the server
 scp artifacts/yura-agent-linux-x64/yura-agent user@server:
 ssh user@server 'sudo ./yura-agent install'
 ```
 
-`install` writes a hardened systemd unit, starts it, and prints one connect string. Paste that
-into Yura → Proxies → **Add agent**; the token in it goes to the secret store and the key
-fingerprint — which is what identifies the agent, instead of a certificate authority — goes to
-the configuration file.
-
-Then open, in the server's firewall and in your cloud provider's security group:
+The script opens these ports in the server's firewall when ufw or firewalld runs it. A cloud
+provider's security group is outside the server, so open them there yourself, and in the
+server's firewall too if you install by hand:
 
 | Port | For |
 | --- | --- |
