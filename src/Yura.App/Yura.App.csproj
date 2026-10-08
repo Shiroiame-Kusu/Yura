@@ -9,6 +9,9 @@
     <ApplicationIcon></ApplicationIcon>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
     <BuiltInComInteropSupport>false</BuiltInComInteropSupport>
+    <!-- Published as NativeAOT: a native binary that starts without a JIT and needs no .NET
+         runtime installed. Every binding is compiled, so nothing in the UI needs reflection. -->
+    <PublishAot>true</PublishAot>
   </PropertyGroup>
 
   <ItemGroup>
@@ -27,6 +30,10 @@
 
   <ItemGroup>
     <ProjectReference Include="../Yura.Core/Yura.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Yura.Core.Tests" />
   </ItemGroup>
 
 </Project>

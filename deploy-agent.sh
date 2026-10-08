@@ -10,10 +10,12 @@
 #   ./deploy-agent.sh -i oracle.key ubuntu@203.0.113.10  with a key file a cloud provider gave you
 #   ./deploy-agent.sh 203.0.113.10 -- --name tokyo    options for "yura-agent install"
 #
-# Builds the agent for the server's architecture as one self-contained file, so the server needs
-# nothing installed, not even .NET; copies it over; and runs "yura-agent install" there, which
-# writes a hardened systemd unit, starts it, and prints the connect string. Run it again to
-# upgrade: the key and token are kept, so the connect string stays the same.
+# Builds the agent for the server's architecture as one file, so the server needs nothing
+# installed, not even .NET; copies it over; and runs "yura-agent install" there, which writes a
+# hardened systemd unit, starts it, and prints the connect string. Run it again to upgrade: the
+# key and token are kept, so the connect string stays the same. The file is a NativeAOT binary
+# when this machine can build one the server can run, and a self-contained .NET one when the
+# server's glibc is older than the binary needs or its architecture is not this machine's.
 #
 # The user is root unless you name another, or your SSH configuration does. A password is used
 # to log in and, for a user other than root, for sudo. Without one, ssh uses your keys or asks.
@@ -154,9 +156,10 @@ remote() {
 step "Connecting to ${user}@${address}${port:+, port $port}"
 probe="$(remote 'echo "yura-probe $(uname -s) $(uname -m) $(id -u)" \
   "$(command -v systemctl >/dev/null 2>&1 && echo systemd || echo none)" \
-  "$(command -v sudo >/dev/null 2>&1 && echo sudo || echo none)"' | grep '^yura-probe ' | tail -1)" ||
+  "$(command -v sudo >/dev/null 2>&1 && echo sudo || echo none)" \
+  "$(getconf GNU_LIBC_VERSION 2>/dev/null | sed -n "s/^glibc //p")"' | grep '^yura-probe ' | tail -1)" ||
   die "could not log in to ${user}@${address}"
-read -r _ os machine uid init sudo <<< "$probe"
+read -r _ os machine uid init sudo glibc <<< "$probe"
 [[ "$os" == Linux ]] || die "the server runs $os; the agent is built for Linux"
 case "$machine" in
   x86_64 | amd64) rid=linux-x64 ;;
@@ -165,6 +168,7 @@ case "$machine" in
 esac
 [[ "$init" == systemd ]] ||
   die "the server has no systemd, which 'yura-agent install' sets the service up with; copy the agent over and run 'yura-agent run' under whatever starts services there"
+[[ -n "$glibc" ]] || die "the server's C library is not glibc (Alpine's musl, say), and the agent is built for glibc"
 
 as_root=""
 if [[ "$uid" == 0 ]]; then
@@ -178,16 +182,30 @@ elif [[ -n "$password" ]]; then
 else
   as_root="sudo"           # asks, through a terminal
 fi
-printf '    %s %s, %s\n' "$os" "$machine" "$( ((uid == 0)) && echo root || echo "${user}, through sudo")"
+printf '    %s %s, glibc %s, %s\n' "$os" "$machine" "$glibc" "$( ((uid == 0)) && echo root || echo "${user}, through sudo")"
+
+# True when glibc $1 is at least $2.
+glibc_at_least() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]; }
+
+build() {  # [--self-contained]
+  "$ROOT/tools/publish-agent.sh" "$@" "$rid" > "$work/publish.log" 2>&1 || {
+    cat "$work/publish.log" >&2
+    die "the agent did not build"
+  }
+}
 
 step "Building the agent for $rid"
-"$ROOT/tools/publish-agent.sh" "$rid" > "$work/publish.log" 2>&1 || {
-  cat "$work/publish.log" >&2
-  die "the agent did not build"
-}
-binary="$ROOT/artifacts/yura-agent-$rid/yura-agent"
+build
+built="$ROOT/artifacts/yura-agent-$rid"
+# A NativeAOT build is linked against this machine's glibc and records the oldest it runs on.
+if [[ -f "$built/glibc" ]] && ! glibc_at_least "$glibc" "$(cat "$built/glibc")"; then
+  printf '    NativeAOT needs glibc %s and the server has %s; building it self-contained instead\n' "$(cat "$built/glibc")" "$glibc"
+  build --self-contained
+fi
+binary="$built/yura-agent"
 [[ -x "$binary" ]] || die "the build left nothing at $binary"
-printf '    %s (%s)\n' "${binary#"$ROOT"/}" "$(du -h "$binary" | cut -f1)"
+printf '    %s (%s), %s\n' "${binary#"$ROOT"/}" "$(du -h "$binary" | cut -f1)" \
+  "$([[ -f "$built/glibc" ]] && echo "NativeAOT" || echo "self-contained .NET")"
 
 # Runs as root on the server: installs the agent, opens its ports if a firewall there is managed
 # by ufw or firewalld, and removes the copied files whatever happens.

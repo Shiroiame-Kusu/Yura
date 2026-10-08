@@ -25,12 +25,11 @@ public static class IpcProtocol
 {
     public const string DefaultSocketPath = "/run/yura/yura.sock";
 
-    public static readonly JsonSerializerOptions Json = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
-    };
+    /// <summary>
+    /// The protocol's options, for code that can only pass options. Both ends serialize through
+    /// <see cref="IpcJsonContext"/> directly, which is what NativeAOT can compile.
+    /// </summary>
+    public static JsonSerializerOptions Json => IpcJsonContext.Default.Options;
 }
 
 public sealed class IpcRequest
@@ -151,16 +150,16 @@ public sealed class StatusDto
 
     public string? SocketPath { get; init; }
 
-    public List<uint> AllowedUids { get; init; } = [];
+    public List<uint> AllowedUids { get; set; } = [];
 
     /// <summary>Environment checks the daemon ran at startup, each with its outcome.</summary>
-    public List<CheckDto> Checks { get; init; } = [];
+    public List<CheckDto> Checks { get; set; } = [];
 
     /// <summary>Every WireGuard exit the daemon was given, up or not, with what the kernel reports.</summary>
-    public List<TunnelDto> Tunnels { get; init; } = [];
+    public List<TunnelDto> Tunnels { get; set; } = [];
 
     /// <summary>Every Yura agent exit the daemon was given, connected or not.</summary>
-    public List<AgentDto> Agents { get; init; } = [];
+    public List<AgentDto> Agents { get; set; } = [];
 }
 
 /// <summary>
@@ -265,7 +264,7 @@ public sealed class ApplyResultDto
     /// <summary>Why connections that should have been aborted were not.</summary>
     public string? ResetFailure { get; init; }
 
-    public List<string> Warnings { get; init; } = [];
+    public List<string> Warnings { get; set; } = [];
 }
 
 public sealed class ProbeResultDto
@@ -292,7 +291,7 @@ public sealed class MeasureRequestDto
 
     public Guid? ChainId { get; init; }
 
-    public int Samples { get; init; } = 5;
+    public int Samples { get; set; } = 5;
 }
 
 /// <summary>What to test the NAT behaviour of.</summary>
@@ -311,7 +310,7 @@ public sealed class NatTestRequestDto
     /// would rather it were their own third party must be able to say so. Which servers
     /// actually answered comes back in the result.
     /// </remarks>
-    public List<string> Servers { get; init; } = [];
+    public List<string> Servers { get; set; } = [];
 
     /// <summary>
     /// Skip the direct half. Only useful when the direct path cannot reach the servers the
@@ -339,7 +338,7 @@ public sealed class NatReportDto
     public string? Diagnostics { get; init; }
 
     /// <summary>The servers that answered, so a verdict is never credited to a silent one.</summary>
-    public List<string> Servers { get; init; } = [];
+    public List<string> Servers { get; set; } = [];
 
     public double? RoundTripMilliseconds { get; init; }
 
@@ -384,7 +383,7 @@ public sealed class SampleSetDto
 
     public string? FailureReason { get; init; }
 
-    public List<double> RoundTripsMilliseconds { get; init; } = [];
+    public List<double> RoundTripsMilliseconds { get; set; } = [];
 }
 
 // A record rather than a class: the split legs are added after the samples are taken, by the
@@ -508,11 +507,11 @@ public sealed class WireGuardDto
 {
     public required string PeerPublicKey { get; init; }
 
-    public List<string> Addresses { get; init; } = [];
+    public List<string> Addresses { get; set; } = [];
 
-    public List<string> Dns { get; init; } = [];
+    public List<string> Dns { get; set; } = [];
 
-    public List<string> AllowedIps { get; init; } = [];
+    public List<string> AllowedIps { get; set; } = [];
 
     public int? Mtu { get; init; }
 
@@ -565,7 +564,7 @@ public sealed class RuleDto
 
     public required string Name { get; init; }
 
-    public bool Enabled { get; init; } = true;
+    public bool Enabled { get; set; } = true;
 
     public required RuleOrigin Origin { get; init; }
 
@@ -597,11 +596,11 @@ public sealed class RuleDto
     public string? WinePrefix { get; init; }
 
     // -- destination side
-    public List<string> Hosts { get; init; } = [];
+    public List<string> Hosts { get; set; } = [];
 
-    public List<string> Networks { get; init; } = [];
+    public List<string> Networks { get; set; } = [];
 
-    public List<string> Ports { get; init; } = [];
+    public List<string> Ports { get; set; } = [];
 
     public TransportFilter Protocol { get; init; }
 

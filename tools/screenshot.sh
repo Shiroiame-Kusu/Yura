@@ -11,6 +11,9 @@
 #   tools/screenshot.sh --out docs/screenshots/processes-dark.png \
 #                       [--size 1280x800] [--scale 1] [--theme dark] [--lang en] \
 #                       [--page processes] [--demo] [--settle 4]
+#
+# YURA_APP=artifacts/yura-linux-x64/Yura.App captures a published build instead of running the
+# development one.
 
 set -euo pipefail
 
@@ -73,7 +76,15 @@ export DISPLAY=":${DISPLAY_NUM}"
 unset WAYLAND_DISPLAY
 export AVALONIA_GLOBAL_SCALE_FACTOR="$SCALE"
 
-dotnet run --project src/Yura.App/Yura.App.csproj -v q -- \
+# A published binary when YURA_APP names one, such as the NativeAOT build tools/publish.sh makes,
+# so what is captured is what ships; otherwise the development build.
+if [[ -n "${YURA_APP:-}" ]]; then
+  app=("$YURA_APP")
+else
+  app=(dotnet run --project src/Yura.App/Yura.App.csproj -v q --)
+fi
+
+"${app[@]}" \
   --screenshot-mode \
   --width "$WIDTH" --height "$HEIGHT" \
   --theme "$THEME" --lang "$LANG_TAG" --page "$PAGE" $DEMO $DEMO_EDITOR $CONFIG_DIR \

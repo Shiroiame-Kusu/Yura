@@ -82,11 +82,11 @@ public sealed class PersistedWireGuard
 {
     public required string PeerPublicKey { get; init; }
 
-    public List<string> Addresses { get; init; } = [];
+    public List<string> Addresses { get; set; } = [];
 
-    public List<string> DnsServers { get; init; } = [];
+    public List<string> DnsServers { get; set; } = [];
 
-    public List<string> AllowedIps { get; init; } = [];
+    public List<string> AllowedIps { get; set; } = [];
 
     public int? Mtu { get; init; }
 
@@ -124,7 +124,7 @@ public sealed class PersistedChain
 
     public required string Name { get; init; }
 
-    public List<Guid> Hops { get; init; } = [];
+    public List<Guid> Hops { get; set; } = [];
 
     public static PersistedChain From(ProxyChain chain) => new()
     {
@@ -262,14 +262,6 @@ public sealed record ConfigLoadResult(ConfigDocument Document, string? Warning);
 /// </remarks>
 public sealed class ConfigStore
 {
-    private static readonly JsonSerializerOptions Json = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        WriteIndented = true,
-        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
-    };
-
     private readonly SemaphoreSlim _writeGate = new(1, 1);
 
     public ConfigStore(string? directory = null)
@@ -322,7 +314,7 @@ public sealed class ConfigStore
 
         try
         {
-            var document = JsonSerializer.Deserialize<ConfigDocument>(text, Json);
+            var document = JsonSerializer.Deserialize(text, ConfigJsonContext.Default.ConfigDocument);
             if (document is null)
             {
                 throw new JsonException("the file contained no object");
@@ -392,7 +384,7 @@ public sealed class ConfigStore
             TrySetMode(Directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
             var temporary = FilePath + ".tmp";
-            await File.WriteAllTextAsync(temporary, JsonSerializer.Serialize(document, Json), cancellationToken)
+            await File.WriteAllTextAsync(temporary, JsonSerializer.Serialize(document, ConfigJsonContext.Default.ConfigDocument), cancellationToken)
                 .ConfigureAwait(false);
             TrySetMode(temporary, UnixFileMode.UserRead | UnixFileMode.UserWrite);
 
@@ -423,3 +415,35 @@ public sealed class ConfigStore
         }
     }
 }
+
+/// <summary>
+/// The configuration file's format, generated at compile time: NativeAOT has no
+/// reflection-based serialization to fall back on.
+/// </summary>
+/// <remarks>
+/// The same shape the file has always had, indented camelCase with enums as names, so files
+/// written by earlier versions load unchanged. Every enum in the document is listed, because one
+/// left out would be written as a number; a test walks the document's types to make sure.
+///
+/// A member with a default is settable rather than init-only. The generated serializer builds a
+/// type's init-only members in one object initializer and gives any the file leaves out
+/// <c>default</c>, not its initializer's value, so a file from before a list was added would
+/// load with that list null.
+/// </remarks>
+[JsonSourceGenerationOptions(
+    PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    WriteIndented = true,
+    Converters =
+    [
+        typeof(CamelCaseEnumConverter<DescendantPolicy>),
+        typeof(CamelCaseEnumConverter<DnsPolicy>),
+        typeof(CamelCaseEnumConverter<GameSource>),
+        typeof(CamelCaseEnumConverter<ProcessSelectorKind>),
+        typeof(CamelCaseEnumConverter<ProxyProtocol>),
+        typeof(CamelCaseEnumConverter<RuleLifetime>),
+        typeof(CamelCaseEnumConverter<RuleOrigin>),
+        typeof(CamelCaseEnumConverter<TransportFilter>),
+    ])]
+[JsonSerializable(typeof(ConfigDocument))]
+internal sealed partial class ConfigJsonContext : JsonSerializerContext;

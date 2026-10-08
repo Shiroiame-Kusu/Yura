@@ -21,7 +21,9 @@
 
   <PropertyGroup>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
-    <WarningsAsErrors>nullable</WarningsAsErrors>
+    <!-- IL2026 and IL3050 mark code that needs reflection or code generated at run time, which a
+         NativeAOT binary does not have. As warnings they would ship, and fail only when reached. -->
+    <WarningsAsErrors>nullable;IL2026;IL3050</WarningsAsErrors>
     <AnalysisLevel>latest</AnalysisLevel>
   </PropertyGroup>
 

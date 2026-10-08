@@ -33,10 +33,11 @@ public sealed record DaemonLocation(string ExecStart, string Directory, DaemonSo
 
 /// <summary>Finds the daemon binary on this machine.</summary>
 /// <remarks>
-/// The daemon is a framework-dependent .NET build: a <c>yura-daemon.dll</c> next to a
-/// <c>yura-daemon</c> apphost. The unit runs the dll through the dotnet host when one can be
-/// found, which is the form that does not depend on where the apphost thinks the runtime
-/// lives; otherwise the apphost itself.
+/// A published daemon (<c>tools/publish.sh</c>) is one NativeAOT executable with no dll beside
+/// it, and the unit runs it directly. A development build is framework-dependent: a
+/// <c>yura-daemon.dll</c> next to a <c>yura-daemon</c> apphost. The unit runs that dll through
+/// the dotnet host when one can be found, which is the form that does not depend on where the
+/// apphost thinks the runtime lives; otherwise the apphost itself.
 /// </remarks>
 public static class DaemonLocator
 {

@@ -4,16 +4,26 @@ The privileged daemon driven end to end through its real IPC socket, on a contro
 built on a dummy interface.
 
 ```bash
-dotnet build src/Yura.Daemon
+dotnet build src/Yura.Daemon src/Yura.Agent
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
 **137 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
-wireguard-tools 1.0.
+wireguard-tools 1.0: on the development builds, and on the NativeAOT daemon and agent that
+`tools/publish.sh` and `tools/publish-agent.sh` produce.
+
+```bash
+sudo YURA_DAEMON=artifacts/yura-linux-x64/yura-daemon \
+     YURA_AGENT=artifacts/yura-agent-linux-x64/yura-agent tests/acceptance/daemon-acceptance.sh
+```
 
 Nothing in the harness touches nftables, cgroups or policy routing directly. Every kernel
-change is made by `yura-daemon` in response to a rule sent over the Unix socket, which is
-exactly the path the desktop application uses.
+change is made by `yura-daemon` in response to a rule sent over a Unix socket, which is
+exactly the path the desktop application uses. The socket is the suite's own,
+`/run/yura-acceptance/yura.sock`, not the service's: a Yura app left running reconnects to
+`/run/yura/yura.sock` whenever a daemon appears there, and pushes its own proxies and rules.
+Once it did that in the middle of a run, replacing the suite's proxies with the user's real ones
+and removing every rule the suite had applied.
 
 ## How a claim is proved
 

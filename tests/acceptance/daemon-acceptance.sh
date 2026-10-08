@@ -11,15 +11,23 @@
 # over the socket, which is exactly how the desktop app will drive it.
 #
 # Usage:  sudo tests/acceptance/daemon-acceptance.sh [--keep]
-# Build first:  dotnet build src/Yura.Daemon
+# Build first:  dotnet build src/Yura.Daemon src/Yura.Agent
+#
+# YURA_DAEMON and YURA_AGENT name other binaries to test, such as the NativeAOT ones
+# tools/publish.sh and tools/publish-agent.sh make; sudo drops the environment, so pass them as
+#   sudo YURA_DAEMON=… YURA_AGENT=… tests/acceptance/daemon-acceptance.sh
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LIB="${ROOT}/spikes/lib"
 RUN="${ROOT}/tests/acceptance/.run"
-DAEMON="${ROOT}/src/Yura.Daemon/bin/Debug/net10.0/yura-daemon"
-SOCK="/run/yura/yura.sock"
+DAEMON="${YURA_DAEMON:-${ROOT}/src/Yura.Daemon/bin/Debug/net10.0/yura-daemon}"
+# Not the service's socket. The desktop app reconnects to /run/yura/yura.sock whenever a daemon
+# appears there and pushes its own proxies and rules, and it is allowed to: the suite lets the
+# sudo user in. A Yura left running replaced the suite's proxies with the user's real ones in
+# the middle of a run, and removed every rule the suite had applied.
+SOCK="/run/yura-acceptance/yura.sock"
 
 DUMMY_IF="yuraacc0"
 LOCAL_ADDR="198.51.100.1"
@@ -47,7 +55,7 @@ MARK_WG_SOCKS="YURA-VIA-WG-THEN-SOCKS"
 
 # The Yura agent lives in a namespace of its own too, for the same reason: the marker it
 # reaches exists nowhere else, so receiving that marker proves the flow went through it.
-AGENT="${ROOT}/src/Yura.Agent/bin/Debug/net10.0/yura-agent"
+AGENT="${YURA_AGENT:-${ROOT}/src/Yura.Agent/bin/Debug/net10.0/yura-agent}"
 AG_NS="yura-agentns"
 AG_VETH_H="yuraacc3"
 AG_VETH_N="yuraacc4"
@@ -171,6 +179,7 @@ cleanup() {
   "${ROOT}/spikes/kill-orphans.sh" >/dev/null 2>&1
   # Belt and braces: if the daemon did not clean up, do it here so the machine is left tidy.
   nft delete table inet yura 2>/dev/null
+  rm -rf "$(dirname "$SOCK")" 2>/dev/null
   ip rule del priority 7100 2>/dev/null
   ip route flush table 711 2>/dev/null
   ip link del "$DUMMY_IF" 2>/dev/null
@@ -208,13 +217,14 @@ step "Preflight"
 [[ -x "$AGENT" ]] || { echo "agent not built: $AGENT (run: dotnet build src/Yura.Agent)" >&2; exit 1; }
 for t in nft ip python3 setpriv wg; do command -v "$t" >/dev/null || { echo "missing $t" >&2; exit 1; }; done
 if systemctl is-active --quiet yura-daemon 2>/dev/null; then
-  echo "the installed yura-daemon service is running and owns $SOCK; stop it first: sudo systemctl stop yura-daemon" >&2
+  echo "the installed yura-daemon service is running and owns the nftables table, policy routing and cgroups this suite builds; stop it first: sudo systemctl stop yura-daemon" >&2
   exit 1
 fi
 "${ROOT}/spikes/kill-orphans.sh" >/dev/null
 mkdir -p "$RUN"; rm -f "$RUN"/*.jsonl "$RUN"/*.out "$RUN"/*.log "$RUN"/*.pid "$RUN"/*.txt "$RUN"/*.json
 [[ -n "${SUDO_USER:-}" ]] && chown -R "$SUDO_USER" "$RUN"
 info "daemon  $DAEMON"
+info "agent   $AGENT"
 info "run dir $RUN"
 
 step "Isolated test network"

@@ -7,8 +7,10 @@
     <RuntimeIdentifiers>linux-x64;linux-arm64</RuntimeIdentifiers>
     <!-- Nothing here is localised: the agent's only output is an operator's log. -->
     <InvariantGlobalization>true</InvariantGlobalization>
-    <!-- Self-contained and single-file are applied when publishing, not when building, so the
-         test project can reference this one. See tools/publish-agent.sh. -->
+    <!-- Published as NativeAOT: one native file, no .NET needed on the server, and nothing
+         compiled at run time. Building is unaffected, so the test project can still reference
+         this one. See tools/publish-agent.sh. -->
+    <PublishAot>true</PublishAot>
     <ServerGarbageCollection>false</ServerGarbageCollection>
   </PropertyGroup>
 

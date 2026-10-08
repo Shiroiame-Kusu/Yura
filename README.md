@@ -57,7 +57,7 @@ docs/                  architecture notes, verification reports, screenshots
 
 ## Requirements
 
-- .NET 10 SDK
+- .NET 10 SDK, and `clang` to publish the NativeAOT builds
 - Linux with cgroup v2 unified hierarchy and nftables (for the daemon and the spike)
 - `nft`, `ip`, `python3` for the spike
 - `wireguard-tools` (`wg`) and a kernel with the `wireguard` module, for WireGuard exits only;
@@ -79,12 +79,29 @@ dotnet build
 which Microsoft.Testing.Platform rejects. The xunit.v3 projects are self-executing, so
 `test.sh` runs them directly.
 
+The app, the daemon and the agent all publish as **NativeAOT**: native binaries that need no
+.NET installed and compile nothing at run time.
+
+```bash
+tools/publish.sh          # the app and the daemon, side by side, in artifacts/yura-linux-x64/
+tools/publish-agent.sh    # the agent, for a server
+```
+
+A NativeAOT binary is linked against the glibc of the machine that publishes it, and needs at
+least that version wherever it runs; both scripts say which. The app and the daemon are meant
+for the machine they are published on. An agent goes to a server, so `deploy-agent.sh` checks
+the server's glibc, and builds a self-contained .NET agent instead when it is older.
+Nothing the three use needs reflection or runtime code generation: JSON goes through
+source-generated serializers, every binding in the UI is compiled, and the build fails on code
+that would need either (IL2026, IL3050).
+
 ## Run the app
 
 ```bash
 dotnet run --project src/Yura.App
 ```
 
+or the published build, `artifacts/yura-linux-x64/Yura.App`, which takes the same flags.
 Useful flags:
 
 | Flag | Effect |
@@ -139,7 +156,9 @@ it via sudo. On SIGTERM it removes every rule, route, tunnel and cgroup it creat
 and the exact script that will run as root, then asks for your password once through polkit.
 The unit runs the daemon with `ProtectHome=yes`, `ProtectSystem=strict`, `NoNewPrivileges`
 and `HOME` pointed at its tmpfs runtime directory, so it can never write into a home
-directory. Without a polkit agent, the same script is offered to run with sudo:
+directory. Installed from a published build, the service runs the native `yura-daemon`
+directly; from a development build, through the dotnet host. Without a polkit agent, the same
+script is offered to run with sudo:
 
 ```bash
 dotnet run --project src/Yura.App -- --service-report
@@ -181,8 +200,10 @@ leave from there instead of from your own connection, over UDP as well as TCP.
 ./deploy-agent.sh 203.0.113.10:2222 'password'   # with a password, on another SSH port
 ```
 
-The script builds the agent for the server's architecture as one self-contained file, so the
-server needs no .NET. It copies the file over and runs `yura-agent install` there. That writes a
+The script builds the agent for the server's architecture as one NativeAOT file of about 6 MB,
+so the server needs no .NET. When the server's glibc is older than 2.34, or this machine cannot
+link for its architecture, it builds a self-contained .NET agent instead. It copies the file
+over and runs `yura-agent install` there. That writes a
 hardened systemd unit, starts it, waits until it accepts connections, and prints one connect
 string. Paste that into Yura → Proxies → **Add agent**. The token in it goes to the secret
 store, and the key fingerprint, which identifies the agent in place of a certificate authority,
@@ -193,7 +214,7 @@ file; `./deploy-agent.sh --help` has the rest. Running it again upgrades the age
 keeps the connect string. By hand, the same thing is:
 
 ```bash
-tools/publish-agent.sh linux-x64          # one self-contained file; no .NET on the server
+tools/publish-agent.sh linux-x64          # one native file; no .NET on the server
 scp artifacts/yura-agent-linux-x64/yura-agent user@server:
 ssh user@server 'sudo ./yura-agent install'
 ```
@@ -293,7 +314,7 @@ is unreferenced.
   key, a shared token, an AES-GCM datagram channel for UDP, full-cone UDP so a peer-to-peer game
   routed through it has an Open NAT, latency measured from the agent's own vantage point, and
   the resolver it offers used for lookups on that exit. Added by pasting one connect string,
-  deployable as one self-contained file with one command
+  deployable as one native file with one command
 - **NAT type for peer-to-peer games**, measured over the route rather than guessed from the
   machine: STUN through the route the way the forwarder uses it — a marked socket for the direct
   path, a socket or SOCKS5 association per destination for a WireGuard or SOCKS5 exit, and one
@@ -309,7 +330,12 @@ is unreferenced.
 - A systemd service installed from Settings through polkit, with the unit and the script
   shown before anything runs as root, and start / stop / restart / uninstall from the same
   page
-- 410 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+- **NativeAOT** for all three executables: the app, the daemon and the agent publish as native
+  binaries needing no .NET installed, with JSON through source-generated serializers and every
+  binding compiled. The acceptance suite passes 137/137 on the native daemon and agent, every
+  page of the native app renders as the development build does, and switching language in it
+  live updates the UI in place
+- 423 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
   wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and tunnel
   manager, the agent protocol end to end against a real agent — full-cone UDP included — the
   agent's systemd unit, its key and token on disk and who may write them, the connect string,
@@ -318,8 +344,9 @@ is unreferenced.
   socket-abort request's byte layout, socket lookups against the running kernel, the flow
   registry, full-cone routing in the daemon, the rule store and the rule editor, the process
   inspector, the Games page, the proxy, agent and chain editors, the secret store, the daemon
-  client against a stand-in daemon, keeping a restarted daemon in step, the routing-evidence
-  sentences, and the configuration file
+  client against a stand-in daemon, the generated JSON serializers against the reflection-based
+  ones they replaced, the localization binding, the ctl request line, keeping a restarted daemon
+  in step, the routing-evidence sentences, and the configuration file
 - Configuration under `~/.config/Yura`, with passwords and keys in the desktop secret service
   and persistent rules reapplied to the daemon on every connection
 

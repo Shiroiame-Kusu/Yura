@@ -8,6 +8,9 @@
     <!-- The daemon is Linux-only by construction: cgroup v2, nftables and TPROXY have no
          meaningful equivalent elsewhere, so there is nothing to gain from pretending. -->
     <RuntimeIdentifiers>linux-x64;linux-arm64</RuntimeIdentifiers>
+    <!-- Published as NativeAOT: one native file the service runs directly, with no .NET runtime
+         to install for root and nothing compiled at run time. Builds stay ordinary .NET. -->
+    <PublishAot>true</PublishAot>
   </PropertyGroup>
 
   <ItemGroup>

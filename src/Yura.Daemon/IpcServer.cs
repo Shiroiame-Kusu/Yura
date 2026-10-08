@@ -172,7 +172,7 @@ public sealed class IpcServer : IAsyncDisposable
                 IpcResponse response;
                 try
                 {
-                    var request = JsonSerializer.Deserialize<IpcRequest>(line, IpcProtocol.Json)
+                    var request = JsonSerializer.Deserialize(line, IpcJsonContext.Default.IpcRequest)
                                   ?? throw new JsonException("empty request");
                     response = await HandleAsync(request, ct).ConfigureAwait(false);
                 }
@@ -554,7 +554,7 @@ public sealed class IpcServer : IAsyncDisposable
 
     private static async Task WriteAsync(Socket client, IpcResponse response, CancellationToken ct)
     {
-        var json = JsonSerializer.Serialize(response, IpcProtocol.Json) + "\n";
+        var json = JsonSerializer.Serialize(response, IpcJsonContext.Default.IpcResponse) + "\n";
         try
         {
             await client.SendAsync(Encoding.UTF8.GetBytes(json), ct).ConfigureAwait(false);

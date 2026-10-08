@@ -2,6 +2,8 @@
 
   <PropertyGroup>
     <RootNamespace>Yura.Core</RootNamespace>
+    <!-- Linked into three NativeAOT executables, so it is analysed as one would be. -->
+    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
 </Project>

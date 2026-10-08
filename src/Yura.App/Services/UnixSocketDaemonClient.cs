@@ -272,7 +272,7 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
             using var stream = new NetworkStream(socket, ownsSocket: false);
             using var reader = new StreamReader(stream, Encoding.UTF8);
 
-            var json = JsonSerializer.Serialize(request, IpcProtocol.Json) + "\n";
+            var json = JsonSerializer.Serialize(request, IpcJsonContext.Default.IpcRequest) + "\n";
             await socket.SendAsync(Encoding.UTF8.GetBytes(json), cancellationToken).ConfigureAwait(false);
 
             var line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
@@ -282,7 +282,7 @@ public sealed class UnixSocketDaemonClient : IDaemonClient
                 return IpcResponse.Failure("The daemon closed the connection without answering.");
             }
 
-            var response = JsonSerializer.Deserialize<IpcResponse>(line, IpcProtocol.Json)
+            var response = JsonSerializer.Deserialize(line, IpcJsonContext.Default.IpcResponse)
                            ?? IpcResponse.Failure("The daemon sent an empty response.");
             ObserveInstance(response.Instance);
             SetState(response.Ok ? DaemonState.Connected : _state);

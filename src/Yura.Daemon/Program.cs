@@ -349,22 +349,7 @@ internal static class Program
         }
 
         // The body, if given, is merged with the op so callers write only the payload.
-        string requestJson;
-        if (rest.Count > 1)
-        {
-            using var doc = JsonDocument.Parse(rest[1]);
-            var merged = new Dictionary<string, object?> { ["op"] = rest[0] };
-            foreach (var property in doc.RootElement.EnumerateObject())
-            {
-                merged[property.Name] = property.Value.Clone();
-            }
-
-            requestJson = JsonSerializer.Serialize(merged, IpcProtocol.Json);
-        }
-        else
-        {
-            requestJson = JsonSerializer.Serialize(new { op = rest[0] }, IpcProtocol.Json);
-        }
+        var requestJson = ControlRequest(rest[0], rest.Count > 1 ? rest[1] : null);
 
         using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         try
@@ -392,5 +377,44 @@ internal static class Program
         Console.WriteLine(line);
         using var response = JsonDocument.Parse(line);
         return response.RootElement.TryGetProperty("ok", out var ok) && ok.GetBoolean() ? 0 : 1;
+    }
+
+    /// <summary>
+    /// One request line: <c>{"op": …}</c> followed by the body's members, written as they came.
+    /// </summary>
+    /// <remarks>
+    /// Written member by member rather than serialized from a dictionary or an anonymous object,
+    /// neither of which NativeAOT can serialize. A body that names its own <c>op</c> still has the
+    /// last word, as it did when the members were merged into a dictionary.
+    /// </remarks>
+    internal static string ControlRequest(string op, string? body)
+    {
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            writer.WriteStartObject();
+            if (body is null)
+            {
+                writer.WriteString("op", op);
+            }
+            else
+            {
+                using var document = JsonDocument.Parse(body);
+                var properties = document.RootElement.EnumerateObject().ToList();
+                if (!properties.Any(p => p.NameEquals("op")))
+                {
+                    writer.WriteString("op", op);
+                }
+
+                foreach (var property in properties)
+                {
+                    property.WriteTo(writer);
+                }
+            }
+
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(buffer.GetBuffer(), 0, (int)buffer.Length);
     }
 }
