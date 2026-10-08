@@ -39,8 +39,12 @@ public sealed class FlowRegistry
         _lastPruneAt = _time.GetTimestamp();
     }
 
+    /// <summary>Told of every flow added from now on, when it is established and when it ends.</summary>
+    public IFlowObserver? Observer { get; init; }
+
     public void Add(Flow flow)
     {
+        flow.Observer ??= Observer;
         _flows[flow.Id] = flow;
         PruneIfDue();
     }

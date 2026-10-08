@@ -19,6 +19,9 @@ public sealed class ServiceManagerTests
         Assert.Contains("ProtectHome=yes\n", unit);
         Assert.Contains("ProtectSystem=strict\n", unit);
         Assert.Contains("RuntimeDirectory=yura\n", unit);
+        // Where it writes down what it routed, kept across restarts and readable by root only.
+        Assert.Contains("LogsDirectory=yura\n", unit);
+        Assert.Contains("LogsDirectoryMode=0750\n", unit);
         Assert.Contains("Environment=HOME=/run/yura", unit);
         Assert.Contains("NoNewPrivileges=yes\n", unit);
         Assert.Contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n", unit);

@@ -35,6 +35,7 @@ internal static class Program
         var allowedUids = new HashSet<uint> { 0 };
         var verbose = false;
         var noWatcher = false;
+        string? logDirectory = null;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -53,8 +54,11 @@ internal static class Program
                 case "--no-process-events":
                     noWatcher = true;
                     break;
+                case "--log-dir" when i + 1 < args.Length:
+                    logDirectory = args[++i];
+                    break;
                 case "-h" or "--help":
-                    Console.WriteLine("yura-daemon [--socket PATH] [--allow-uid UID]... [--verbose] [--no-process-events]");
+                    Console.WriteLine("yura-daemon [--socket PATH] [--allow-uid UID]... [--log-dir DIR] [--verbose] [--no-process-events]");
                     Console.WriteLine("yura-daemon ctl [--socket PATH] <op> [json]");
                     return 0;
             }
@@ -66,6 +70,13 @@ internal static class Program
         {
             allowedUids.Add(parsedSudoUid);
         }
+
+        // What the daemon did, written down where it survives a restart: the directory given, or
+        // the one systemd made for the service — LogsDirectory=yura puts it in $LOGS_DIRECTORY.
+        logDirectory ??= Environment.GetEnvironmentVariable("LOGS_DIRECTORY")?.Split(':')[0];
+        await using var journal = logDirectory is { Length: > 0 }
+            ? DaemonJournal.Open(logDirectory)
+            : DaemonJournal.Unwritten(DaemonJournal.None.DisabledReason!);
 
         var logBuffer = new LogBuffer();
         void Log(string message)
@@ -80,6 +91,7 @@ internal static class Program
             if (verbose || !noisy)
             {
                 Console.WriteLine(line);
+                journal.Log($"{DateTimeOffset.Now:yyyy-MM-dd} {line}");
             }
         }
 
@@ -112,9 +124,23 @@ internal static class Program
 
         var kernel = ReadTrimmed("/proc/sys/kernel/osrelease");
         Log($"yura-daemon {Version} starting on kernel {kernel}; {probe.StandardOutput.Trim()}");
+        journal.Event("daemon-started", json =>
+        {
+            json.WriteString("version", Version);
+            json.WriteString("kernel", kernel);
+        });
+        Log(journal.Enabled
+            ? $"writing what is routed to {journal.Directory}/{DaemonJournal.EventsFileName}"
+            : $"not writing what is routed to a file: {journal.DisabledReason}");
+        checks.Add(new CheckDto
+        {
+            Name = "What is routed is written to a file",
+            Passed = journal.Enabled,
+            Detail = journal.Enabled ? Path.Combine(journal.Directory!, DaemonJournal.EventsFileName) : journal.DisabledReason,
+        });
 
         var processes = new ProcProcessSource();
-        var cgroups = new CgroupManager(Log, processes);
+        var cgroups = new CgroupManager(Log, processes) { Journal = journal };
 
         // A daemon that died without cleaning up leaves its groups behind with processes still
         // in them, captured by nothing and remembered by nobody. They are released now: the
@@ -127,7 +153,7 @@ internal static class Program
         }
         var nftables = new NftablesManager(commands, Log);
         var routing = new PolicyRouting(commands, Log);
-        var flows = new FlowRegistry();
+        var flows = new FlowRegistry { Observer = journal };
         var ownership = new SocketOwnership();
 
         // WireGuard is optional: a machine without the tool or the module still routes through
@@ -152,7 +178,10 @@ internal static class Program
                 : "UDP through a Yura agent will be refused; TCP is unaffected",
         });
 
-        await using var runtime = new RuleRuntime(cgroups, nftables, wireguard, agents, processes, flows, ownership, Log);
+        await using var runtime = new RuleRuntime(cgroups, nftables, wireguard, agents, processes, flows, ownership, Log)
+        {
+            Journal = journal,
+        };
 
         var routingOk = await routing.InstallAsync().ConfigureAwait(false);
         checks.Add(new CheckDto { Name = "Policy routing installed", Passed = routingOk, Detail = routingOk ? $"fwmark 0x{PolicyRouting.MarkBase:x}/0x{PolicyRouting.MarkMask:x} -> table {PolicyRouting.RoutingTable}" : "see daemon log" });
@@ -220,6 +249,7 @@ internal static class Program
             ProcessWatcherState = () => watcher.IsRunning
                 ? watcher.DroppedEvents == 0 ? "netlink" : $"netlink ({watcher.DroppedEvents} events dropped, recovered by sweep)"
                 : $"polling: {watcher.UnavailableReason ?? "disabled"}",
+            Journal = journal,
         };
 
         var connections = new ConnectionLister(runtime, flows, ownership, processes);
@@ -287,6 +317,27 @@ internal static class Program
             }
         });
 
+        // Every rule that carried anything is summed up every few minutes, so the log says what a
+        // session routed while it is still running, not only once it ends.
+        var traffic = Task.Run(async () =>
+        {
+            while (!shutdown.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(1), shutdown.Token).ConfigureAwait(false);
+                    foreach (var line in journal.ReportTraffic(runtime.Rules, flows.Snapshot()))
+                    {
+                        Log(line);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        });
+
         Log("ready");
         try
         {
@@ -297,11 +348,17 @@ internal static class Program
         }
 
         Log("shutting down");
-        await Task.WhenAll(sweep, eventPump).ConfigureAwait(false);
+        await Task.WhenAll(sweep, eventPump, traffic).ConfigureAwait(false);
         await runtime.TeardownAsync().ConfigureAwait(false);
         await routing.RemoveAsync().ConfigureAwait(false);
         routing.RestoreSysctls();
         Log("clean shutdown: rules, routing, tunnels and cgroups removed");
+        if (journal.Dropped > 0)
+        {
+            Log($"{journal.Dropped} line(s) could not be written to {journal.Directory}");
+        }
+
+        journal.Event("daemon-stopped");
         return 0;
     }
 

@@ -275,6 +275,16 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
 
     public DnsCache Dns { get; } = new();
 
+    /// <summary>Where rule events, placements and resets are written down, beside the log.</summary>
+    public Diagnostics.DaemonJournal Journal { get; init; } = Diagnostics.DaemonJournal.None;
+
+    private string RouteNameOf(RuleAction action) => action switch
+    {
+        RuleAction.Direct => "direct",
+        RuleAction.Block => "block",
+        _ => _state.ResolveRoute(action).RouteName,
+    };
+
     public AgentSessionManager Agents => _agents;
 
     public IReadOnlyList<RoutingRule> Rules => _state.OrderedRules;
@@ -478,6 +488,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         }
 
         Interlocked.Increment(ref _includedOnExec);
+        Journal.ProcessPlaced(pid, Path.GetFileName(executable), CgroupManager.RelativePathFor(group), "at exec");
         return true;
     }
 
@@ -708,6 +719,11 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
                 };
             }
 
+            if (outcome.Succeeded)
+            {
+                Journal.RuleApplied(rule, RouteNameOf(rule.Action), outcome);
+            }
+
             if (!outcome.Succeeded)
             {
                 // Do not keep a rule the kernel refused; the list must describe reality.
@@ -779,13 +795,15 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (!_rules.Remove(ruleId))
+            if (!_rules.Remove(ruleId, out var removed))
             {
                 return new ApplyOutcome { Succeeded = true, ConfirmedAtUtc = DateTimeOffset.UtcNow };
             }
 
             _tree.Remove(ruleId);
-            return await ReconcileAsync(ct).ConfigureAwait(false);
+            var outcome = await ReconcileAsync(ct).ConfigureAwait(false);
+            _log(Journal.RuleRemoved(removed, "removed", _flows.Snapshot()));
+            return outcome;
         }
         finally
         {
@@ -975,6 +993,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
                     _rules.Remove(rule.Id);
                     _tree.Remove(rule.Id);
                     _log($"rule '{rule.Name}' expired: its process instance is gone");
+                    _log(Journal.RuleRemoved(rule, "expired", _flows.Snapshot()));
                     expired++;
                 }
             }
@@ -1013,6 +1032,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             _rules.Remove(rule.Id);
             _tree.Remove(rule.Id);
             _log($"rule '{rule.Name}' expired: pid {pid} exited");
+            _log(Journal.RuleRemoved(rule, "expired", _flows.Snapshot()));
             expired++;
         }
 
@@ -1520,6 +1540,7 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
 
         var ordered = _state.OrderedRules;
         var targets = new List<ResetTarget>();
+        var described = new List<(int, string?, TransportProtocol, IPEndPoint, IPEndPoint)>();
         foreach (var candidate in candidates)
         {
             if (DecideFor(ordered, candidate.Process, candidate.Socket) == candidate.Before)
@@ -1528,6 +1549,9 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             }
 
             targets.Add(new ResetTarget(candidate.Socket.Protocol, candidate.Socket.Local, candidate.Socket.Remote));
+            described.Add((candidate.Process.Identity.Pid, candidate.Process.DisplayName,
+                candidate.Socket.Protocol == ProtocolType.Tcp ? TransportProtocol.Tcp : TransportProtocol.Udp,
+                candidate.Socket.Local, candidate.Socket.Remote));
         }
 
         var outcome = _reset.Destroy(targets);
@@ -1535,6 +1559,11 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         {
             _log($"reset {outcome.Reset} connection(s) so the rule applies to them; " +
                  "the application reconnects on the new route");
+        }
+
+        if (described.Count > 0)
+        {
+            Journal.SocketsReset(described, outcome.Reset, outcome.Failure);
         }
 
         return outcome;
@@ -1765,6 +1794,14 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             }
 
             _tornDown = true;
+
+            // Each rule still in force is accounted for before its listeners go, while the flows
+            // they hold are still open and their bytes can be read.
+            var flows = _flows.Snapshot();
+            foreach (var rule in _rules.Values)
+            {
+                _log(Journal.RuleRemoved(rule, "stopped with the daemon", flows));
+            }
 
             foreach (var listener in _listeners.Values)
             {

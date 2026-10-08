@@ -31,6 +31,9 @@ public sealed record DaemonEnvironment
     public IReadOnlyList<CheckDto> Checks { get; init; } = [];
 
     public Func<string?>? ProcessWatcherState { get; init; }
+
+    /// <summary>Where what is routed is written down; read back by the <c>events</c> operation.</summary>
+    public Diagnostics.DaemonJournal Journal { get; init; } = Diagnostics.DaemonJournal.None;
 }
 
 /// <summary>
@@ -441,6 +444,10 @@ public sealed class IpcServer : IAsyncDisposable
 
             case "log":
                 return new IpcResponse { Ok = true, Log = _logBuffer.Tail(request.Lines ?? 200).ToList() };
+
+            case "events":
+                // The written record, so the desktop user can read it without being root.
+                return new IpcResponse { Ok = true, Log = _environment.Journal.TailEvents(Math.Clamp(request.Lines ?? 200, 1, 5000)).ToList() };
 
             default:
                 return IpcResponse.Failure($"Unknown operation '{request.Op}'.");

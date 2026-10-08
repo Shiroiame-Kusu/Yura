@@ -5,6 +5,14 @@ using Yura.Daemon.Runtime;
 
 namespace Yura.Daemon.Forwarding;
 
+/// <summary>Told when a flow is established and when it ends, once each.</summary>
+public interface IFlowObserver
+{
+    void Opened(Flow flow);
+
+    void Ended(Flow flow);
+}
+
 /// <summary>
 /// One captured connection, from acceptance to close.
 /// </summary>
@@ -19,6 +27,8 @@ public sealed class Flow
     private static long _nextId;
     private long _bytesUp;
     private long _bytesDown;
+    private int _opened;
+    private int _ended;
 
     public Flow(IPEndPoint client, IPEndPoint originalDestination, TransportProtocol protocol, Guid slotRuleId)
     {
@@ -76,6 +86,9 @@ public sealed class Flow
 
     public void Annotate(string note) => Note = note;
 
+    /// <summary>What is told when the flow is established and when it ends. Set by the registry that holds it.</summary>
+    public IFlowObserver? Observer { get; set; }
+
     /// <summary>Bytes from the application towards the destination.</summary>
     public long BytesUp => Interlocked.Read(ref _bytesUp);
 
@@ -102,13 +115,17 @@ public sealed class Flow
     {
         State = ConnectionState.Established;
         Route = route;
+        if (Interlocked.Exchange(ref _opened, 1) == 0)
+        {
+            Observer?.Opened(this);
+        }
     }
 
     public void MarkBlocked()
     {
         State = ConnectionState.Closed;
         Route = RouteObservation.ConfirmedBlocked;
-        ClosedAtUtc ??= DateTimeOffset.UtcNow;
+        End();
     }
 
     public void MarkClosing() => State = ConnectionState.Closing;
@@ -116,7 +133,7 @@ public sealed class Flow
     public void MarkClosed()
     {
         State = ConnectionState.Closed;
-        ClosedAtUtc ??= DateTimeOffset.UtcNow;
+        End();
     }
 
     public void MarkFailed(string reason)
@@ -124,6 +141,21 @@ public sealed class Flow
         State = ConnectionState.Failed;
         Route = RouteObservation.Unknown;
         FailureReason = reason;
+        End();
+    }
+
+    /// <summary>
+    /// The first end wins: its time and its account. A UDP flow can be ended by its idle timer
+    /// and by an error at once, and must not be counted twice.
+    /// </summary>
+    private void End()
+    {
+        if (Interlocked.Exchange(ref _ended, 1) != 0)
+        {
+            return;
+        }
+
         ClosedAtUtc ??= DateTimeOffset.UtcNow;
+        Observer?.Ended(this);
     }
 }

@@ -8,7 +8,7 @@ dotnet build src/Yura.Daemon src/Yura.Agent
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-**141 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
+**147 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
 wireguard-tools 1.0: on the development builds, and on the NativeAOT daemon and agent that
 `tools/publish.sh` and `tools/publish-agent.sh` produce.
 
@@ -210,6 +210,22 @@ Requirement 11 above is unchanged and still asserted: a rule applied *without* a
 reset leaves existing connections where they are, and the Connections view reports them as
 `preExistingPreviousRoute` rather than claiming they are proxied. The two behaviours are
 different answers to the same physical limit, and the suite proves both.
+
+### The record the daemon keeps of what it routed
+
+The flows the daemon relays live in memory for a minute after they end. Whether a game played
+the night before had gone through its route once could not be answered at all, because a reboot
+had taken every record with it. The daemon now writes each one down (`--log-dir`, or
+`/var/log/yura` as a service), and six checks hold that record against what the run itself did:
+
+| Check | Result |
+| --- | --- |
+| Every connection a rule carried is written down | Each with its process, `route: "Proxy A"`, destination and bytes each way; the held connection that carried nothing is there too, with how long it lasted |
+| A removed rule's account is written when it goes | `rule-removed` with its connections, how many were proxied and failed, and its bytes; the same account as a sentence in `daemon.log` |
+| The connections a rule aborted are listed one by one | `yura-resetapp`, its pid, and `10.79.1.1 -> 10.79.1.2:8091`, the held connection |
+| Processes taken into a rule are written down | Moved while running, or placed at exec before they could open a socket |
+| The record can be read without root | `yura-daemon ctl events` as the desktop user returns the last lines |
+| It outlives the daemon | The file runs from `daemon-started` to `daemon-stopped`, and `daemon.log` beside it ends with the clean shutdown |
 
 ## The exclusion race
 

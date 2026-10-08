@@ -255,7 +255,10 @@ step "Daemon"
 # A socket file left by a killed daemon would make the readiness wait below pass
 # instantly and the first request fail with "connection refused".
 rm -f "$SOCK"
-"$DAEMON" --socket "$SOCK" --verbose > "$RUN/daemon.log" 2>&1 & DAEMON_PID=$!
+# The daemon appends to its record across restarts, as a service must; this run starts its own.
+JOURNAL="$RUN/daemon-logs"
+rm -rf "$JOURNAL"
+"$DAEMON" --socket "$SOCK" --verbose --log-dir "$JOURNAL" > "$RUN/daemon.log" 2>&1 & DAEMON_PID=$!
 ready=0
 for _ in $(seq 1 60); do
   if [[ -S "$SOCK" ]] && ctl status >/dev/null 2>&1; then ready=1; break; fi
@@ -1384,6 +1387,61 @@ ctl remove-rule "{\"ruleId\":\"$RULE_RS\"}" > /dev/null
 kill -9 "$RESET_PID" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
+step "The record the daemon keeps of what it routed"
+# The flows live in memory for a minute after they end. Whether last night's game went through
+# its route could not be answered after a reboot, so the daemon writes each one down, and each
+# rule's account, where it outlives the daemon. Checked against what this run just did.
+sleep 1
+check "every connection a rule carried is written down, with its process, route and bytes" bash -c "
+  python3 -c \"
+import json
+ev=[json.loads(l) for l in open('$JOURNAL/events.jsonl')]
+mine=[e for e in ev if e['event']=='flow-ended' and e.get('ruleId')=='$RULE_RS' and e.get('outcome')=='proxied']
+assert len(mine)>=2, f'{len(mine)} ended flows for the rule'
+bad=[e for e in mine if e['route']!='Proxy A' or not e.get('process') or 'bytesUp' not in e or 'bytesDown' not in e]
+assert not bad, bad[0]
+# The held connection carries nothing either way, and is written down all the same, with how long it lasted.
+carried=[e for e in mine if e['bytesUp']>0 and e['bytesDown']>0]
+held=[e for e in mine if e['destination']=='${RS_ADDR}:${RS_HOLD_PORT}' and e['seconds']>=1]
+assert carried and held, (len(carried), len(held))
+print(f\\\"{len(mine)} connection(s) written, e.g. {carried[0]['process']} to {carried[0]['destination']} through {carried[0]['route']}: {carried[0]['bytesUp']} B up, {carried[0]['bytesDown']} B down; the held one for {held[0]['seconds']:.1f} s\\\")\""
+check "a removed rule's account is written when it goes" bash -c "
+  python3 -c \"
+import json
+ev=[json.loads(l) for l in open('$JOURNAL/events.jsonl')]
+r=[e for e in ev if e['event']=='rule-removed' and e['ruleId']=='$RULE_RS']
+assert len(r)==1, r
+r=r[0]
+assert r['reason']=='removed' and r['flows']>=2 and r['proxied']>=2 and r['bytesDown']>0, r
+print(f\\\"'{r['rule']}': {r['flows']} connection(s), {r['proxied']} proxied, {r['failed']} failed, {r['bytesDown']} B received\\\")\" &&
+  grep -q \"rule 'resetapp via proxy A' removed after\" '$JOURNAL/daemon.log' && echo 'and said so in the log'"
+check "the connections a rule aborted are listed one by one" bash -c "
+  python3 -c \"
+import json
+ev=[json.loads(l) for l in open('$JOURNAL/events.jsonl')]
+s=[x for e in ev if e['event']=='sockets-reset' for x in e['sockets'] if x['remote']=='${RS_ADDR}:${RS_HOLD_PORT}']
+assert s, 'no reset socket to the held destination'
+assert s[0]['protocol']=='tcp' and s[0]['pid']==$RESET_PID, s[0]
+print(f\\\"{s[0]['process']} (pid {s[0]['pid']}): {s[0]['local']} -> {s[0]['remote']}\\\")\""
+check "processes taken into a rule are written down, moved or placed at exec" bash -c "
+  python3 -c \"
+import json
+ev=[json.loads(l) for l in open('$JOURNAL/events.jsonl')]
+p=[e for e in ev if e['event']=='process-placed']
+moved=[e for e in p if e['how']=='moved' and e['pid']==$RESET_PID]
+atexec=[e for e in p if e['how']=='at exec']
+assert moved and atexec, (len(moved), len(atexec))
+print(f\\\"{len(p)} placements: the reset app moved into {moved[0]['group']}, {len(atexec)} placed at exec\\\")\""
+check "the record can be read over the socket by the desktop user, without root" bash -c "
+  as_user() { if [[ -n \"\${SUDO_USER:-}\" && \"\$SUDO_USER\" != root ]]; then setpriv --reuid \"\$(id -u \"\$SUDO_USER\")\" --regid \"\$(id -g \"\$SUDO_USER\")\" --init-groups -- \"\$@\"; else \"\$@\"; fi; }
+  as_user '$DAEMON' ctl --socket '$SOCK' events '{\"lines\":5}' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)
+lines=[json.loads(l) for l in r['log']]
+assert len(lines)==5 and all('event' in l and 'time' in l for l in lines), r
+print('last 5: ' + ', '.join(l['event'] for l in lines))\""
+
+# ---------------------------------------------------------------------------
 step "Clean shutdown"
 kill -TERM "$DAEMON_PID"
 for _ in $(seq 1 40); do kill -0 "$DAEMON_PID" 2>/dev/null || break; sleep 0.25; done
@@ -1392,6 +1450,14 @@ check "policy routing removed on shutdown" bash -c "! ip rule show | grep -q 'fw
 check "cgroup subtree removed on shutdown" bash -c "[[ ! -d /sys/fs/cgroup/yura ]] && echo removed"
 check "WireGuard interfaces removed on shutdown" bash -c "! ip -o link show type wireguard | grep -q yura-wg && echo removed"
 check "tunnel policy rules removed on shutdown" bash -c "! ip rule show | grep -q 'fwmark 0x73' && echo removed"
+check "the record outlives the daemon, from its start to its stop" bash -c "
+  python3 -c \"
+import json
+ev=[json.loads(l) for l in open('$JOURNAL/events.jsonl')]
+assert ev[0]['event']=='daemon-started' and ev[-1]['event']=='daemon-stopped', (ev[0]['event'], ev[-1]['event'])
+kinds=sorted({e['event'] for e in ev})
+print(f\\\"{len(ev)} events: {', '.join(kinds)}\\\")\" &&
+  grep -q 'clean shutdown' '$JOURNAL/daemon.log' && echo 'and the log beside it ends with the clean shutdown'"
 DAEMON_PID=""
 
 step "Result"

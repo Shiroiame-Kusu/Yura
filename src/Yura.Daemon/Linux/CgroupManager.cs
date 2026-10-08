@@ -224,6 +224,9 @@ public sealed class CgroupManager
         return Move(groupName, expected.Pid, current.DisplayName);
     }
 
+    /// <summary>Where each placement is written down, beside the log.</summary>
+    public Diagnostics.DaemonJournal Journal { get; set; } = Diagnostics.DaemonJournal.None;
+
     /// <summary>
     /// Moves a process by pid alone. Only for processes the kernel just told us about (a fork
     /// or exec event), where the pid cannot have been reused yet.
@@ -255,6 +258,7 @@ public sealed class CgroupManager
         }
 
         _log($"migrated pid {pid}{(displayName is null ? string.Empty : $" ({displayName})")} into {RelativePathFor(groupName)}");
+        Journal.ProcessPlaced(pid, displayName, RelativePathFor(groupName), "moved");
         return new MigrationResult(MigrationOutcome.Migrated);
     }
 

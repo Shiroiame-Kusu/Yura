@@ -10,7 +10,7 @@ traffic goes there.
 
 > **Status: working end to end.** The privileged daemon routes selected running processes
 > through user-supplied proxies and WireGuard exits, verified by
-> [141 acceptance checks](docs/daemon-acceptance.md) driven through its real IPC socket, and
+> [147 acceptance checks](docs/daemon-acceptance.md) driven through its real IPC socket, and
 > the desktop application drives it and can install it as a systemd service. All eleven
 > mandatory acceptance tests are covered. See [Current state](#current-state) for what is
 > proven and what is not.
@@ -172,6 +172,21 @@ yura-daemon ctl list-rules
 yura-daemon ctl list-connections
 yura-daemon ctl dump-ruleset
 yura-daemon ctl log
+yura-daemon ctl events '{"lines":100}'
+```
+
+**What it routed, written down.** The flows themselves live in memory for a minute after they
+end. So that "did last night's game go through the route?" still has an answer after a
+reboot, the daemon writes `events.jsonl`: one JSON line per connection when it opens and when
+it ends, with process, rule, route, destination, outcome and bytes each way; a line per rule
+applied, and per rule removed with everything it carried; a summary every five minutes for each
+rule carrying traffic; and every process it placed and every connection it reset. Its ordinary
+log goes beside it as `daemon.log`. As a service that is `/var/log/yura`, readable by root;
+`ctl events` reads it back as the desktop user. Run by hand, `--log-dir DIR` says where. Each
+file is moved aside at 16 MB (8 MB for the log), and three old ones are kept.
+
+```bash
+sudo jq -c 'select(.event == "rule-removed")' /var/log/yura/events.jsonl
 ```
 
 ## Acceptance tests
@@ -180,9 +195,9 @@ yura-daemon ctl log
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-141 checks against a controlled network on a dummy interface, where each marker payload is
+147 checks against a controlled network on a dummy interface, where each marker payload is
 reachable only through one specific proxy — or, for a WireGuard exit and a Yura agent, only
-inside a network namespace that the tunnel or the agent is the sole way into. **141 passed, 0
+inside a network namespace that the tunnel or the agent is the sole way into. **147 passed, 0
 failed.** All eleven mandatory acceptance tests are covered, including child exclusion, rule
 precedence in the kernel, and Wine/Proton isolation. See
 [docs/daemon-acceptance.md](docs/daemon-acceptance.md) for the evidence behind each one and for
@@ -299,7 +314,7 @@ is unreferenced.
 - All seven pages: Processes, Games, Connections, Proxies, Rules, Diagnostics, Settings
 - Design system, both themes, both languages, 960×640 to 1280×800, 100–200% scaling —
   see [docs/ux-verification.md](docs/ux-verification.md)
-- **Routing spike passing 12/12** and the **daemon acceptance suite passing 141/141**: a
+- **Routing spike passing 12/12** and the **daemon acceptance suite passing 147/147**: a
   running process migrated into a cgroup live, classified by nftables, captured by TPROXY and
   forwarded to a SOCKS5 proxy, through a WireGuard tunnel, or through a Yura agent — TCP and
   UDP, per instance, with the process still running as its original user
@@ -346,10 +361,10 @@ is unreferenced.
   page
 - **NativeAOT** for all three executables: the app, the daemon and the agent publish as native
   binaries needing no .NET installed, with JSON through source-generated serializers and every
-  binding compiled. The acceptance suite passes 141/141 on the native daemon and agent, every
+  binding compiled. The acceptance suite passes 147/147 on the native daemon and agent, every
   page of the native app renders as the development build does, and switching language in it
   live updates the UI in place
-- 477 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+- 489 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
   wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and tunnel
   manager, the agent protocol end to end against a real agent — full-cone UDP included — the
   agent's systemd unit, its key and token on disk and who may write them, the connect string,
@@ -361,8 +376,8 @@ is unreferenced.
   monitor's arithmetic — what the measurer counts as an answer, the proxy, agent and chain
   editors, the secret store, the daemon client against a stand-in daemon, the generated JSON
   serializers against the reflection-based ones they replaced, the localization binding, the ctl
-  request line, keeping a restarted daemon in step, the routing-evidence sentences, and the
-  configuration file
+  request line, keeping a restarted daemon in step, the routing-evidence sentences, the record
+  the daemon keeps of what it routed, and the configuration file
 - Configuration under `~/.config/Yura`, with passwords and keys in the desktop secret service
   and persistent rules reapplied to the daemon on every connection
 

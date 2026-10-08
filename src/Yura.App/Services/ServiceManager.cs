@@ -151,8 +151,9 @@ public static class DaemonLocator
 /// <remarks>
 /// The hardening is chosen around what the daemon actually touches: nftables and policy
 /// routing over netlink, cgroups under <c>/sys/fs/cgroup</c>, <c>/proc</c>, its runtime
-/// directory, and nothing in anyone's home. <c>HOME</c> is pointed at the runtime directory
-/// so anything the .NET runtime insists on writing lands on tmpfs, never in a user's home.
+/// directory, its log directory, and nothing in anyone's home. <c>HOME</c> is pointed at the
+/// runtime directory so anything the .NET runtime insists on writing lands on tmpfs, never in a
+/// user's home.
 /// </remarks>
 public static class SystemdUnit
 {
@@ -174,7 +175,11 @@ public static class SystemdUnit
         sb.Append("RestartSec=2\n");
         sb.Append("RuntimeDirectory=yura\n");
         sb.Append("RuntimeDirectoryMode=0755\n");
-        sb.Append("# The runtime directory is the only place the daemon may write, and it is tmpfs.\n");
+        sb.Append("# What the daemon routed, kept across restarts: /var/log/yura, readable by root.\n");
+        sb.Append("# The desktop user reads it with: yura-daemon ctl events\n");
+        sb.Append("LogsDirectory=yura\n");
+        sb.Append("LogsDirectoryMode=0750\n");
+        sb.Append("# Besides that, the runtime directory is the only place the daemon may write, and it is tmpfs.\n");
         sb.Append("Environment=HOME=/run/yura DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1\n");
         sb.Append('\n');
         sb.Append("# Hardening. The daemon needs the network, netlink, cgroups and /proc; nothing else.\n");
