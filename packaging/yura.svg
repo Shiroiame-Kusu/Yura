@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>Yura</title>
+  <!-- One path, forking: the program's traffic, one branch through the route (accent), one direct (recessive),
+       as the Games page's chart draws them. -->
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="#1C1F24"/>
+  <rect x="17" y="17" width="222" height="222" rx="51" fill="none" stroke="#2C3139" stroke-width="2"/>
+  <path d="M128 132 C128 104 82 108 82 76" fill="none" stroke="#6B7480" stroke-width="18" stroke-linecap="round"/>
+  <path d="M128 192 L128 132 C128 104 174 108 174 76" fill="none" stroke="#2FA79F" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="82" cy="72" r="13" fill="#6B7480" stroke="#1C1F24" stroke-width="5"/>
+  <circle cx="174" cy="70" r="18" fill="#2FA79F" stroke="#1C1F24" stroke-width="6"/>
+  <circle cx="128" cy="194" r="16" fill="#2FA79F"/>
+</svg>

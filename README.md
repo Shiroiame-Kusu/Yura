@@ -51,8 +51,11 @@ tests/Yura.Daemon.Tests unit tests for the nftables ruleset builder
 tests/Yura.Agent.Tests  end-to-end tests of the agent: real server, real client, real sockets
 tests/acceptance/      the daemon acceptance suite, driven through the real IPC socket
 spikes/                the routing spike: proves running-process routing end to end
-tools/                 screenshot harness, contrast checker, string-table checker
+tools/                 publishing, screenshot harness, contrast checker, string-table checker
+packaging/             the app's icon
 docs/                  architecture notes, verification reports, screenshots
+deploy-agent.sh        installs an agent on a server over SSH
+install-desktop.sh     installs the app with an icon and an application-menu entry
 ```
 
 ## Requirements
@@ -102,6 +105,19 @@ dotnet run --project src/Yura.App
 ```
 
 or the published build, `artifacts/yura-linux-x64/Yura.App`, which takes the same flags.
+
+**In the application menu.** This installs the native build for you alone, with an icon and a
+menu entry, publishing it first if there is none yet:
+
+```bash
+./install-desktop.sh
+```
+
+The app is copied to `~/.local/share/yura/app`, so the entry keeps working whatever happens to the
+checkout; run the script again after a new build to update it, or with `--uninstall` to remove it.
+`--rebuild` publishes afresh first. Nothing in it needs root; the daemon is installed from the app,
+Settings → Service.
+
 Useful flags:
 
 | Flag | Effect |
