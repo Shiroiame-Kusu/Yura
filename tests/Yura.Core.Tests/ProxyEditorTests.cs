@@ -77,12 +77,24 @@ internal sealed class RecordingDaemonClient : IDaemonClient
     public Task<IReadOnlyDictionary<int, int>> GetConnectionCountsAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyDictionary<int, int>>(new Dictionary<int, int>());
 
-    public Task<IReadOnlyList<Connections.ConnectionRecord>> GetConnectionsAsync(int? pid = null, CancellationToken ct = default) =>
-        Task.FromResult<IReadOnlyList<Connections.ConnectionRecord>>([]);
+    /// <summary>What the game's connections look like to the daemon.</summary>
+    public List<ConnectionRecord> Connections { get; } = [];
 
-    public Task<RuleApplyResult> ApplyRuleAsync(
+    /// <remarks>Filtered by owner the way the daemon filters, so a test sees what one process would.</remarks>
+    public Task<IReadOnlyList<ConnectionRecord>> GetConnectionsAsync(int? pid = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ConnectionRecord>>(Connections.Where(c => pid is null || c.OwnerPid == pid).ToList());
+
+    /// <summary>Holds every rule application until completed, so a test can act while one is going in.</summary>
+    public TaskCompletionSource? HoldApply { get; set; }
+
+    public async Task<RuleApplyResult> ApplyRuleAsync(
         RoutingRule rule, bool resetExisting = false, CancellationToken ct = default)
     {
+        if (HoldApply is { } hold)
+        {
+            await hold.Task.WaitAsync(ct);
+        }
+
         Applied.Add((rule, resetExisting));
         if (NextApplyResult.Succeeded)
         {
@@ -90,9 +102,9 @@ internal sealed class RecordingDaemonClient : IDaemonClient
             Installed.Add((rule.Id, rule.Name));
         }
 
-        return Task.FromResult(NextApplyResult.Succeeded
+        return NextApplyResult.Succeeded
             ? NextApplyResult with { ConfirmedAtUtc = DateTimeOffset.UtcNow }
-            : NextApplyResult);
+            : NextApplyResult;
     }
 
     public Task<RuleApplyResult> RemoveRuleAsync(Guid ruleId, CancellationToken ct = default)
@@ -140,8 +152,14 @@ internal sealed class RecordingDaemonClient : IDaemonClient
             await hold.Task.WaitAsync(ct);
         }
 
-        return null;
+        Measured.Add((host, port, proxyId, chainId, samples));
+        return NextMeasurement;
     }
+
+    /// <summary>What each measurement returns; null, as a daemon that failed would.</summary>
+    public MeasurementDto? NextMeasurement { get; set; }
+
+    public List<(string Host, ushort Port, Guid? ProxyId, Guid? ChainId, int Samples)> Measured { get; } = [];
 
     /// <summary>What the next NAT test reports, so a test can drive the comparison.</summary>
     public NatTestResultDto? NextNatResult { get; set; }

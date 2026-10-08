@@ -67,9 +67,12 @@ public sealed record GameProfile
     /// <remarks>
     /// Containment is evidence rather than a guess: a binary under
     /// <c>steamapps/common/&lt;this game&gt;</c> belongs to this game and to nothing else. Windows
-    /// paths from a Wine process are translated first — Proton reports
-    /// <c>Z:\mnt\games\...\game.exe</c> for a game whose files are at <c>/mnt/games/...</c> —
-    /// and the whole remaining path still has to match, so a wrong game cannot be picked up.
+    /// paths from a Wine process are translated first, and the whole remaining path still has to
+    /// match, so a wrong game cannot be picked up. Proton has two drives for the same files:
+    /// <c>Z:</c> is the filesystem root, so <c>Z:\mnt\games\...\game.exe</c> is
+    /// <c>/mnt/games/...</c>; and <c>S:</c> is the Steam library the game is in, so a game runs as
+    /// <c>S:\steamapps\common\&lt;game&gt;\game.exe</c>. Taking every drive for the root, as this
+    /// once did, recognised no Proton game by its own process at all.
     /// </remarks>
     public bool MatchesInstalledPath(string? executablePath)
     {
@@ -78,19 +81,29 @@ public sealed record GameProfile
             return false;
         }
 
-        if (path.Contains('\\', StringComparison.Ordinal))
+        var prefix = directory.EndsWith('/') ? directory : directory + '/';
+        if (!path.Contains('\\', StringComparison.Ordinal))
         {
-            path = path.Replace('\\', '/');
-            // "Z:/mnt/games/..." -> "/mnt/games/...". Any drive letter: Proton maps Z: to the
-            // filesystem root, but a prefix can map others.
-            if (path.Length > 2 && char.IsAsciiLetter(path[0]) && path[1] == ':')
-            {
-                path = path[2..];
-            }
+            return path.StartsWith(prefix, StringComparison.Ordinal);
         }
 
-        var prefix = directory.EndsWith('/') ? directory : directory + '/';
-        return path.StartsWith(prefix, StringComparison.Ordinal);
+        path = path.Replace('\\', '/');
+        if (path.Length < 3 || !char.IsAsciiLetter(path[0]) || path[1] != ':')
+        {
+            return false;
+        }
+
+        // A Windows path is resolved case-insensitively, so it is compared that way.
+        var rest = path[2..];
+        if (char.ToLowerInvariant(path[0]) == 'z')
+        {
+            return rest.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Any other drive is some directory of its own; inside a Steam library, the part of the
+        // install directory from steamapps on is what a path on it has to start with.
+        var library = prefix.IndexOf("/steamapps/", StringComparison.Ordinal);
+        return library >= 0 && rest.StartsWith(prefix[library..], StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>True when a latency comparison can be run.</summary>

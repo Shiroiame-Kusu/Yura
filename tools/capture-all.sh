@@ -24,6 +24,8 @@ shot --out "$OUT/02-processes-light.png" --page processes --theme light
 echo "== populated states (simulated daemon) =="
 shot --out "$OUT/03-games-dark-demo.png"      --page games    --theme dark  --demo
 shot --out "$OUT/04-games-light-demo.png"     --page games    --theme light --demo
+# Tall enough for the whole session monitor: its tiles, both charts, and the table under them.
+shot --out "$OUT/37-games-monitor-dark-demo.png" --page games --theme dark --size 1280x1500 --demo
 shot --out "$OUT/05-proxy-editor-dark-demo.png"  --page proxies --theme dark  --demo
 shot --out "$OUT/06-proxy-editor-light-demo.png" --page proxies --theme light --demo
 

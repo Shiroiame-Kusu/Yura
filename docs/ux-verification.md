@@ -28,7 +28,7 @@ the shell instead, so a page nobody is looking at costs nothing.
 | | |
 | --- | --- |
 | Processes | `01-processes-dark.png`, `02-processes-light.png` |
-| Games | `03-games-dark-demo.png`, `04-games-light-demo.png` |
+| Games | `03-games-dark-demo.png`, `04-games-light-demo.png`; the whole session monitor in `37-games-monitor-dark-demo.png` |
 | Proxies | `05-proxy-editor-dark-demo.png`, `06-proxy-editor-light-demo.png`, `30-proxies-wireguard-dark-demo.png`, `31-proxies-chain-light-demo.png` |
 | Connections | `17-connections-dark-demo.png`, `18-connections-light-demo.png` |
 | Rules | `19-rules-dark-demo.png`, `20-rules-light-demo.png` |

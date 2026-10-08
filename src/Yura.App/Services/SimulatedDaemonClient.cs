@@ -261,8 +261,9 @@ public sealed class SimulatedDaemonClient : IDaemonClient
         {
             Target = $"{host}:{port}",
             Method = "TCP connect",
-            Direct = Set(samples, samples, 84.3, 11.2),
-            Routed = proxyId is null && chainId is null ? null : Set(samples, samples, 46.1, 3.7),
+            // A little variation, so the Games page's live chart moves the way a real one does.
+            Direct = Set(samples, samples, 78 + (Random.Shared.NextDouble() * 16), 11.2),
+            Routed = proxyId is null && chainId is null ? null : Set(samples, samples, 44 + (Random.Shared.NextDouble() * 5), 3.7),
             MeasuredAtUtc = DateTimeOffset.UtcNow,
         };
     }

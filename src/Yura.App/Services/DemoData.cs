@@ -142,7 +142,14 @@ internal static class DemoData
                 SteamAppId = "548430",
                 Source = GameSource.Steam,
             },
-        ]);
+        ],
+        // The demo's own libraries, not this machine's: a capture shows the same games and the same
+        // folders wherever it is taken, and nothing of the machine it was taken on.
+        new SteamScan
+        {
+            Libraries = [new ScannedLibrary("/home/hakuu/.local/share/Steam", 3)],
+            Skipped = [new SkippedLibrary("/mnt/games/SteamLibrary", SkipReason.NotPresent)],
+        });
 
         // The process inspector only exists when something is selected, so a capture of the
         // Processes page without a selection shows an empty panel and proves nothing about
@@ -180,6 +187,20 @@ internal static class DemoData
 
         shell.Games.MeasurementTargetInput = "162.254.192.71:27015";
         shell.Games.EnterSimulatedSession(BoostState.Routing, TimeSpan.FromMinutes(7).Add(TimeSpan.FromSeconds(24)));
+
+        // The session's monitor so far: the route steady near 46 ms, the direct path near 84 ms and
+        // noisier, one short spike on the route, a few of its probes unanswered, and a stretch
+        // where the direct path got worse. Seeded, so screenshots come out the same every time.
+        var random = new Random(7);
+        var now = DateTimeOffset.UtcNow;
+        const int samples = 148;
+        shell.Games.SeedHistory(Enumerable.Range(0, samples).Select(i =>
+        {
+            var at = now - TimeSpan.FromSeconds(3 * (samples - 1 - i));
+            double? routed = i is 71 or 72 or 118 ? null : 44 + (random.NextDouble() * 5) + (i is >= 60 and <= 63 ? 22 : 0);
+            double? direct = 78 + (random.NextDouble() * 16) + (i is >= 100 and <= 108 ? 30 : 0);
+            return new LatencySample(at, routed, direct);
+        }));
         shell.Games.MeasurementTarget = "162.254.192.71:27015";
         shell.Games.MeasurementMethod = "TCP connect";
         shell.Games.LastMeasurementUtc = DateTimeOffset.UtcNow;

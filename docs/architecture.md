@@ -353,6 +353,7 @@ Several types exist specifically to stop the UI asserting more than is known:
 | `CapabilityState` | Inferring UDP support from the protocol instead of measuring it |
 | `Metric.Value` (nullable) | Rendering an unmeasured figure as `0`, which reads as a perfect score |
 | `MeasurementDto.RouteAnswersBeforeConnecting` | Timing a route through a proxy that reports a connection made before it dials — mihomo does — which puts the loopback hop on the chart as the route's latency |
+| `BoostHistory` counting loss from the first answer | Charting 100 % loss through the route for a target that never answers probes at all |
 | `ProcessSnapshot.ConnectionCount` (nullable) | `0` meaning both "none" and "unknown" |
 
 ## Known trade-offs

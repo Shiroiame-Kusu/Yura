@@ -5,6 +5,7 @@
              xmlns:vm="using:Yura.App.ViewModels"
              xmlns:loc="using:Yura.App.Localization"
              xmlns:icons="using:FluentIcons.Avalonia"
+             xmlns:views="using:Yura.App.Views"
              mc:Ignorable="d"
              x:Class="Yura.App.Views.GamesPage"
              x:DataType="vm:GamesPageViewModel">
@@ -105,11 +106,14 @@
           </StackPanel>
         </Border>
         <TextBlock Classes="FieldHint" Text="{Binding RoutingEvidence}" TextWrapping="Wrap"
-                   IsVisible="{Binding !RoutingEvidenceIsWarning}" />
+                   IsVisible="{Binding ShowRoutingEvidenceHint}" />
 
         <!-- Why Start is unavailable, stated beside the control. -->
         <TextBlock Classes="FieldHint" Text="{Binding StartBlockedReason}"
                    IsVisible="{Binding StartBlockedReason, Converter={x:Static ObjectConverters.IsNotNull}}" />
+        <!-- Starting before the game is the expected order, so it is said, not blocked. -->
+        <TextBlock Classes="FieldHint" Text="{Binding StartHint}" TextWrapping="Wrap"
+                   IsVisible="{Binding StartHint, Converter={x:Static ObjectConverters.IsNotNull}}" />
 
         <!-- A route that cannot carry UDP is a functional limitation for a game, so it is
              a banner and not a footnote. -->
@@ -161,6 +165,95 @@
               <TextBlock Classes="Metric" Text="{Binding LastMeasurementDisplay}" />
             </StackPanel>
           </Grid>
+        </Border>
+
+        <!-- ============== Latency and packet loss, over the session ==============
+             The session's own measurements, every few seconds for as long as the game is routed:
+             the headline figures first, then the two charts on one time axis, then the same
+             figures as a table, so no value is reachable only by hovering. -->
+        <Border Classes="Panel" Padding="16" IsVisible="{Binding ShowMonitor}">
+          <StackPanel Spacing="12">
+            <StackPanel Spacing="2">
+              <TextBlock Classes="SectionTitle" Text="{loc:Tr Games.Monitor.Title}" />
+              <TextBlock Classes="FieldHint" Text="{loc:Tr Games.Monitor.Hint}" TextWrapping="Wrap" />
+            </StackPanel>
+
+            <Grid ColumnDefinitions="*,*,*,*" ColumnSpacing="20">
+              <StackPanel Grid.Column="0" Spacing="2">
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Games.Monitor.Now}" />
+                <TextBlock Classes="Metric" Text="{Binding MonitorNowDisplay}" />
+                <TextBlock Classes="Caption" Text="{Binding MonitorNowDirect}" />
+              </StackPanel>
+              <StackPanel Grid.Column="1" Spacing="2">
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Games.Monitor.Average}" />
+                <TextBlock Classes="Metric" Text="{Binding MonitorAverageDisplay}" />
+                <TextBlock Classes="Caption" Text="{Binding MonitorAverageDirect}" />
+              </StackPanel>
+              <StackPanel Grid.Column="2" Spacing="2">
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Games.Jitter}" />
+                <TextBlock Classes="Metric" Text="{Binding MonitorJitterDisplay}" />
+                <TextBlock Classes="Caption" Text="{Binding MonitorJitterDirect}" />
+              </StackPanel>
+              <StackPanel Grid.Column="3" Spacing="2">
+                <TextBlock Classes="FieldLabel" Text="{loc:Tr Games.Monitor.LossRecent}" />
+                <!-- Loss is bad news: said with an icon beside the figure, not with colour alone. -->
+                <StackPanel Orientation="Horizontal" Spacing="6">
+                  <icons:SymbolIcon Symbol="Warning" FontSize="16" VerticalAlignment="Center"
+                                    Foreground="{DynamicResource YuraWarning}"
+                                    IsVisible="{Binding MonitorLossIsWarning}" />
+                  <TextBlock Classes="Metric" Text="{Binding MonitorLossDisplay}" />
+                </StackPanel>
+                <TextBlock Classes="Caption" Text="{Binding MonitorLossDirect}" />
+              </StackPanel>
+            </Grid>
+
+            <TextBlock Classes="FieldHint" Text="{Binding MonitorStatus}" TextWrapping="Wrap"
+                       IsVisible="{Binding HasMonitorStatus}" />
+
+            <views:BoostChart Height="280" HorizontalAlignment="Stretch"
+                              History="{Binding History}" Version="{Binding HistoryVersion}"
+                              IsVisible="{Binding HasHistory}"
+                              RouteBrush="{DynamicResource YuraChartRoute}"
+                              ContextBrush="{DynamicResource YuraChartContext}"
+                              LossBrush="{DynamicResource YuraChartLoss}"
+                              GridBrush="{DynamicResource YuraChartGrid}"
+                              TextBrush="{DynamicResource YuraTextPrimary}"
+                              MutedTextBrush="{DynamicResource YuraTextTertiary}"
+                              SurfaceBrush="{DynamicResource YuraSurfaceRaised}"
+                              TipBackground="{DynamicResource YuraSurfaceOverlay}"
+                              TipBorderBrush="{DynamicResource YuraBorderStrong}"
+                              RouteLabel="{Binding MonitorRouteLabel}"
+                              DirectLabel="{loc:Tr Games.Direct}"
+                              LatencyTitle="{loc:Tr Games.Latency}"
+                              LossTitle="{loc:Tr Games.Loss}"
+                              NoAnswerLabel="{loc:Tr Games.Monitor.NoAnswer}"
+                              RouteMissingLabel="{Binding MonitorRouteMissingLabel}"
+                              AutomationProperties.Name="{Binding MonitorSummary}" />
+
+            <TextBlock Classes="Caption" Text="{Binding MonitorTargetDisplay}" TextWrapping="Wrap"
+                       IsVisible="{Binding MonitorTargetDisplay, Converter={x:Static ObjectConverters.IsNotNull}}" />
+
+            <Expander Header="{loc:Tr Games.Monitor.Table}" IsVisible="{Binding HasHistory}">
+              <StackPanel Spacing="4">
+                <Grid ColumnDefinitions="110,180,180">
+                  <TextBlock Grid.Column="0" Classes="FieldLabel" Text="{loc:Tr Games.Monitor.Time}" />
+                  <TextBlock Grid.Column="1" Classes="FieldLabel" Text="{Binding MonitorRouteLabel}" />
+                  <TextBlock Grid.Column="2" Classes="FieldLabel" Text="{loc:Tr Games.Direct}" />
+                </Grid>
+                <ItemsControl ItemsSource="{Binding RecentSamples}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="vm:BoostSampleRow">
+                      <Grid ColumnDefinitions="110,180,180">
+                        <TextBlock Grid.Column="0" Classes="Mono Tertiary" Text="{Binding Time}" />
+                        <TextBlock Grid.Column="1" Classes="Mono" Text="{Binding Route}" />
+                        <TextBlock Grid.Column="2" Classes="Mono Tertiary" Text="{Binding Direct}" />
+                      </Grid>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </StackPanel>
+            </Expander>
+          </StackPanel>
         </Border>
 
         <!-- ============== Direct vs routed, same units, same target ==============

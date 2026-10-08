@@ -6,6 +6,7 @@ using CommunityToolkit.Mvvm.Input;
 using Yura.App.Localization;
 using Yura.App.Services;
 using System.Net;
+using System.Net.Sockets;
 using Yura.Core.Connections;
 using Yura.Core.Games;
 using Yura.Core.Ipc;
@@ -141,6 +142,38 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     private CancellationTokenSource? _measuring;
     private bool _runningRefreshInFlight;
 
+    // The session's monitor: the target probed once each way, every few seconds, for the chart.
+    private readonly DispatcherTimer _sampleTimer;
+    private CancellationTokenSource? _sampling;
+    private bool _sampleInFlight;
+    private bool _arrivalInFlight;
+
+    /// <summary>
+    /// What the monitor measures when no target was typed: the server the game is talking to
+    /// most, through the route.
+    /// </summary>
+    private IPEndPoint? _autoTarget;
+
+    /// <summary>
+    /// Every process that is the game: whatever matches its profile, and everything those started.
+    /// </summary>
+    /// <remarks>
+    /// Its connections are in one of them, and rarely the one that matched first. Steam starts a
+    /// game through a wrapper that never opens a socket, and Proton runs it as a tree of Wine
+    /// processes. Reading the wrapper's connections alone, the page reported that nothing from the
+    /// game was captured, and drew no chart, however much of its traffic the route was carrying.
+    /// </remarks>
+    private IReadOnlySet<int> _gamePids = new HashSet<int>();
+
+    /// <summary>
+    /// The game's process when the session started, if the game was already running: the
+    /// sockets it had opened by then are on their old route, and the reset can only move some.
+    /// </summary>
+    private ProcessIdentity? _runningAtStart;
+
+    /// <summary>How often the monitor probes the target while a session routes the game.</summary>
+    public static readonly TimeSpan SampleInterval = TimeSpan.FromSeconds(3);
+
     public GamesPageViewModel(RuleStore rules, IDaemonClient daemon, ProcProcessSource processes)
     {
         _rules = rules;
@@ -159,6 +192,9 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             _ = RefreshRunningInBackgroundAsync();
             _ = RefreshEvidenceAsync();
         };
+
+        _sampleTimer = new DispatcherTimer { Interval = SampleInterval };
+        _sampleTimer.Tick += (_, _) => _ = SampleAsync();
     }
 
     public ObservableCollection<GameRowViewModel> Games { get; } = [];
@@ -228,7 +264,11 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
 
     partial void OnIsMeasuringChanged(bool value) => OnPropertyChanged(nameof(CanMeasure));
 
-    partial void OnMeasurementTargetInputChanged(string value) => OnPropertyChanged(nameof(CanMeasure));
+    partial void OnMeasurementTargetInputChanged(string value)
+    {
+        OnPropertyChanged(nameof(CanMeasure));
+        RaiseMonitor();
+    }
 
     /// <summary>Shown next to a disabled Start button, so the reason needs no hovering.</summary>
     public string? StartBlockedReason
@@ -250,14 +290,19 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
                 return _daemon.UnavailableReason;
             }
 
-            if (!SelectedGame.Profile.IsRoutable && SelectedGame.Running is null)
-            {
-                return Loc.Current["Games.StartItFirst"];
-            }
-
             return null;
         }
     }
+
+    /// <summary>
+    /// Said under the controls before a boost: when the game is not running, that starting the
+    /// boost first is the expected order, not a mistake to be blocked; when it is, what a boost
+    /// can and cannot move of what it already has open.
+    /// </summary>
+    public string? StartHint => IsRunning || StartBlockedReason is not null || SelectedGame is not { } game
+        ? null
+        : string.Format(CultureInfo.CurrentCulture,
+            Loc.Current[game.Running is null ? "Games.StartBeforeGame" : "Games.StartWhileRunning"], game.Name);
 
     // -- discovery -------------------------------------------------------------
 
@@ -269,14 +314,15 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     /// the measurement target. Discovery contributes the facts it owns: the name Steam uses
     /// and where the game is installed, both of which can change under a saved profile.
     /// </remarks>
-    public void LoadProfiles(IEnumerable<GameProfile> saved)
+    /// <param name="scan">The Steam libraries, or null to read this machine's; tests pass their own.</param>
+    public void LoadProfiles(IEnumerable<GameProfile> saved, SteamScan? scan = null)
     {
         foreach (var profile in saved)
         {
             _rows[profile.Id] = new GameRowViewModel(profile);
         }
 
-        Merge(SteamLibrary.Scan());
+        Merge(scan ?? SteamLibrary.Scan());
         Rebuild();
         RefreshRunning();
     }
@@ -486,22 +532,19 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         }
     }
 
-    private void ApplyRunning(IReadOnlyList<ProcessSnapshot> snapshot)
+    internal void ApplyRunning(IReadOnlyList<ProcessSnapshot> snapshot)
     {
         var changed = false;
 
         foreach (var row in _rows.Values)
         {
             var profile = row.Profile;
-            var match = snapshot.FirstOrDefault(p =>
-                (profile.WineTargetExecutable is { Length: > 0 } wine &&
-                 string.Equals(p.Wine?.TargetExecutable, wine, StringComparison.OrdinalIgnoreCase)) ||
-                (profile.ExecutablePath is { Length: > 0 } path &&
-                 string.Equals(p.ExecutablePath, path, StringComparison.Ordinal)) ||
-                (profile.SteamAppId is { Length: > 0 } appId &&
-                 string.Equals(p.SteamAppId, appId, StringComparison.Ordinal)) ||
-                profile.MatchesInstalledPath(p.ExecutablePath) ||
-                profile.MatchesInstalledPath(p.Wine?.TargetExecutable));
+            var match = snapshot
+                .Select(p => (Process: p, Rank: MatchRank(profile, p)))
+                .Where(m => m.Rank > 0)
+                .OrderByDescending(m => m.Rank)
+                .Select(m => m.Process)
+                .FirstOrDefault();
 
             // By identity: every read makes new snapshot objects, so comparing references
             // re-raised every running game's row on every tick whether or not anything changed.
@@ -516,20 +559,122 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         {
             OnPropertyChanged(nameof(CanStart));
             OnPropertyChanged(nameof(StartBlockedReason));
+            OnPropertyChanged(nameof(StartHint));
             OnPropertyChanged(nameof(CanLaunch));
         }
 
-        // A session that was waiting for its game now has one, and vice versa.
+        // A session that was waiting for its game now has one, and vice versa. One that was started
+        // before anything about the game was known gets its rule now, from the process itself.
         var game = _sessionGame ?? SelectedGame;
-        if (State == BoostState.WaitingForGame && game?.Running is not null)
+        _gamePids = game is null ? new HashSet<int>() : GamePids(game.Profile, snapshot);
+        LearnWhileRouting(game);
+        if (State == BoostState.WaitingForGame && game?.Running is { } process)
         {
-            State = BoostState.Routing;
+            if (NeedsRuleFor(process))
+            {
+                _ = RouteArrivedGameAsync(game, process);
+            }
+            else
+            {
+                State = BoostState.Routing;
+            }
         }
         else if (State == BoostState.Routing && game?.Running is null)
         {
             State = BoostState.WaitingForGame;
         }
     }
+
+    /// <summary>
+    /// How surely <paramref name="process"/> is the game's own: 0 when it is not the game's at all,
+    /// higher for more specific evidence.
+    /// </summary>
+    /// <remarks>
+    /// Several processes match one game. Steam's launch wrapper and every runtime process under it
+    /// carry the game's app id; a native game's own binary, inside its folder, outranks them. A
+    /// Proton game is different: the wrapper's command line names the game's .exe, so the wrapper
+    /// is recognised by it as surely as the Wine process running it — and, being the root of the
+    /// tree, it is the better process to route, since everything else descends from it. Either
+    /// way the page does not rely on this one process for anything but a rule: the evidence and
+    /// the monitor read the whole tree, <see cref="GamePids"/>. The executable path of a Wine game
+    /// is the runtime's, shared by every game on that runtime, so such a game is recognised by its
+    /// Windows executable alone, as the daemon matches it.
+    /// </remarks>
+    internal static int MatchRank(GameProfile profile, ProcessSnapshot process)
+    {
+        var exact = profile.WineTargetExecutable is { Length: > 0 } wine
+            ? string.Equals(process.Wine?.TargetExecutable, wine, StringComparison.OrdinalIgnoreCase)
+            : profile.ExecutablePath is { Length: > 0 } path &&
+              string.Equals(process.ExecutablePath, path, StringComparison.Ordinal);
+        if (exact)
+        {
+            return 3;
+        }
+
+        if (profile.MatchesInstalledPath(process.Wine?.TargetExecutable) ||
+            profile.MatchesInstalledPath(process.ExecutablePath))
+        {
+            return 2;
+        }
+
+        return profile.SteamAppId is { Length: > 0 } appId &&
+               string.Equals(process.SteamAppId, appId, StringComparison.Ordinal)
+            ? 1
+            : 0;
+    }
+
+    /// <summary>Every process of the game in <paramref name="snapshot"/>; see <see cref="_gamePids"/>.</summary>
+    internal static HashSet<int> GamePids(GameProfile profile, IReadOnlyList<ProcessSnapshot> snapshot)
+    {
+        var pids = snapshot.Where(p => MatchRank(profile, p) > 0).Select(p => p.Identity.Pid).ToHashSet();
+        var children = snapshot.ToLookup(p => p.ParentPid);
+        var pending = new Stack<int>(pids);
+        while (pending.TryPop(out var parent))
+        {
+            foreach (var child in children[parent])
+            {
+                if (pids.Add(child.Identity.Pid))
+                {
+                    pending.Push(child.Identity.Pid);
+                }
+            }
+        }
+
+        return pids;
+    }
+
+    /// <summary>
+    /// Remembers what a game routed by process turned out to be, once its own binary is running.
+    /// </summary>
+    /// <remarks>
+    /// A game launched through Steam is usually found first by its wrapper, a couple of seconds
+    /// before the game itself starts, and routed by process from there — which covers the game
+    /// too, since it runs under the wrapper. What is learned when the game appears changes nothing
+    /// about this run; it is what lets the next boost have its rule in place before the game's
+    /// first connection.
+    /// </remarks>
+    private void LearnWhileRouting(GameRowViewModel? game)
+    {
+        if (State is not (BoostState.Routing or BoostState.Degraded) ||
+            _sessionRule is not { Process.Kind: ProcessSelectorKind.Instance } ||
+            game is not { Running: { } running } || game.Profile.IsRoutable ||
+            LearnSelector(game.Profile, running).Learned is not { } learned)
+        {
+            return;
+        }
+
+        game.Update(learned, running);
+        ProfilesChanged?.Invoke(this, EventArgs.Empty);
+        StatusMessage = string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Learned"], game.Name);
+    }
+
+    /// <summary>
+    /// Whether a game that just appeared still has to be given a rule: the session has none yet,
+    /// or it has one for an earlier run of the game that matched by process.
+    /// </summary>
+    private bool NeedsRuleFor(ProcessSnapshot process) =>
+        _sessionRule is not { } rule ||
+        (rule.Process.Kind == ProcessSelectorKind.Instance && rule.Process.Identity != process.Identity);
 
     // -- evidence -------------------------------------------------------------
 
@@ -553,12 +698,26 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
 
     public bool HasRoutingEvidence => RoutingEvidence is not null;
 
+    /// <summary>
+    /// The evidence as a quiet line, when there is some and it is not a warning. Shown whenever
+    /// it was not a warning, it left an empty line above the session for as long as there was none.
+    /// </summary>
+    public bool ShowRoutingEvidenceHint => RoutingEvidence is not null && !RoutingEvidenceIsWarning;
+
+    partial void OnRoutingEvidenceChanged(string? value)
+    {
+        OnPropertyChanged(nameof(HasRoutingEvidence));
+        OnPropertyChanged(nameof(ShowRoutingEvidenceHint));
+    }
+
+    partial void OnRoutingEvidenceIsWarningChanged(bool value) => OnPropertyChanged(nameof(ShowRoutingEvidenceHint));
+
     private DateTimeOffset? _routingSince;
     private bool _evidenceInFlight;
 
-    private async Task RefreshEvidenceAsync()
+    internal async Task RefreshEvidenceAsync()
     {
-        if (_evidenceInFlight || (_sessionGame ?? SelectedGame)?.Running is not { } process || !IsRunning ||
+        if (_evidenceInFlight || (_sessionGame ?? SelectedGame)?.Running is null || !IsRunning ||
             _daemon.State != DaemonState.Connected)
         {
             return;
@@ -567,8 +726,11 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         _evidenceInFlight = true;
         try
         {
-            var rows = await _daemon.GetConnectionsAsync(process.Identity.Pid).ConfigureAwait(true);
+            // Every connection, then the game's: they can be in any process of its tree. Listing
+            // them all takes the daemon a few milliseconds.
+            var rows = GameRows(await _daemon.GetConnectionsAsync().ConfigureAwait(true), _gamePids, _sessionRule?.Id);
             Describe(rows);
+            UpdateAutoTarget(rows);
         }
         finally
         {
@@ -576,12 +738,23 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>
+    /// The connections of the game's processes, and any the session's rule decided whatever
+    /// process they are now put down to.
+    /// </summary>
+    internal static List<ConnectionRecord> GameRows(
+        IReadOnlyList<ConnectionRecord> rows, IReadOnlySet<int> gamePids, Guid? sessionRuleId) => rows
+        .Where(r => (r.OwnerPid is { } pid && gamePids.Contains(pid)) ||
+                    (sessionRuleId is { } id && r.MatchedRuleId == id))
+        .ToList();
+
     /// <summary>Turns the daemon's per-connection account into one sentence, or two.</summary>
     private void Describe(IReadOnlyList<ConnectionRecord> rows)
     {
         _routingSince ??= DateTimeOffset.UtcNow;
         var patient = DateTimeOffset.UtcNow - _routingSince.Value > TimeSpan.FromSeconds(15);
-        var (text, warning) = Summarise(rows, RouteName, patient);
+        var wasRunning = _runningAtStart is { } atStart && _gamePids.Contains(atStart.Pid);
+        var (text, warning) = Summarise(rows, RouteName, patient, wasRunning);
         RoutingEvidence = text;
         RoutingEvidenceIsWarning = warning;
         OnPropertyChanged(nameof(HasRoutingEvidence));
@@ -597,7 +770,22 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     /// are each a different thing to go and fix.
     /// </remarks>
     /// <param name="patient">True once enough time has passed that silence is worth reporting.</param>
+    /// <param name="gameWasRunning">
+    /// The game was already running when the session started. Some of its traffic is then on its
+    /// old route whatever the rows say: a socket that is not connected to one address — which is
+    /// how games commonly send their play — can be neither captured nor reset, and it appears in
+    /// no row with a destination, so the only honest thing is to say so and how to fix it.
+    /// </param>
     public static (string? Text, bool IsWarning) Summarise(
+        IReadOnlyList<ConnectionRecord> rows, string routeName, bool patient, bool gameWasRunning = false)
+    {
+        var (text, warning) = SummariseRows(rows, routeName, patient);
+        return gameWasRunning
+            ? (string.Join(" ", new[] { text, Loc.Current["Games.Evidence.StartedWhileRunning"] }.OfType<string>()), true)
+            : (text, warning);
+    }
+
+    private static (string? Text, bool IsWarning) SummariseRows(
         IReadOnlyList<ConnectionRecord> rows, string routeName, bool patient)
     {
         var routed = rows.Count(r => r.Route == RouteObservation.ConfirmedProxied);
@@ -771,6 +959,8 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         // game's numbers under another's name.
         ClearMeasurements();
         ClearNat();
+        ClearHistory();
+        OnPropertyChanged(nameof(StartHint));
 
         if (value is null)
         {
@@ -797,6 +987,8 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(IsDegraded));
         OnPropertyChanged(nameof(IsFailed));
         OnPropertyChanged(nameof(IsTransitioning));
+        OnPropertyChanged(nameof(StartHint));
+        UpdateSampler();
     }
 
     private void ClearMeasurements()
@@ -963,6 +1155,365 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(LastMeasurementDisplay));
         OnPropertyChanged(nameof(MeasurementTargetDisplay));
         OnPropertyChanged(nameof(MeasurementMethodDisplay));
+    }
+
+    // -- the session's monitor ------------------------------------------------
+
+    /// <summary>The session's samples, which the chart draws.</summary>
+    public BoostHistory History { get; } = new();
+
+    /// <summary>Changes with every sample, which is what makes the chart redraw.</summary>
+    [ObservableProperty]
+    public partial int HistoryVersion { get; set; }
+
+    private DateTimeOffset? _sessionEndedAt;
+
+    /// <summary>
+    /// The route's proxy reports connections made before it makes them, so the route has no
+    /// figure: the daemon found out on this session's first sample.
+    /// </summary>
+    private bool _routeAnswersEarly;
+
+    public bool HasHistory => !History.IsEmpty;
+
+    /// <summary>The monitor's card shows for the whole session, and afterwards until another starts.</summary>
+    public bool ShowMonitor => IsRunning || HasHistory;
+
+    public string MonitorRouteLabel => string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Monitor.Through"], RouteName);
+
+    public string MonitorNowDisplay => History.Latest is not { } latest
+        ? Loc.Current["Common.NotMeasured"]
+        : RouteMilliseconds(latest.RoutedMilliseconds);
+
+    public string MonitorNowDirect => Direct(History.Latest is { } latest ? Milliseconds(latest.DirectMilliseconds) : null);
+
+    public string MonitorAverageDisplay => History.IsEmpty ? Loc.Current["Common.NotMeasured"] : RouteMilliseconds(History.RouteAverage);
+
+    public string MonitorAverageDirect => Direct(History.IsEmpty ? null : Milliseconds(History.DirectAverage));
+
+    public string MonitorJitterDisplay => Jitter(History.RouteJitter, History.Samples.Count < 2 || _routeAnswersEarly);
+
+    public string MonitorJitterDirect => Direct(History.Samples.Count < 2 ? null : Jitter(History.DirectJitter, false));
+
+    public string MonitorLossDisplay => Percent(History.RouteLossPercent);
+
+    public string MonitorLossDirect => Direct(History.IsEmpty ? null : Percent(History.DirectLossPercent));
+
+    /// <summary>Any loss in the last minute: the tile says so with an icon, not with colour alone.</summary>
+    public bool MonitorLossIsWarning => History.RouteLossPercent > 0;
+
+    /// <summary>What the monitor is measuring, and where that target came from.</summary>
+    public string? MonitorTargetDisplay => IsRunning && MonitorTarget() is { } target
+        ? string.Format(CultureInfo.CurrentCulture,
+            Loc.Current[target.Typed ? "Games.Monitor.TargetTyped" : "Games.Monitor.TargetAuto"],
+            Endpoint(target.Host, target.Port))
+        : null;
+
+    /// <summary>Why the chart is empty or what it is waiting for, when it is either.</summary>
+    public string? MonitorStatus
+    {
+        get
+        {
+            if (State == BoostState.WaitingForGame)
+            {
+                return Loc.Current[HasHistory ? "Games.Monitor.Paused" : "Games.Monitor.WaitingForGame"];
+            }
+
+            if (!IsRunning)
+            {
+                return _sessionEndedAt is { } ended && HasHistory
+                    ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Monitor.Ended"],
+                        ended.ToLocalTime().ToString("HH:mm", CultureInfo.CurrentCulture))
+                    : null;
+            }
+
+            if (MonitorTarget() is not { } target)
+            {
+                return Loc.Current["Games.Monitor.WaitingForTarget"];
+            }
+
+            var endpoint = Endpoint(target.Host, target.Port);
+            if (History.IsEmpty)
+            {
+                return string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Monitor.Measuring"], endpoint);
+            }
+
+            if (_routeAnswersEarly)
+            {
+                return string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Monitor.RouteAnswersEarly"], RouteName);
+            }
+
+            if (!History.RouteHasAnswered)
+            {
+                if (History.Samples.Count < 5)
+                {
+                    return string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Monitor.WaitingForAnswer"], endpoint);
+                }
+
+                // Not loss: a target that has never answered is a target that does not answer
+                // probes, and saying 100 % would blame the route for it. Answering directly and
+                // never through the route is the route's doing, and is said so.
+                return History.DirectFirstAnswered is not null
+                    ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Monitor.RouteNotAnswering"], endpoint, RouteName)
+                    : string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Monitor.NotAnswering"], endpoint);
+            }
+
+            return null;
+        }
+    }
+
+    public bool HasMonitorStatus => MonitorStatus is not null;
+
+    /// <summary>The chart in one sentence, for a screen reader.</summary>
+    public string MonitorSummary => string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Monitor.Summary"],
+        RouteName, MonitorNowDisplay, MonitorNowDirect, MonitorLossDisplay);
+
+    /// <summary>The last twenty samples, newest first: every value the chart shows, readable without it.</summary>
+    public IReadOnlyList<BoostSampleRow> RecentSamples => History.Samples
+        .Reverse()
+        .Take(20)
+        .Select(s => new BoostSampleRow(
+            s.At.ToLocalTime().ToString("HH:mm:ss", CultureInfo.CurrentCulture),
+            RouteMilliseconds(s.RoutedMilliseconds),
+            Milliseconds(s.DirectMilliseconds)))
+        .ToList();
+
+    /// <summary>What the chart's tooltip says for a route sample with no figure.</summary>
+    public string MonitorRouteMissingLabel => Loc.Current[_routeAnswersEarly ? "Common.NotMeasured" : "Games.Monitor.NoAnswer"];
+
+    private static string Milliseconds(double? value) => value is { } v
+        ? string.Create(CultureInfo.CurrentCulture, $"{v:0} ms")
+        : Loc.Current["Games.Monitor.NoAnswer"];
+
+    private string RouteMilliseconds(double? value) => value is null ? MonitorRouteMissingLabel : Milliseconds(value);
+
+    /// <summary>Jitter keeps a decimal: it is a few milliseconds, where latency is tens.</summary>
+    private static string Jitter(double? value, bool notYet) => notYet
+        ? Loc.Current["Common.NotMeasured"]
+        : value is { } v ? string.Create(CultureInfo.CurrentCulture, $"{v:0.#} ms") : Loc.Current["Games.Monitor.NoAnswer"];
+
+    private static string Percent(double? value) => value is { } v
+        ? string.Create(CultureInfo.CurrentCulture, $"{v:0.#} %")
+        : Loc.Current["Common.NotMeasured"];
+
+    private static string Direct(string? value) => value is null
+        ? string.Empty
+        : string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Monitor.DirectValue"], value);
+
+    private static string Endpoint(string host, ushort port) =>
+        host.Contains(':', StringComparison.Ordinal) ? $"[{host}]:{port}" : $"{host}:{port}";
+
+    /// <summary>The target typed in, or saved with the game; failing that, the game's busiest server.</summary>
+    private (string Host, ushort Port, bool Typed)? MonitorTarget() =>
+        TryParseTarget(MeasurementTargetInput, out var host, out var port)
+            ? (host, port, true)
+            : _autoTarget is { } auto
+                ? (auto.Address.ToString(), (ushort)auto.Port, false)
+                : null;
+
+    /// <summary>Runs the monitor while the game is routed, and only then.</summary>
+    private void UpdateSampler()
+    {
+        var routing = State is BoostState.Routing or BoostState.Degraded;
+        if (routing && !_sampleTimer.IsEnabled)
+        {
+            _sampleTimer.Start();
+            _ = SampleAsync();
+        }
+        else if (!routing && _sampleTimer.IsEnabled)
+        {
+            _sampleTimer.Stop();
+            _sampling?.Cancel();
+        }
+
+        RaiseMonitor();
+    }
+
+    /// <summary>
+    /// One tick: the target probed once through the route and once directly, by the daemon.
+    /// </summary>
+    /// <remarks>
+    /// One probe a side keeps the cost to a few small connections every few seconds, and the
+    /// chart's loss comes from many ticks rather than from many probes in one. A tick still
+    /// running when the next is due is not doubled up: an unanswered probe waits seconds.
+    /// </remarks>
+    internal async Task SampleAsync()
+    {
+        if (_sampleInFlight || _daemon.State != DaemonState.Connected || SelectedRoute is not { } route ||
+            State is not (BoostState.Routing or BoostState.Degraded))
+        {
+            return;
+        }
+
+        if (MonitorTarget() is not { } target)
+        {
+            RaiseMonitor();
+            return;
+        }
+
+        _sampleInFlight = true;
+        var sampling = new CancellationTokenSource();
+        _sampling = sampling;
+        try
+        {
+            var (proxyId, chainId) = route.IsChain ? ((Guid?)null, (Guid?)route.Id) : (route.Id, null);
+            var measurement = await _daemon.MeasureAsync(target.Host, target.Port, proxyId, chainId, 1, sampling.Token)
+                .ConfigureAwait(true);
+            if (measurement is null || sampling.IsCancellationRequested ||
+                State is not (BoostState.Routing or BoostState.Degraded))
+            {
+                return;
+            }
+
+            _routeAnswersEarly = measurement.RouteAnswersBeforeConnecting;
+            History.Add(ToSample(measurement, route.IsChain));
+            HistoryVersion = History.Version;
+            LastMeasurementUtc = measurement.MeasuredAtUtc;
+            OnPropertyChanged(nameof(LastMeasurementDisplay));
+            RaiseMonitor();
+        }
+        catch (OperationCanceledException)
+        {
+            // The session stopped, or left routing, while the probe was out.
+        }
+        finally
+        {
+            _sampleInFlight = false;
+        }
+    }
+
+    /// <summary>
+    /// One measurement as one sample: the route's round trip and the direct one, or null for a
+    /// side that got no answer.
+    /// </summary>
+    /// <remarks>
+    /// Through a single agent the route's figure is its two halves added up: the round trip to the
+    /// agent, and the agent's own probe of the target from where it stands. That is the path a
+    /// game's datagrams take. The connect through the agent that the daemon also measures opens a
+    /// fresh TLS stream each time, and its handshakes would be counted as latency the game never
+    /// sees. A chain is measured end to end, because the agent's own probe skips the hops after it.
+    /// </remarks>
+    internal static LatencySample ToSample(MeasurementDto measurement, bool routeIsChain)
+    {
+        double? routed;
+        if (!routeIsChain && measurement.Legs is { } legs)
+        {
+            routed = legs.ToAgentMilliseconds is { } to && legs.FromAgentMilliseconds is { } from ? to + from : null;
+        }
+        else
+        {
+            routed = measurement.Routed is { Successes: > 0 } r ? r.LatencyMilliseconds : null;
+        }
+
+        var direct = measurement.Direct is { Successes: > 0 } d ? d.LatencyMilliseconds : null;
+        return new LatencySample(measurement.MeasuredAtUtc, routed, direct);
+    }
+
+    /// <summary>
+    /// Takes the monitor's target from the game's own connections, when none was typed.
+    /// </summary>
+    /// <remarks>
+    /// Kept for as long as the game still talks to it, so the chart does not hop between servers
+    /// every time another connection briefly carries more.
+    /// </remarks>
+    private void UpdateAutoTarget(IReadOnlyList<ConnectionRecord> rows)
+    {
+        if (_autoTarget is { } current && rows.Any(r => r.Remote.Equals(current)))
+        {
+            return;
+        }
+
+        if (PickServer(rows) is not { } picked || picked.Equals(_autoTarget))
+        {
+            return;
+        }
+
+        _autoTarget = picked;
+        RaiseMonitor();
+        _ = SampleAsync();
+    }
+
+    /// <summary>
+    /// The server the game is talking to most: its busiest connection to an address on the
+    /// internet, a datagram one first, since that is where a game's play happens.
+    /// </summary>
+    /// <remarks>
+    /// Whether or not the route is carrying it. One the route carries is preferred, but a game
+    /// whose play is still going out directly — it was running before the boost — is measured
+    /// all the same: what the route would give it is exactly the question, and requiring a routed
+    /// connection left the chart empty in the case that most needed it.
+    /// </remarks>
+    internal static IPEndPoint? PickServer(IReadOnlyList<ConnectionRecord> rows) => rows
+        .Where(r => r.Remote.Port is not (0 or 53) && IsInternetAddress(r.Remote.Address))
+        .OrderByDescending(r => r.Protocol == TransportProtocol.Udp)
+        .ThenByDescending(r => r.Route == RouteObservation.ConfirmedProxied)
+        .ThenByDescending(r => (r.BytesUp ?? 0) + (r.BytesDown ?? 0))
+        .Select(r => r.Remote)
+        .FirstOrDefault();
+
+    /// <summary>Not this machine, not a private network, not multicast: somewhere a game server can be.</summary>
+    private static bool IsInternetAddress(IPAddress address)
+    {
+        if (address.IsIPv4MappedToIPv6)
+        {
+            address = address.MapToIPv4();
+        }
+
+        if (address.AddressFamily != AddressFamily.InterNetwork || IPAddress.IsLoopback(address))
+        {
+            return false;
+        }
+
+        var b = address.GetAddressBytes();
+        return !(b[0] is 0 or 10 or >= 224 ||
+                 (b[0] == 172 && b[1] is >= 16 and <= 31) ||
+                 (b[0] == 192 && b[1] == 168) ||
+                 (b[0] == 169 && b[1] == 254) ||
+                 (b[0] == 100 && b[1] is >= 64 and <= 127));
+    }
+
+    private void ClearHistory()
+    {
+        History.Clear();
+        HistoryVersion = History.Version;
+        _sessionEndedAt = null;
+        _routeAnswersEarly = false;
+        RaiseMonitor();
+    }
+
+    /// <summary>Design-review hook: a session's worth of samples, so the chart has something to show.</summary>
+    internal void SeedHistory(IEnumerable<LatencySample> samples)
+    {
+        History.Clear();
+        foreach (var sample in samples)
+        {
+            History.Add(sample);
+        }
+
+        HistoryVersion = History.Version;
+        RaiseMonitor();
+    }
+
+    private void RaiseMonitor()
+    {
+        OnPropertyChanged(nameof(HasHistory));
+        OnPropertyChanged(nameof(ShowMonitor));
+        OnPropertyChanged(nameof(MonitorRouteLabel));
+        OnPropertyChanged(nameof(MonitorNowDisplay));
+        OnPropertyChanged(nameof(MonitorNowDirect));
+        OnPropertyChanged(nameof(MonitorAverageDisplay));
+        OnPropertyChanged(nameof(MonitorAverageDirect));
+        OnPropertyChanged(nameof(MonitorJitterDisplay));
+        OnPropertyChanged(nameof(MonitorJitterDirect));
+        OnPropertyChanged(nameof(MonitorLossDisplay));
+        OnPropertyChanged(nameof(MonitorLossDirect));
+        OnPropertyChanged(nameof(MonitorLossIsWarning));
+        OnPropertyChanged(nameof(MonitorTargetDisplay));
+        OnPropertyChanged(nameof(MonitorStatus));
+        OnPropertyChanged(nameof(HasMonitorStatus));
+        OnPropertyChanged(nameof(MonitorSummary));
+        OnPropertyChanged(nameof(MonitorRouteMissingLabel));
+        OnPropertyChanged(nameof(RecentSamples));
     }
 
     // -- NAT type -------------------------------------------------------------
@@ -1198,6 +1749,9 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         RoutingEvidence = null;
         RoutingEvidenceIsWarning = false;
         _routingSince = null;
+        _autoTarget = null;
+        _runningAtStart = row.Running?.Identity;
+        ClearHistory();
         _sessionStartedAt = DateTimeOffset.UtcNow;
         _sessionTimer.Start();
         _attachTimer.Start();
@@ -1208,17 +1762,63 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             return;
         }
 
+        _sessionGame = row;
+
         // The rule is the session. A game profile is an ordinary rule in the shared list, so
         // its precedence against a manual selection is visible on the Rules page.
-        var selector = BuildSelector(row);
+        var (selector, learned) = BuildSelector(row);
         if (selector is null)
         {
-            Fail(Loc.Current["Games.StartItFirst"]);
+            // Nothing to match yet, and nothing running to learn it from: a game Steam knows only
+            // by its folder, never started under Yura. The session waits for it, and the moment it
+            // appears it is given a rule matching what it turned out to be.
+            State = BoostState.WaitingForGame;
+            StatusMessage = string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Armed"], row.Name);
             return;
         }
 
-        var action = SelectedRoute.ToAction();
+        if (learned is not null)
+        {
+            row.Update(learned, row.Running);
+            ProfilesChanged?.Invoke(this, EventArgs.Empty);
+        }
 
+        // A boost is usually asked for while the game is already running and talking to its
+        // servers, so the connections that matter are the ones that exist. They cannot be
+        // captured where they are — a socket's cgroup is fixed when it is created — so the
+        // daemon drops them and the game reconnects through the route. Asked for before the
+        // game starts, the rule is in place at its first connection and there is nothing to drop.
+        if (await ApplySessionRuleAsync(row, selector).ConfigureAwait(true) is not { } result)
+        {
+            return;
+        }
+
+        State = row.Running is null ? BoostState.WaitingForGame : BoostState.Routing;
+        StatusMessage = row.Running is null
+            ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.ArmedWithRule"], row.Name)
+            : (result.ResetConnections, result.PreExistingConnections) switch
+            {
+                ( > 0, _) => string.Format(
+                    CultureInfo.CurrentCulture, Loc.Current["Games.StartedWithReset"], result.ResetConnections),
+                (_, > 0) => string.Format(
+                    CultureInfo.CurrentCulture, Loc.Current["Games.StartedWithExisting"], result.PreExistingConnections),
+                _ => Loc.Current["Games.Started"],
+            };
+
+        // Numbers the moment the session starts, if we know where to measure.
+        if (row.Running is not null && (row.Profile.IsMeasurable || TryParseTarget(MeasurementTargetInput, out _, out _)))
+        {
+            await MeasureAsync().ConfigureAwait(true);
+        }
+    }
+
+    /// <summary>
+    /// Installs the session's rule for <paramref name="row"/>, in place of any rule of the game's
+    /// that it supersedes.
+    /// </summary>
+    /// <returns>The daemon's account, or null when it failed and the session has failed with it.</returns>
+    private async Task<RuleApplyResult?> ApplySessionRuleAsync(GameRowViewModel row, ProcessSelector selector)
+    {
         var built = new RoutingRule
         {
             Id = Guid.NewGuid(),
@@ -1230,7 +1830,7 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             Lifetime = RuleLifetime.Session,
             Process = selector,
             Destination = DestinationSelector.Any,
-            Action = action,
+            Action = SelectedRoute!.ToAction(),
             CreatedAtUtc = DateTimeOffset.UtcNow,
         };
 
@@ -1241,19 +1841,14 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             ? built with { Id = previous.Id, Order = previous.Order }
             : built;
 
-        // A boost is asked for while the game is already running and already talking to its
-        // servers, so the connections that matter are the ones that exist. They cannot be
-        // captured where they are — a socket's cgroup is fixed when it is created — so the
-        // daemon drops them and the game reconnects through the route.
         var result = await _daemon.ApplyRuleAsync(rule, resetExisting: true).ConfigureAwait(true);
         if (!result.Succeeded)
         {
             Fail(result.FailureReason);
-            return;
+            return null;
         }
 
         _sessionRule = rule;
-        _sessionGame = row;
         foreach (var superseded in _rules.Add(rule with { AppliedAtUtc = result.ConfirmedAtUtc }))
         {
             // Also out of the kernel: left installed, it would go on deciding the game's route
@@ -1261,21 +1856,130 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             await _daemon.RemoveRuleAsync(superseded.Id).ConfigureAwait(true);
         }
 
-        State = row.Running is null ? BoostState.WaitingForGame : BoostState.Routing;
-        StatusMessage = (result.ResetConnections, result.PreExistingConnections) switch
-        {
-            ( > 0, _) => string.Format(
-                CultureInfo.CurrentCulture, Loc.Current["Games.StartedWithReset"], result.ResetConnections),
-            (_, > 0) => string.Format(
-                CultureInfo.CurrentCulture, Loc.Current["Games.StartedWithExisting"], result.PreExistingConnections),
-            _ => Loc.Current["Games.Started"],
-        };
+        return result;
+    }
 
-        // Numbers the moment the session starts, if we know where to measure.
-        if (row.Profile.IsMeasurable || TryParseTarget(MeasurementTargetInput, out _, out _))
+    /// <summary>
+    /// The game a waiting session was started for has appeared: route it, and remember what it is.
+    /// </summary>
+    /// <remarks>
+    /// It has been running for up to a couple of seconds, long enough to have opened connections
+    /// the rule cannot reach where they are, so those are dropped and reconnect through the route.
+    /// What is learned is saved with the game, so the next boost has its rule in place before the
+    /// game's first connection and nothing has to be dropped at all.
+    /// </remarks>
+    private async Task RouteArrivedGameAsync(GameRowViewModel row, ProcessSnapshot process)
+    {
+        if (_arrivalInFlight || SelectedRoute is null)
         {
-            await MeasureAsync().ConfigureAwait(true);
+            return;
         }
+
+        _arrivalInFlight = true;
+        try
+        {
+            if (_sessionRule is { Process.Kind: ProcessSelectorKind.Instance } earlier)
+            {
+                // A rule for an earlier run of the game, matched by process: that process is gone.
+                await _daemon.RemoveRuleAsync(earlier.Id).ConfigureAwait(true);
+                _rules.Remove(earlier.Id);
+                _sessionRule = null;
+            }
+
+            // What the profile knows by now comes first: the game may have been learned during an
+            // earlier run of this session, routed by process.
+            var (selector, learned) = BuildSelector(row);
+            if (selector is null)
+            {
+                return;
+            }
+
+            if (learned is not null)
+            {
+                row.Update(learned, process);
+                ProfilesChanged?.Invoke(this, EventArgs.Empty);
+            }
+
+            var result = await ApplySessionRuleAsync(row, selector).ConfigureAwait(true);
+            if (result is null)
+            {
+                return;
+            }
+
+            if (!ReferenceEquals(_sessionGame, row) || State != BoostState.WaitingForGame)
+            {
+                // Stopped while the rule was going in: it belongs to no session now.
+                if (_sessionRule is { } orphan)
+                {
+                    await _daemon.RemoveRuleAsync(orphan.Id).ConfigureAwait(true);
+                    _rules.Remove(orphan.Id);
+                    _sessionRule = null;
+                }
+
+                return;
+            }
+
+            State = BoostState.Routing;
+            var routed = string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Arrived"], row.Name, RouteName);
+            var reset = result.ResetConnections > 0
+                ? " " + string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.ArrivedReset"], result.ResetConnections)
+                : string.Empty;
+            var thisRun = selector.Kind == ProcessSelectorKind.Instance
+                ? " " + Loc.Current["Games.ArrivedThisRunOnly"]
+                : string.Empty;
+            StatusMessage = routed + reset + thisRun;
+        }
+        finally
+        {
+            _arrivalInFlight = false;
+        }
+    }
+
+    /// <summary>
+    /// What to match a game that has just appeared, and what about it is worth remembering.
+    /// </summary>
+    /// <remarks>
+    /// Only what is evidently the game's own is remembered: a Windows executable or a binary
+    /// inside the game's folder, under <c>steamapps/common/&lt;this game&gt;</c>. A game found by
+    /// its Steam app id can be running from outside it, through a Proton or Steam runtime wrapper
+    /// every other game shares, and a rule for that binary would route all of them. That run is
+    /// routed by process instead, and nothing is remembered.
+    /// </remarks>
+    /// <returns>The selector, and the profile with what was learned, or null for the profile when nothing was.</returns>
+    internal static (ProcessSelector Selector, GameProfile? Learned) LearnSelector(GameProfile profile, ProcessSnapshot process)
+    {
+        if (process.Wine?.TargetExecutable is { Length: > 0 } wine && profile.MatchesInstalledPath(wine))
+        {
+            return (new ProcessSelector
+            {
+                Kind = ProcessSelectorKind.ExecutablePath,
+                ExecutablePath = process.ExecutablePath,
+                WineTargetExecutable = wine,
+                Descendants = DescendantPolicy.IncludeExistingAndFuture,
+            }, profile with
+            {
+                ExecutablePath = process.ExecutablePath,
+                WineTargetExecutable = wine,
+                SteamAppId = profile.SteamAppId ?? process.SteamAppId,
+            });
+        }
+
+        if (process.ExecutablePath is { Length: > 0 } path && profile.MatchesInstalledPath(path))
+        {
+            return (new ProcessSelector
+            {
+                Kind = ProcessSelectorKind.ExecutablePath,
+                ExecutablePath = path,
+                Descendants = DescendantPolicy.IncludeExistingAndFuture,
+            }, profile with { ExecutablePath = path, SteamAppId = profile.SteamAppId ?? process.SteamAppId });
+        }
+
+        return (new ProcessSelector
+        {
+            Kind = ProcessSelectorKind.Instance,
+            Identity = process.Identity,
+            Descendants = DescendantPolicy.IncludeExistingAndFuture,
+        }, null);
     }
 
     /// <summary>
@@ -1283,17 +1987,21 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     /// </summary>
     /// <remarks>
     /// Prefers the Wine target, because that is the only thing that distinguishes two games
-    /// sharing a runtime. Falls back to the executable path, and to the running instance when
-    /// the profile has no path at all — which is the case for a Steam game that has never been
-    /// attached.
+    /// sharing a runtime. Falls back to the executable path. A profile with no path at all — a
+    /// Steam game that has never been attached — is matched by what its running process turns
+    /// out to be, as in <see cref="LearnSelector"/>, and by nothing while it is not running.
     /// </remarks>
-    private ProcessSelector? BuildSelector(GameRowViewModel row)
+    /// <returns>
+    /// The selector, or null when there is nothing to match yet; and the profile with what was
+    /// learned from the running game, or null when nothing was.
+    /// </returns>
+    private static (ProcessSelector? Selector, GameProfile? Learned) BuildSelector(GameRowViewModel row)
     {
         var profile = row.Profile;
 
         if (profile.WineTargetExecutable is { Length: > 0 } wine)
         {
-            return new ProcessSelector
+            return (new ProcessSelector
             {
                 Kind = ProcessSelectorKind.ExecutablePath,
                 ExecutablePath = profile.ExecutablePath ?? row.Running?.ExecutablePath,
@@ -1301,30 +2009,20 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
                 // Games spawn helpers — launchers, anti-cheat, crash handlers — that need the
                 // same route, and they are all children.
                 Descendants = DescendantPolicy.IncludeExistingAndFuture,
-            };
+            }, null);
         }
 
         if (profile.ExecutablePath is { Length: > 0 } path)
         {
-            return new ProcessSelector
+            return (new ProcessSelector
             {
                 Kind = ProcessSelectorKind.ExecutablePath,
                 ExecutablePath = path,
                 Descendants = DescendantPolicy.IncludeExistingAndFuture,
-            };
+            }, null);
         }
 
-        if (row.Running is { } running)
-        {
-            return new ProcessSelector
-            {
-                Kind = ProcessSelectorKind.Instance,
-                Identity = running.Identity,
-                Descendants = DescendantPolicy.IncludeExistingAndFuture,
-            };
-        }
-
-        return null;
+        return row.Running is { } running ? LearnSelector(profile, running) : (null, null);
     }
 
     private void Fail(string? reason)
@@ -1360,6 +2058,9 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         _sessionTimer.Stop();
         _attachTimer.Stop();
         _sessionStartedAt = null;
+        _sessionEndedAt = DateTimeOffset.UtcNow;
+        _autoTarget = null;
+        _runningAtStart = null;
         _routingSince = null;
         RoutingEvidence = null;
         RoutingEvidenceIsWarning = false;
@@ -1455,6 +2156,8 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     {
         _sessionTimer.Stop();
         _attachTimer.Stop();
+        _sampleTimer.Stop();
         _measuring?.Cancel();
+        _sampling?.Cancel();
     }
 }

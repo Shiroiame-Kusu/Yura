@@ -327,6 +327,20 @@ is unreferenced.
   each of the game's connections and says how many are going through the route, how many are
   going to a proxy on this machine, and how many predate the rule — because a rule being
   installed was never evidence that traffic obeys it
+- **A boost started before the game**: press Start, then launch the game. Yura spots it the
+  moment it appears — by its executable, its Windows executable under Wine or Proton, its
+  folder, or Steam's app id — routes it, drops the few connections it opened first so they
+  reconnect through the route, and remembers what it learned so the next boost is in place
+  before the game's first connection. A Proton game is caught at Steam's own launch of it, the
+  root of its process tree, so everything it starts is routed from birth; and what the page
+  reports is read from that whole tree, not from whichever process matched. A boost started
+  while the game is running says what it cannot move: sockets the game already has open, which
+  for gameplay is often all of it until the game restarts
+- **A live chart of latency and packet loss** for the session, route against direct: the server
+  the game talks to most is probed every three seconds when no target is typed, a refused probe
+  counts as an answer (game servers mostly listen on UDP and refuse TCP), loss is counted only
+  once the target has answered, and a proxy that answers before it connects — mihomo does — is
+  reported as unmeasurable rather than plotted at the speed of loopback
 - A systemd service installed from Settings through polkit, with the unit and the script
   shown before anything runs as root, and start / stop / restart / uninstall from the same
   page
@@ -335,7 +349,7 @@ is unreferenced.
   binding compiled. The acceptance suite passes 141/141 on the native daemon and agent, every
   page of the native app renders as the development build does, and switching language in it
   live updates the UI in place
-- 437 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+- 477 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
   wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and tunnel
   manager, the agent protocol end to end against a real agent — full-cone UDP included — the
   agent's systemd unit, its key and token on disk and who may write them, the connect string,
@@ -343,7 +357,8 @@ is unreferenced.
   reader and its KeyValues parser, the STUN codec and the NAT classifier's table of cases, the
   socket-abort request's byte layout, socket lookups against the running kernel, the flow
   registry, full-cone routing in the daemon, the rule store and the rule editor, the process
-  inspector, the Games page, what the measurer counts as an answer, the proxy, agent and chain
+  inspector, the Games page — a boost started before its game, what it learns, and the session
+  monitor's arithmetic — what the measurer counts as an answer, the proxy, agent and chain
   editors, the secret store, the daemon client against a stand-in daemon, the generated JSON
   serializers against the reflection-based ones they replaced, the localization binding, the ctl
   request line, keeping a restarted daemon in step, the routing-evidence sentences, and the

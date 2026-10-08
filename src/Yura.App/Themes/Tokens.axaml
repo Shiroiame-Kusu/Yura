@@ -53,6 +53,11 @@
       <Color x:Key="YuraWarningSubtleColor">#332711</Color>
       <Color x:Key="YuraDangerColor">#F0625A</Color>
       <Color x:Key="YuraDangerSubtleColor">#3A1A18</Color>
+
+      <!-- A chart's context series: recessive, and apart from the accent in lightness, so it
+           stays distinct from it under every colour-vision deficiency (Delta E >= 15). Below 3:1
+           on the panel on purpose; the chart names both lines, so colour is never the only key. -->
+      <Color x:Key="YuraChartContextColor">#5C6675</Color>
       <Color x:Key="YuraNeutralStateColor">#98A3B0</Color>
 
       <Color x:Key="YuraFocusColor">#6FDCD3</Color>
@@ -90,6 +95,8 @@
       <Color x:Key="YuraWarningSubtleColor">#FAEFD5</Color>
       <Color x:Key="YuraDangerColor">#B3251C</Color>
       <Color x:Key="YuraDangerSubtleColor">#FBE3E1</Color>
+
+      <Color x:Key="YuraChartContextColor">#98A1AC</Color>
       <Color x:Key="YuraNeutralStateColor">#5A6472</Color>
 
       <Color x:Key="YuraFocusColor">#0B6A63</Color>
@@ -110,6 +117,12 @@
   <SolidColorBrush x:Key="YuraBorderControl" Color="{DynamicResource YuraBorderControlColor}" />
 
   <SolidColorBrush x:Key="YuraTextPrimary" Color="{DynamicResource YuraTextPrimaryColor}" />
+  <!-- Charts: the series that matters wears the accent, its context the recessive gray, loss the
+       warning tone, gridlines the subtlest border. -->
+  <SolidColorBrush x:Key="YuraChartRoute" Color="{DynamicResource YuraAccentColor}" />
+  <SolidColorBrush x:Key="YuraChartContext" Color="{DynamicResource YuraChartContextColor}" />
+  <SolidColorBrush x:Key="YuraChartLoss" Color="{DynamicResource YuraWarningColor}" />
+  <SolidColorBrush x:Key="YuraChartGrid" Color="{DynamicResource YuraBorderSubtleColor}" />
   <SolidColorBrush x:Key="YuraTextSecondary" Color="{DynamicResource YuraTextSecondaryColor}" />
   <SolidColorBrush x:Key="YuraTextTertiary" Color="{DynamicResource YuraTextTertiaryColor}" />
   <SolidColorBrush x:Key="YuraTextDisabled" Color="{DynamicResource YuraTextDisabledColor}" />
