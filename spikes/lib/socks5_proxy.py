@@ -41,6 +41,7 @@ ATYP_IPV6 = 0x04
 
 REP_SUCCESS = 0x00
 REP_GENERAL_FAILURE = 0x01
+REP_CONNECTION_REFUSED = 0x05
 REP_CMD_NOT_SUPPORTED = 0x07
 
 
@@ -192,15 +193,24 @@ class Socks5Server:
             rewritten=rewritten,
         )
 
+        if self.args.answer_first:
+            # Success before anything was dialled, as some proxies (mihomo) answer.
+            self.reply(sock, REP_SUCCESS)
+
         try:
             upstream = socket.create_connection(target, timeout=5)
         except OSError as exc:
             self.audit.record(event="connect_failed", requested=f"{host}:{port}", error=str(exc))
-            self.reply(sock, REP_GENERAL_FAILURE)
+            if not self.args.answer_first:
+                # Refused is a reply of its own, as RFC 1928 has it and Dante sends it: the
+                # destination answered, where every other failure is the network's.
+                refused = isinstance(exc, ConnectionRefusedError)
+                self.reply(sock, REP_CONNECTION_REFUSED if refused else REP_GENERAL_FAILURE)
             return
 
-        bound = upstream.getsockname()
-        self.reply(sock, REP_SUCCESS, bound[0], bound[1])
+        if not self.args.answer_first:
+            bound = upstream.getsockname()
+            self.reply(sock, REP_SUCCESS, bound[0], bound[1])
         pump(sock, upstream)
 
     def do_udp_associate(self, sock: socket.socket, peer: tuple[str, int]) -> "UdpRelay":
@@ -363,6 +373,11 @@ def main() -> int:
         action="append",
         metavar="HOST:PORT=HOST:PORT",
         help="Dial a different address than the client requested. Repeatable.",
+    )
+    parser.add_argument(
+        "--answer-first",
+        action="store_true",
+        help="Report a CONNECT as made before dialling, and close if the dial fails.",
     )
     args = parser.parse_args()
 

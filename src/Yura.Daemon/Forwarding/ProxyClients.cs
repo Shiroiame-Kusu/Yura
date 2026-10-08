@@ -11,7 +11,17 @@ using Yura.Daemon.Linux;
 namespace Yura.Daemon.Forwarding;
 
 /// <summary>Raised when a proxy refuses or garbles a handshake. The message is operator-facing.</summary>
-public sealed class ProxyHandshakeException(string message) : Exception(message);
+public class ProxyHandshakeException(string message) : Exception(message);
+
+/// <summary>
+/// The destination itself refused the connection, as reported by the proxy in front of it.
+/// </summary>
+/// <remarks>
+/// Kept apart from the proxy's own refusals because it is an answer from the destination, a
+/// round trip away: measuring latency counts it, which is how a game server that listens only
+/// on UDP, and so refuses every TCP connect, can still be measured.
+/// </remarks>
+public sealed class DestinationRefusedException(string message) : ProxyHandshakeException(message);
 
 /// <summary>
 /// One hop of a route: an endpoint plus the credential the app handed over, or the installed
@@ -436,6 +446,10 @@ public static class ProxyDialer
                     await AgentClient.JoinAsync(stream, new AgentAddress(targetHost, (ushort)targetPort), timeout.Token)
                         .ConfigureAwait(false);
                 }
+                catch (AgentRefusedException e) when (e.Code == AgentRejection.ConnectionRefused)
+                {
+                    throw new DestinationRefusedException(e.Message);
+                }
                 catch (AgentRefusedException e)
                 {
                     throw new ProxyHandshakeException(e.Message);
@@ -485,7 +499,7 @@ public static class ProxyDialer
         }
     }
 
-    private static async Task Socks5ConnectAsync(
+    internal static async Task Socks5ConnectAsync(
         Stream stream, string? username, string? password, string targetHost, int targetPort, CancellationToken ct)
     {
         await Socks5GreetAsync(stream, username, password, ct).ConfigureAwait(false);
@@ -495,6 +509,11 @@ public static class ProxyDialer
         await stream.FlushAsync(ct).ConfigureAwait(false);
 
         var header = await ReadExactlyAsync(stream, 4, ct).ConfigureAwait(false);
+        if (header[1] == 0x05)
+        {
+            throw new DestinationRefusedException("The destination refused the connection (via the proxy).");
+        }
+
         if (header[1] != 0x00)
         {
             throw new ProxyHandshakeException(header[1] switch
@@ -502,7 +521,6 @@ public static class ProxyDialer
                 0x02 => "The proxy's ruleset does not allow this connection.",
                 0x03 => "The proxy reports the network is unreachable.",
                 0x04 => "The proxy reports the destination host is unreachable.",
-                0x05 => "The destination refused the connection (via the proxy).",
                 0x06 => "The proxy reports the connection timed out.",
                 0x07 => "The proxy does not support CONNECT.",
                 0x08 => "The proxy does not support this address type.",

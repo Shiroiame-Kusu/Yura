@@ -932,7 +932,10 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         MeasurementTarget = measurement.Target;
         MeasurementMethod = measurement.Method;
         LastMeasurementUtc = measurement.MeasuredAtUtc;
-        RouteSplit = Describe(measurement.Legs);
+        RouteSplit = measurement.RouteAnswersBeforeConnecting
+            ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.RouteAnswersEarly"], RouteName)
+            : Describe(measurement.Legs);
+        OnPropertyChanged(nameof(HasRouteSplit));
 
         DirectLatency = new Metric(measurement.Direct.LatencyMilliseconds, "ms");
         DirectJitter = new Metric(measurement.Direct.JitterMilliseconds, "ms");

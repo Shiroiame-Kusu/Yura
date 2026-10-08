@@ -193,8 +193,9 @@ public sealed class AgentServerTests
         var refused = await Assert.ThrowsAsync<AgentRefusedException>(() =>
             AgentClient.OpenStreamAsync(harness.Client(), new AgentAddress("127.0.0.1", 1), Token));
 
-        Assert.Equal(AgentRejection.ConnectFailed, refused.Code);
-        Assert.Contains("could not reach", refused.Message, StringComparison.Ordinal);
+        // A refusal, not a failure to reach it: the destination answered, which a measurement counts.
+        Assert.Equal(AgentRejection.ConnectionRefused, refused.Code);
+        Assert.Contains("refused the connection", refused.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -443,15 +444,18 @@ public sealed class AgentServerTests
     }
 
     [Fact]
-    public async Task A_probe_of_something_unreachable_says_so_instead_of_reporting_zero()
+    public async Task A_probe_of_a_port_nothing_listens_on_is_answered_by_the_refusal()
     {
+        // The refusal comes from the destination, a round trip from the agent. Game servers mostly
+        // listen on UDP and refuse a TCP connect, and taking that for no answer made every one of
+        // them look unreachable through an agent. Silence is still no answer: see the blackhole above.
         await using var harness = AgentHarness.Start();
         await using var session = await harness.SessionAsync(Token);
 
         var reply = await session.ProbeAsync(new AgentAddress("127.0.0.1", 1), 2, Token);
 
-        Assert.Empty(reply.Microseconds);
-        Assert.NotNull(reply.Failure);
+        Assert.Equal(2, reply.Microseconds.Length);
+        Assert.Null(reply.Failure);
     }
 
     [Fact]

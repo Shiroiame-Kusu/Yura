@@ -352,6 +352,7 @@ Several types exist specifically to stop the UI asserting more than is known:
 | `RouteObservation` | Reporting a flow as *Proxied* without having observed it. Only `ConfirmedProxied` — where the daemon holds both sockets — may render as proxied |
 | `CapabilityState` | Inferring UDP support from the protocol instead of measuring it |
 | `Metric.Value` (nullable) | Rendering an unmeasured figure as `0`, which reads as a perfect score |
+| `MeasurementDto.RouteAnswersBeforeConnecting` | Timing a route through a proxy that reports a connection made before it dials — mihomo does — which puts the loopback hop on the chart as the route's latency |
 | `ProcessSnapshot.ConnectionCount` (nullable) | `0` meaning both "none" and "unknown" |
 
 ## Known trade-offs

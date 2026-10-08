@@ -249,6 +249,8 @@ public sealed class IpcServer : IAsyncDisposable
                     .ToList();
                 var chains = (request.Chains ?? []).Select(c => c.ToChain()).ToList();
                 var outcome = await _runtime.SetProxiesAsync(proxies, chains, ct).ConfigureAwait(false);
+                // An edited proxy may be another program now, or have credentials that let it be asked.
+                NetworkMeasurer.ForgetEarlyAnswers();
                 return FromOutcome(outcome);
             }
 

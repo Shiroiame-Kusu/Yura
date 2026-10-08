@@ -8,7 +8,7 @@ dotnet build src/Yura.Daemon src/Yura.Agent
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-**137 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
+**141 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
 wireguard-tools 1.0: on the development builds, and on the NativeAOT daemon and agent that
 `tools/publish.sh` and `tools/publish-agent.sh` produce.
 
@@ -70,6 +70,9 @@ address as the source, which is what an exit node's far end sees.
 | Proxy chains | Traffic through an A→B chain arrives with B's marker, and proxy A's log shows it was asked to reach proxy B — not the destination |
 | A chain refuses UDP rather than losing it | Stated in the log, not silently dropped |
 | Direct-versus-routed measurement | Both sides measured against one target by one method (TCP connect) in one call |
+| A refused connection is an answer | A port nothing listens on is timed directly and through proxy A, which now reports `connection refused` as RFC 1928 has it and Dante sends it, instead of being counted as loss. Game servers mostly listen on UDP and refuse a TCP connect to their port, and they are no less there for it |
+| A proxy that answers before it connects is said to, not timed | Proxy C reports success before it dials, as mihomo does, so a connect through it would time loopback. The daemon asks it once for port 1 on its own loopback, is told it is open, and gives the route no figure: the second measurement does not ask again, and neither times a connect through it |
+| A proxy that connects first is not mistaken for one that answers first | Proxy A reports the same port refused, so its routed figures stand |
 | The daemon can dump exactly what it installed | nftables table with counters, ip rules, routing table and cgroup membership |
 | Clean shutdown removes the nft table, the ip rule and the cgroup subtree | All three verified absent afterwards |
 
@@ -92,10 +95,11 @@ address as the source, which is what an exit node's far end sees.
 
 The agent is proved the same way as the WireGuard exit, and for the same reason: the marker it
 reaches exists only inside the agent's network namespace, so receiving that marker means the
-agent dialled it. Twenty-two checks cover the connect string, the session, the refusal of a
+agent dialled it. Twenty-three checks cover the connect string, the session, the refusal of a
 stale token, the probe's real datagram round trip, TCP and UDP through the agent, the resolver
 it advertises (on its own loopback, where nothing outside the namespace could answer), the
-split measurement, the policy refusing a private destination, an agent as the first hop of a
+split measurement, a port nothing listens on answered both through the agent and from it, the
+policy refusing a private destination, an agent as the first hop of a
 chain and as a later one, and the daemon noticing when the agent goes away.
 
 ### The capture boundary

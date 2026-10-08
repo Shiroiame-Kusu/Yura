@@ -240,6 +240,9 @@ public static class AgentClient
             $"The agent will not relay to {destination}: {reject.Message}",
         AgentRejection.ConnectFailed =>
             $"The agent could not reach {destination}: {reject.Message}",
+        AgentRejection.ConnectionRefused => destination is null
+            ? "The destination refused the connection from the agent."
+            : $"The destination {destination} refused the connection from the agent.",
         AgentRejection.TooMany => $"The agent is at its limit: {reject.Message}",
         AgentRejection.UdpDisabled => "The agent was started without UDP relaying.",
         _ => reject.Message,

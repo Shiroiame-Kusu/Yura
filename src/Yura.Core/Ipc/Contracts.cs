@@ -403,6 +403,12 @@ public sealed record MeasurementDto
     /// <summary>Where the routed time went, when the route can say. Null when it cannot.</summary>
     public RouteLegsDto? Legs { get; init; }
 
+    /// <summary>
+    /// The route's proxy reports a connection made before it has made it, so a connect through it
+    /// times the proxy alone. <see cref="Routed"/> is null then: there is no figure to give.
+    /// </summary>
+    public bool RouteAnswersBeforeConnecting { get; init; }
+
     public required DateTimeOffset MeasuredAtUtc { get; init; }
 }
 

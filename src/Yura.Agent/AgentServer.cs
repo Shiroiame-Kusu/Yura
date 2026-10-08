@@ -447,7 +447,9 @@ public sealed class AgentServer : IAsyncDisposable
     /// <remarks>
     /// A TCP connect, the same measurement the daemon makes directly, so the two figures can
     /// be subtracted: what the client measures through the agent, minus this, is what the
-    /// agent adds. That is the difference between "this route is faster" and knowing why.
+    /// agent adds. That is the difference between "this route is faster" and knowing why. A
+    /// refusal counts as an answer, as it does in the daemon: it comes from the destination,
+    /// and a game server that listens only on UDP refuses every TCP connect.
     /// </remarks>
     private async Task<AgentProbeReply> MeasureAsync(AgentProbeRequest request, CancellationToken ct)
     {
@@ -482,6 +484,12 @@ public sealed class AgentServer : IAsyncDisposable
             try
             {
                 await socket.ConnectAsync(target, timeout.Token).ConfigureAwait(false);
+                samples.Add((uint)Math.Min(clock.Elapsed.TotalMicroseconds, uint.MaxValue));
+            }
+            catch (SocketException e) when (e.SocketErrorCode == SocketError.ConnectionRefused)
+            {
+                // Refused by the destination itself, one round trip away: an answer. A game server
+                // listening only on UDP refuses every TCP connect, and is no less there for it.
                 samples.Add((uint)Math.Min(clock.Elapsed.TotalMicroseconds, uint.MaxValue));
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
@@ -563,6 +571,14 @@ public sealed class AgentServer : IAsyncDisposable
             using var connecting = CancellationTokenSource.CreateLinkedTokenSource(ct);
             connecting.CancelAfter(ConnectTimeout);
             await upstream.ConnectAsync(target, connecting.Token).ConfigureAwait(false);
+        }
+        catch (SocketException e) when (e.SocketErrorCode == SocketError.ConnectionRefused)
+        {
+            // Said as such: a refusal is the destination answering, and a measurement counts it.
+            await RejectAsync(stream, AgentRejection.ConnectionRefused, "The destination refused the connection.", ct)
+                .ConfigureAwait(false);
+            _log($"{peer}: tcp to {target} refused");
+            return;
         }
         catch (Exception e) when (e is SocketException or OperationCanceledException)
         {

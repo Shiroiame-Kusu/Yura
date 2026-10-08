@@ -75,6 +75,13 @@ public enum AgentRejection : byte
 
     /// <summary>The agent was started without UDP relaying.</summary>
     UdpDisabled = 7,
+
+    /// <summary>
+    /// The destination itself refused: it is there, and answered. Kept apart from
+    /// <see cref="ConnectFailed"/> because measuring counts it as an answer. An agent older than
+    /// this code says <see cref="ConnectFailed"/> instead, and a client older than it shows the message.
+    /// </summary>
+    ConnectionRefused = 8,
 }
 
 /// <summary>

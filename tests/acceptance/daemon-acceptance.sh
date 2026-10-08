@@ -40,6 +40,9 @@ MARK_B="YURA-VIA-PROXY-B"
 MARK_UDP_A="YURA-UDP-VIA-PROXY-A"
 PROXY_A_ID="aaaaaaaa-0000-4000-8000-00000000000a"
 PROXY_B_ID="bbbbbbbb-0000-4000-8000-00000000000b"
+# Proxy C says a connection is made before it makes it, as mihomo does.
+PROXY_C_ID="cccccccc-0000-4000-8000-00000000000c"
+PROXY_C_JSON="{\"id\":\"$PROXY_C_ID\",\"name\":\"Proxy C\",\"protocol\":\"socks5\",\"host\":\"127.0.0.1\",\"port\":11082}"
 
 # The WireGuard peer lives in its own network namespace, reached over a veth pair.
 WG_NS="yura-wgns"
@@ -243,8 +246,10 @@ as_user python3 "${LIB}/socks5_proxy.py" --listen 127.0.0.1 --port 11080 --log "
   --rewrite "${UNREACHABLE}:53=${LOCAL_ADDR}:53" > "$RUN/proxy-a.out" 2>&1 & BG+=($!)
 as_user python3 "${LIB}/socks5_proxy.py" --listen 127.0.0.1 --port 11081 --log "$RUN/proxy-b.jsonl" \
   --rewrite "${UNREACHABLE}:8080=${LOCAL_ADDR}:18090" > "$RUN/proxy-b.out" 2>&1 & BG+=($!)
+as_user python3 "${LIB}/socks5_proxy.py" --listen 127.0.0.1 --port 11082 --log "$RUN/proxy-c.jsonl" \
+  --answer-first > "$RUN/proxy-c.out" 2>&1 & BG+=($!)
 sleep 1
-info "proxy A :11080 -> marker A (${MARK_A});  proxy B :11081 -> marker B (${MARK_B});  dns ${LOCAL_ADDR}:53"
+info "proxy A :11080 -> marker A (${MARK_A});  proxy B :11081 -> marker B (${MARK_B});  proxy C :11082 answers first;  dns ${LOCAL_ADDR}:53"
 
 step "Daemon"
 # A socket file left by a killed daemon would make the readiness wait below pass
@@ -259,7 +264,7 @@ done
 [[ $ready -eq 1 ]] || { echo "daemon never became ready:"; cat "$RUN/daemon.log"; exit 1; }
 check "daemon answers status over the socket" ctl status
 check "daemon accepts the proxy list" ctl set-proxies \
-  "{\"proxies\":[{\"id\":\"$PROXY_A_ID\",\"name\":\"Proxy A\",\"protocol\":\"socks5\",\"host\":\"127.0.0.1\",\"port\":11080},{\"id\":\"$PROXY_B_ID\",\"name\":\"Proxy B\",\"protocol\":\"socks5\",\"host\":\"127.0.0.1\",\"port\":11081}]}"
+  "{\"proxies\":[{\"id\":\"$PROXY_A_ID\",\"name\":\"Proxy A\",\"protocol\":\"socks5\",\"host\":\"127.0.0.1\",\"port\":11080},{\"id\":\"$PROXY_B_ID\",\"name\":\"Proxy B\",\"protocol\":\"socks5\",\"host\":\"127.0.0.1\",\"port\":11081},$PROXY_C_JSON]}"
 
 step "Two instances of the same ordinary application, started normally"
 start_client() {
@@ -553,7 +558,7 @@ CHAIN_APP="$RUN/yura-chainapp"
 cp /usr/bin/python3 "$CHAIN_APP"; chmod 755 "$CHAIN_APP"
 CHAIN_ID="cccc0000-0000-4000-8000-00000000000c"
 check "daemon accepts a chain of proxy A then proxy B" ctl set-proxies \
-  "{\"proxies\":[{\"id\":\"$PROXY_A_ID\",\"name\":\"Proxy A\",\"protocol\":\"socks5\",\"host\":\"127.0.0.1\",\"port\":11080},{\"id\":\"$PROXY_B_ID\",\"name\":\"Proxy B\",\"protocol\":\"socks5\",\"host\":\"127.0.0.1\",\"port\":11081}],\"chains\":[{\"id\":\"$CHAIN_ID\",\"name\":\"A then B\",\"hops\":[\"$PROXY_A_ID\",\"$PROXY_B_ID\"]}]}"
+  "{\"proxies\":[{\"id\":\"$PROXY_A_ID\",\"name\":\"Proxy A\",\"protocol\":\"socks5\",\"host\":\"127.0.0.1\",\"port\":11080},{\"id\":\"$PROXY_B_ID\",\"name\":\"Proxy B\",\"protocol\":\"socks5\",\"host\":\"127.0.0.1\",\"port\":11081},$PROXY_C_JSON],\"chains\":[{\"id\":\"$CHAIN_ID\",\"name\":\"A then B\",\"hops\":[\"$PROXY_A_ID\",\"$PROXY_B_ID\"]}]}"
 CHAIN_PID="$(start_client_as "$CHAIN_APP" chain)"; BG+=("$CHAIN_PID")
 RULE_C="bbbb0000-0000-4000-8000-00000000000b"
 check "daemon applies a rule routing through the chain" ctl apply-rule "$(exe_rule "$RULE_C" "chained" "$CHAIN_APP" chain "\"$CHAIN_ID\"" 108)"
@@ -597,6 +602,46 @@ m=json.load(sys.stdin)['measurement']
 assert m['direct']['successes']==3, m['direct']
 assert m['routed']['successes']==3, m['routed']
 print(f\\\"direct {m['direct']['latencyMilliseconds']:.1f} ms vs routed {m['routed']['latencyMilliseconds']:.1f} ms over {m['method']}\\\")\""
+# A game server mostly listens on UDP, so a TCP connect to its port is refused. The refusal is
+# the destination answering, a round trip away, and is timed as an answer on both paths.
+check "a port nothing listens on is measured rather than lost, directly and through the proxy" bash -c "
+  T=\$(date +%s.%N)
+  '$DAEMON' ctl --socket '$SOCK' measure '{\"measure\":{\"host\":\"$LOCAL_ADDR\",\"port\":18089,\"proxyId\":\"$PROXY_A_ID\",\"samples\":3}}' > '$RUN/measure-closed.json' &&
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/proxy-a.jsonl' --event connect_failed --since \$T --where-contains requested=${LOCAL_ADDR}:18089) &&
+  python3 -c \"
+import json
+m=json.load(open('$RUN/measure-closed.json'))['measurement']
+assert m['direct']['successes']==3, m['direct']
+assert m['routed']['successes']==3, m['routed']
+assert \$n>=3, 'proxy A reported \$n refusals'
+print(f\\\"refused in {m['direct']['latencyMilliseconds']:.2f} ms directly and {m['routed']['latencyMilliseconds']:.2f} ms through proxy A, which was refused \$n times\\\")\""
+# A proxy that answers before it connects would make the route look as fast as loopback. The
+# daemon finds out once, by asking it for a port closed on every host, and gives no figure.
+check "a proxy that answers before it connects is said to, rather than timed at loopback speed" bash -c "
+  T=\$(date +%s.%N)
+  for i in 1 2; do
+    '$DAEMON' ctl --socket '$SOCK' measure '{\"measure\":{\"host\":\"$LOCAL_ADDR\",\"port\":18080,\"proxyId\":\"$PROXY_C_ID\",\"samples\":3}}' > '$RUN/measure-early-'\$i.json || exit 1
+  done
+  asked=\$(python3 '$LIB/logquery.py' count '$RUN/proxy-c.jsonl' --event connect --since \$T --where-contains requested=127.0.0.1:1)
+  timed=\$(python3 '$LIB/logquery.py' count '$RUN/proxy-c.jsonl' --event connect --since \$T --where-contains requested=${LOCAL_ADDR}:18080)
+  python3 -c \"
+import json
+for i in (1, 2):
+    m=json.load(open(f'$RUN/measure-early-{i}.json'))['measurement']
+    assert m.get('routeAnswersBeforeConnecting') is True, m
+    assert m.get('routed') is None, m['routed']
+    assert m['direct']['successes']==3, m['direct']
+assert \$asked==1, f'asked \$asked times, not once and remembered'
+assert \$timed==0, f'timed \$timed connects through it anyway'
+print('proxy C asked once for 127.0.0.1:1, said yes, and was not timed by either measurement')\""
+check "a proxy that connects first is not mistaken for one that answers first" bash -c "
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/proxy-a.jsonl' --event connect_failed --where-contains requested=127.0.0.1:1)
+  python3 -c \"
+import json
+m=json.load(open('$RUN/measure-closed.json'))['measurement']
+assert not m.get('routeAnswersBeforeConnecting'), m
+assert \$n>=1, 'proxy A was never asked'
+print('proxy A reported 127.0.0.1:1 refused (\$n time(s)), so its routed figures stand')\""
 check "the daemon can dump exactly what it installed" bash -c "
   '$DAEMON' ctl --socket '$SOCK' dump-ruleset | python3 -c \"
 import json,sys
@@ -985,6 +1030,14 @@ assert legs['agentName']=='acceptance-agent', legs
 assert legs['toAgentMilliseconds'] is not None and legs['fromAgentMilliseconds'] is not None, legs
 assert m['routed']['successes']>=1, m['routed']
 print(f\\\"routed {m['routed']['latencyMilliseconds']:.1f} ms = {legs['toAgentMilliseconds']:.1f} ms to the agent + {legs['fromAgentMilliseconds']:.1f} ms beyond it\\\")\""
+check "a port nothing listens on is answered through the agent too, connecting and from the agent itself" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' measure '{\"measure\":{\"host\":\"$UNREACHABLE\",\"port\":8099,\"proxyId\":\"$AG_ID\",\"samples\":2}}' | python3 -c \"
+import json,sys
+m=json.load(sys.stdin)['measurement']
+legs=m['legs']
+assert m['routed']['successes']==2, m['routed']
+assert legs['fromAgentMilliseconds'] is not None, legs
+print(f\\\"refused through the agent in {m['routed']['latencyMilliseconds']:.1f} ms, and in {legs['fromAgentMilliseconds']:.2f} ms seen from the agent\\\")\""
 check "the agent refuses a private destination, and the refusal reaches the app" bash -c "
   '$DAEMON' ctl --socket '$SOCK' measure '{\"measure\":{\"host\":\"10.78.1.2\",\"port\":9,\"proxyId\":\"$AG_ID\",\"samples\":1}}' 2>/dev/null | python3 -c \"
 import json,sys
