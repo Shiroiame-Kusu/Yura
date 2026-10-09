@@ -79,7 +79,7 @@ public sealed partial class YuraApplication : Application
             // block the window from appearing.
             _ = shell.RefreshDaemonStateAsync();
 
-            var window = new MainWindow { DataContext = shell };
+            var window = new MainWindow { DataContext = shell, Frameless = options.ScreenshotMode };
 
             // Flush any debounced change before the process goes away.
             desktop.ShutdownRequested += (_, _) => shell.SaveConfigurationBeforeExit();

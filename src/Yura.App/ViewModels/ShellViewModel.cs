@@ -329,6 +329,7 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
             IsDarkTheme = !string.Equals(document.Settings.Theme, "light", StringComparison.OrdinalIgnoreCase);
             IsChinese = document.Settings.Language.StartsWith("zh", StringComparison.OrdinalIgnoreCase);
             ReducedMotion = document.Settings.ReducedMotion;
+            UseSystemTitleBar = document.Settings.UseSystemTitleBar;
             DnsPolicy = document.Settings.DnsPolicy;
             Processes.FilterScope = document.Settings.ShowAllProcesses
                 ? ProcessFilterScope.AllProcesses
@@ -412,6 +413,7 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
             Theme = IsDarkTheme ? "dark" : "light",
             Language = IsChinese ? "zh-Hans" : "en",
             ReducedMotion = ReducedMotion,
+            UseSystemTitleBar = UseSystemTitleBar,
             DnsPolicy = DnsPolicy,
             ShowAllProcesses = Processes.FilterScope == ProcessFilterScope.AllProcesses,
         },
@@ -776,6 +778,19 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
             resources["YuraDurationSlow"] = value ? TimeSpan.Zero : TimeSpan.FromMilliseconds(280);
         }
 
+        Settings.NotifyShellChanged();
+        ScheduleSave();
+    }
+
+    /// <summary>
+    /// Lets the desktop draw the title bar and frame, for anyone who prefers them, or whose window
+    /// manager draws its own whatever the window asks for, such as a tiling one.
+    /// </summary>
+    [ObservableProperty]
+    public partial bool UseSystemTitleBar { get; set; }
+
+    partial void OnUseSystemTitleBarChanged(bool value)
+    {
         Settings.NotifyShellChanged();
         ScheduleSave();
     }

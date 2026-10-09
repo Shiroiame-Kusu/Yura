@@ -85,5 +85,14 @@ echo "== disconnected: the default, with no daemon =="
 shot --out "$OUT/28-connections-disconnected.png" --page connections --theme dark
 shot --out "$OUT/29-diagnostics-disconnected.png" --page diagnostics --theme dark
 
+echo "== the window in a real window manager: its frame, and the desktop's =="
+# 38 and 39 come from KWin itself, nested and offscreen, which is the only place the frame's
+# shadow and corners are composited; tools/check-window.sh also drives the window there.
+if command -v kwin_wayland >/dev/null && command -v spectacle >/dev/null; then
+  tools/check-window.sh || echo "tools/check-window.sh reported a failure; see above" >&2
+else
+  echo "kwin_wayland or spectacle is missing, so 38 and 39 were not retaken"
+fi
+
 echo
 echo "captured $(ls -1 "$OUT"/*.png | wc -l) screenshots into $OUT"

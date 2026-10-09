@@ -12,6 +12,75 @@
   <conv:ProtocolDisplayConverter x:Key="ProtocolDisplay" />
   <conv:DnsPolicyDisplayConverter x:Key="DnsPolicyDisplay" />
 
+  <!-- The title bar's buttons. A theme of their own rather than a restyled Button, so nothing
+       of the control set's buttons (padding, corner radius, focus ring) reaches the chrome. Not
+       focusable, as in any window's title bar: the keyboard has Alt+F4 and the desktop's own
+       shortcuts, and these would only lengthen the tab order of every page. -->
+  <ControlTheme x:Key="YuraCaptionButton" TargetType="Button">
+    <Setter Property="Width" Value="46" />
+    <Setter Property="VerticalAlignment" Value="Stretch" />
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="Foreground" Value="{DynamicResource YuraTextSecondary}" />
+    <Setter Property="Focusable" Value="False" />
+    <Setter Property="IsTabStop" Value="False" />
+    <Setter Property="Template">
+      <ControlTemplate>
+        <Border Background="{TemplateBinding Background}">
+          <ContentPresenter Content="{TemplateBinding Content}"
+                            HorizontalAlignment="Center" VerticalAlignment="Center" />
+        </Border>
+      </ControlTemplate>
+    </Setter>
+    <Style Selector="^:pointerover">
+      <Setter Property="Background" Value="{DynamicResource YuraSurfaceHover}" />
+      <Setter Property="Foreground" Value="{DynamicResource YuraTextPrimary}" />
+    </Style>
+    <Style Selector="^:pressed">
+      <Setter Property="Background" Value="{DynamicResource YuraBorderSubtle}" />
+    </Style>
+    <!-- The one red in the chrome, and only under the pointer: closing is the action to be sure of. -->
+    <Style Selector="^.Close:pointerover">
+      <Setter Property="Background" Value="#C42B1C" />
+      <Setter Property="Foreground" Value="#FFFFFF" />
+    </Style>
+    <Style Selector="^.Close:pressed">
+      <Setter Property="Background" Value="#A3271B" />
+      <Setter Property="Foreground" Value="#FFFFFF" />
+    </Style>
+  </ControlTheme>
+
+  <!-- The frame Avalonia draws around the window while Yura draws its own title bar. On X11 an
+       undecorated window has no edge to be resized by, and the shadow is that edge: its width is
+       what the pointer can catch. The line inside it is a panel border, and its corners follow
+       the window's content, which is rounded the same. -->
+  <ControlTheme x:Key="YuraWindowFrame" TargetType="WindowDrawnDecorations">
+    <Setter Property="DefaultTitleBarHeight" Value="0" />
+    <Setter Property="DefaultFrameThickness" Value="1" />
+    <Setter Property="DefaultShadowThickness" Value="10" />
+    <Setter Property="Template">
+      <WindowDrawnDecorationsTemplate>
+        <WindowDrawnDecorationsContent>
+          <WindowDrawnDecorationsContent.Underlay>
+            <Panel x:Name="PART_UnderlayWrapper">
+              <Border x:Name="PART_WindowBorder"
+                      Background="Transparent"
+                      BorderThickness="{TemplateBinding FrameThickness}"
+                      BorderBrush="{DynamicResource YuraBorderStrong}"
+                      CornerRadius="9"
+                      IsHitTestVisible="False" />
+            </Panel>
+          </WindowDrawnDecorationsContent.Underlay>
+        </WindowDrawnDecorationsContent>
+      </WindowDrawnDecorationsTemplate>
+    </Setter>
+    <Style Selector="^:has-shadow /template/ Panel#PART_UnderlayWrapper">
+      <Setter Property="Margin" Value="{TemplateBinding ShadowThickness}" />
+    </Style>
+    <Style Selector="^:has-shadow /template/ Border#PART_WindowBorder">
+      <Setter Property="BoxShadow" Value="0 3 12 0 #59000000" />
+    </Style>
+  </ControlTheme>
+
   <!-- The routing-policy cell. Pairs a colour with a word so colour never carries the
        meaning on its own, and stays fixed width so the column does not jitter. -->
   <DataTemplate x:Key="PolicyCell" x:DataType="vm:ProcessRowViewModel">

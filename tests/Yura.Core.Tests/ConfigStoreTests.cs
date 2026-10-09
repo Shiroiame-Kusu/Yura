@@ -168,6 +168,7 @@ public sealed class ConfigStoreTests : IDisposable
                 Theme = "light",
                 Language = "zh-Hans",
                 ReducedMotion = true,
+                UseSystemTitleBar = true,
                 DnsPolicy = DnsPolicy.Direct,
                 ShowAllProcesses = true,
             }));
@@ -177,8 +178,17 @@ public sealed class ConfigStoreTests : IDisposable
         Assert.Equal("light", document.Settings.Theme);
         Assert.Equal("zh-Hans", document.Settings.Language);
         Assert.True(document.Settings.ReducedMotion);
+        Assert.True(document.Settings.UseSystemTitleBar);
         Assert.Equal(DnsPolicy.Direct, document.Settings.DnsPolicy);
         Assert.True(document.Settings.ShowAllProcesses);
+    }
+
+    [Fact]
+    public void Yura_draws_its_own_title_bar_unless_told_otherwise()
+    {
+        var (document, _) = NewStore().Load();
+
+        Assert.False(document.Settings.UseSystemTitleBar);
     }
 
     /// <summary>A synchronization context whose thread never gets round to anything posted to it.</summary>

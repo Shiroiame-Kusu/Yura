@@ -334,6 +334,8 @@ internal static class Strings
         ["Settings.Chinese"] = "简体中文",
         ["Settings.ReducedMotion"] = "Reduce motion",
         ["Settings.ReducedMotionHint"] = "Removes transitions entirely rather than shortening them.",
+        ["Settings.SystemTitleBar"] = "Use the desktop's title bar",
+        ["Settings.SystemTitleBarHint"] = "Lets the desktop draw the window's title bar and frame, as it does for other applications, instead of Yura's own.",
         ["Settings.Processes"] = "Processes",
         ["Settings.ShowAllProcesses"] = "Show processes owned by other users",
         ["Settings.ShowAllProcessesHint"] = "System and root processes are hidden by default, because they are rarely what you want to route.",
@@ -460,6 +462,10 @@ internal static class Strings
 
         // -- shell additions ------------------------------------------------
         ["App.Tagline"] = "Per-process routing for Linux",
+        ["Shell.Minimize"] = "Minimize",
+        ["Shell.Maximize"] = "Maximize",
+        ["Shell.Restore"] = "Restore",
+        ["Shell.Close"] = "Close",
 
         // -- proxies page: sections, WireGuard exits, removal ---------------
         ["Proxy.Section"] = "Proxies and exits",
@@ -914,6 +920,8 @@ internal static class Strings
         ["Settings.Chinese"] = "简体中文",
         ["Settings.ReducedMotion"] = "减少动态效果",
         ["Settings.ReducedMotionHint"] = "完全移除过渡效果，而非仅缩短时长。",
+        ["Settings.SystemTitleBar"] = "使用桌面的标题栏",
+        ["Settings.SystemTitleBarHint"] = "由桌面绘制窗口的标题栏和边框，与其他应用程序一致，而不使用 Yura 自己的标题栏。",
         ["Settings.Processes"] = "进程",
         ["Settings.ShowAllProcesses"] = "显示其他用户的进程",
         ["Settings.ShowAllProcessesHint"] = "默认隐藏系统与 root 进程，因为通常不需要为它们设置路由。",
@@ -1036,6 +1044,10 @@ internal static class Strings
         ["Processes.Action.ResetExistingOffHint"] = "已经打开的连接在应用程序自行重新连接之前仍使用原有路由。",
 
         ["App.Tagline"] = "Linux 按进程路由",
+        ["Shell.Minimize"] = "最小化",
+        ["Shell.Maximize"] = "最大化",
+        ["Shell.Restore"] = "还原",
+        ["Shell.Close"] = "关闭",
 
         ["Proxy.Section"] = "代理与出口",
         ["Proxy.Empty"] = "还没有代理。",

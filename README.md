@@ -376,6 +376,11 @@ is unreferenced.
   counts as an answer (game servers mostly listen on UDP and refuse TCP), loss is counted only
   once the target has answered, and a proxy that answers before it connects — mihomo does — is
   reported as unmeasurable rather than plotted at the speed of loopback
+- **Its own title bar**: the sidebar's colour runs to the top of the window and the pages' to
+  the window buttons, with a frame Avalonia draws whose shadow is the edge to resize by.
+  Dragging moves the window and a double click maximises it, both left to the window manager,
+  so snapping and tiling keep working. Settings → Appearance brings back the desktop's title
+  bar and frame instead
 - A systemd service installed from Settings through polkit, with the unit and the script
   shown before anything runs as root, and start / stop / restart / uninstall from the same
   page
@@ -384,7 +389,7 @@ is unreferenced.
   binding compiled. The acceptance suite passes 151/151 on the native daemon and agent, every
   page of the native app renders as the development build does, and switching language in it
   live updates the UI in place
-- 520 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+- 521 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
   wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and tunnel
   manager, the agent protocol end to end against a real agent — full-cone UDP included — the
   agent's systemd unit, its key and token on disk and who may write them, the connect string,

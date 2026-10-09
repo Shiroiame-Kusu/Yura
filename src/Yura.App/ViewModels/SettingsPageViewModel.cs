@@ -71,6 +71,12 @@ public sealed partial class SettingsPageViewModel : ObservableObject
         set => _shell.ReducedMotion = value;
     }
 
+    public bool UseSystemTitleBar
+    {
+        get => _shell.UseSystemTitleBar;
+        set => _shell.UseSystemTitleBar = value;
+    }
+
     public bool ShowAllProcesses
     {
         get => _shell.Processes.FilterScope == ProcessFilterScope.AllProcesses;
@@ -452,6 +458,7 @@ public sealed partial class SettingsPageViewModel : ObservableObject
         OnPropertyChanged(nameof(IsDarkTheme));
         OnPropertyChanged(nameof(SelectedLanguage));
         OnPropertyChanged(nameof(ReducedMotion));
+        OnPropertyChanged(nameof(UseSystemTitleBar));
         OnPropertyChanged(nameof(DnsPolicy));
         OnPropertyChanged(nameof(DnsPolicyHint));
         OnPropertyChanged(nameof(ShowAllProcesses));

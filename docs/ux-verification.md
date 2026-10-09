@@ -51,7 +51,7 @@ the token — `YuraBorderControl` (3:1, outlines inputs) is distinct from `YuraB
 `07-processes-zh.png`, `08-games-zh-demo.png`, `09-proxy-editor-zh-demo.png`,
 `23-connections-zh-demo.png`, `24-rules-zh-demo.png`, `25-settings-zh-demo.png`.
 
-All 434 strings exist in both tables, and nothing references a key that is missing from
+All 548 strings exist in both tables, and nothing references a key that is missing from
 either — checked mechanically by `tools/check-strings.py`, which also reports keys in the
 table that nothing uses (currently none):
 
@@ -107,6 +107,42 @@ Four defects were found at the minimum size, every one of them by rendering it:
   below 1120 DIPs — and the address and hop lines now trim with an ellipsis and carry the full
   value in a tooltip. Three pages having needed this is why it is one control per inspector
   rather than a copy in each placement.
+
+### The window's own title bar
+
+`38-window-frame-kwin-demo.png`, `39-window-desktop-frame-kwin-demo.png`; and at the top of
+every other screenshot.
+
+Yura draws its title bar: the sidebar's colour runs to the top edge with the name and icon in
+it, and the pages' colour runs up to the window buttons, so the window reads as one surface
+rather than a desktop frame around an app. Around it Avalonia draws a frame, a one-DIP line and
+a ten-DIP shadow. That shadow is not decoration: an X11 window without the desktop's frame has
+no edge to resize by, and the shadow is where the pointer catches. Corners are rounded, and
+square when maximised, when nothing would show past them. The buttons are not in the tab
+order, as on any title bar, and carry accessible names; the maximise button says Restore once
+the window is maximised.
+
+The screenshots under Xvfb show the title bar, but nothing can be dragged, resized or
+maximised there, because there is no window manager. So `tools/check-window.sh` checks the
+window in KWin itself, nested and offscreen with its own D-Bus session and configuration, and
+drives it with the pointer through the X server KWin starts for X11 clients. **11 of 11 pass**
+on KWin 6.7.5: the window asks for no decorations and has an alpha channel; the frame surrounds
+the content rather than eating into it; dragging the title bar moves the window, and dragging
+the frame's edge resizes it; a double click maximises it to the whole screen and the restore
+button puts it back where it was; minimise hides it, and close closes it and the process
+exits; and with **Use the desktop's title bar** set, KWin decorates the window and it is the
+content alone. The two screenshots are KWin's own captures from that run, composited, shadow
+included.
+
+Writing that check found a defect older than the title bar: closing the window never ended
+the process. The handler that saves the configuration on exit waited, on the UI thread, for a
+save that resumed on the UI thread. The window stayed on screen and the process ran on, as the
+build before the title bar shows too when the desktop closes it. Saving on exit now waits only
+for the store, which never comes back to the calling thread, and a test holds the store to that.
+
+```bash
+tools/check-window.sh
+```
 
 ### Settings
 

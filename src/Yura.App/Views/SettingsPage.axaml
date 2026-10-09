@@ -215,6 +215,16 @@
                                 AutomationProperties.Name="{loc:Tr Settings.ReducedMotion}" />
                 </Grid>
               </Border>
+              <Border Classes="SettingRow">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
+                  <StackPanel Grid.Column="0">
+                    <TextBlock Classes="SettingTitle" Text="{loc:Tr Settings.SystemTitleBar}" />
+                    <TextBlock Classes="SettingDescription" Text="{loc:Tr Settings.SystemTitleBarHint}" />
+                  </StackPanel>
+                  <ToggleSwitch Grid.Column="1" IsChecked="{Binding UseSystemTitleBar}" VerticalAlignment="Center"
+                                AutomationProperties.Name="{loc:Tr Settings.SystemTitleBar}" />
+                </Grid>
+              </Border>
             </StackPanel>
           </Border>
         </StackPanel>

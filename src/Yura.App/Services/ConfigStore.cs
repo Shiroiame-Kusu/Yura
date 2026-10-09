@@ -205,6 +205,9 @@ public sealed class PersistedSettings
 
     public bool ReducedMotion { get; set; }
 
+    /// <summary>Let the desktop draw the window's title bar and frame instead of Yura.</summary>
+    public bool UseSystemTitleBar { get; set; }
+
     /// <summary>Whether DNS from proxied processes goes through the proxy. See <see cref="DnsPolicy"/>.</summary>
     public DnsPolicy DnsPolicy { get; set; } = DnsPolicy.ThroughProxy;
 

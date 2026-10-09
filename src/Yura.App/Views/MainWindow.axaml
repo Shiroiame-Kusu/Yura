@@ -12,122 +12,191 @@
         Title="Yura"
         Width="1280" Height="800"
         MinWidth="960" MinHeight="640"
-        Background="{DynamicResource YuraSurfaceBase}"
-        FontFamily="{DynamicResource YuraFontUi}">
+        Background="Transparent"
+        FontFamily="{DynamicResource YuraFontUi}"
+        WindowDecorationsTheme="{StaticResource YuraWindowFrame}">
 
-  <Grid ColumnDefinitions="216,*">
+  <!-- The whole window inside one border, so its corners can be rounded while Yura draws its own
+       frame, and square when the desktop draws it or the window is maximised. -->
+  <Border x:Name="WindowFrame" Background="{DynamicResource YuraSurfaceBase}" ClipToBounds="True">
+    <Grid RowDefinitions="Auto,*">
 
-    <!-- ====================== Left navigation sidebar ======================
-         Fixed width and always visible: navigation must not move or collapse as the
-         window resizes, so the user's spatial memory of it stays valid. -->
-    <Border Grid.Column="0"
-            Background="{DynamicResource YuraSurfaceRaised}"
-            BorderBrush="{DynamicResource YuraBorderSubtle}"
-            BorderThickness="0,0,1,0">
-      <Grid RowDefinitions="Auto,*,Auto">
-
-        <StackPanel Grid.Row="0" Margin="16,18,16,14" Spacing="2">
-          <TextBlock Text="Yura" FontSize="18" FontWeight="SemiBold" />
-          <TextBlock Classes="Caption" Text="{loc:Tr App.Tagline}" />
-        </StackPanel>
-
-        <ListBox Grid.Row="1"
-                 Classes="Nav"
-                 ItemsSource="{Binding Pages}"
-                 SelectedItem="{Binding SelectedPage}"
-                 Background="Transparent"
-                 BorderThickness="0"
-                 Padding="8,0"
-                 AutomationProperties.Name="Main navigation">
-          <ListBox.ItemTemplate>
-            <DataTemplate x:DataType="vm:NavigationItem">
-              <StackPanel Orientation="Horizontal" Spacing="10" Height="32">
-                <icons:SymbolIcon Symbol="{Binding Icon}" FontSize="18" VerticalAlignment="Center" />
-                <TextBlock Text="{Binding Label}" VerticalAlignment="Center" />
-              </StackPanel>
-            </DataTemplate>
-          </ListBox.ItemTemplate>
-        </ListBox>
-
-        <!-- Daemon status. Always visible: whether routing can take effect at all is the
-             single most important piece of ambient state in the application. -->
-        <StackPanel Grid.Row="2" Margin="16,12,16,16" Spacing="8">
-          <StackPanel Orientation="Horizontal" Spacing="8">
-            <Ellipse Width="8" Height="8" VerticalAlignment="Center"
-                     Classes="StatusDot"
-                     Classes.Connected="{Binding IsDaemonConnected}" />
-            <TextBlock Classes="Caption" Text="{Binding DaemonStatusText}" />
+      <!-- ============================== Title bar ==============================
+           Yura's own, in place of the desktop's, so the window reads as one surface: the
+           sidebar's colour runs to the top edge and the pages' to the buttons. Dragging it
+           anywhere but the buttons moves the window, and a double click maximises it, as on any
+           title bar. Hidden when the desktop draws its own (Settings, Appearance). -->
+      <Grid x:Name="TitleBar" Grid.Row="0" Height="36" ColumnDefinitions="216,*,Auto"
+            PointerPressed="OnTitleBarPressed" PointerMoved="OnTitleBarMoved" PointerReleased="OnTitleBarReleased">
+        <Border Grid.Column="0"
+                Background="{DynamicResource YuraSurfaceRaised}"
+                BorderBrush="{DynamicResource YuraBorderSubtle}"
+                BorderThickness="0,0,1,0"
+                ToolTip.Tip="{loc:Tr App.Tagline}">
+          <StackPanel Orientation="Horizontal" Spacing="9" Margin="16,0" VerticalAlignment="Center">
+            <!-- packaging/yura.svg, drawn rather than loaded so it stays sharp at any scale. -->
+            <Viewbox Width="18" Height="18">
+              <Canvas Width="256" Height="256">
+                <Rectangle Canvas.Left="16" Canvas.Top="16" Width="224" Height="224" RadiusX="52" RadiusY="52"
+                           Fill="#1C1F24" Stroke="#2C3139" StrokeThickness="2" />
+                <Path Data="M128,132 C128,104 82,108 82,76" Stroke="#6B7480" StrokeThickness="18"
+                      StrokeLineCap="Round" />
+                <Path Data="M128,192 L128,132 C128,104 174,108 174,76" Stroke="#2FA79F" StrokeThickness="20"
+                      StrokeLineCap="Round" StrokeJoin="Round" />
+                <Ellipse Canvas.Left="66.5" Canvas.Top="56.5" Width="31" Height="31"
+                         Fill="#6B7480" Stroke="#1C1F24" StrokeThickness="5" />
+                <Ellipse Canvas.Left="153" Canvas.Top="49" Width="42" Height="42"
+                         Fill="#2FA79F" Stroke="#1C1F24" StrokeThickness="6" />
+                <Ellipse Canvas.Left="112" Canvas.Top="178" Width="32" Height="32" Fill="#2FA79F" />
+              </Canvas>
+            </Viewbox>
+            <TextBlock Text="Yura" FontWeight="SemiBold" VerticalAlignment="Center" />
           </StackPanel>
+        </Border>
 
+        <Border Grid.Column="1" Background="Transparent" />
+
+        <StackPanel Grid.Column="2" Orientation="Horizontal">
+          <Button x:Name="MinimizeButton" Theme="{StaticResource YuraCaptionButton}" Click="OnMinimize"
+                  ToolTip.Tip="{loc:Tr Shell.Minimize}" AutomationProperties.Name="{loc:Tr Shell.Minimize}">
+            <Path Data="M0,5.5 L10,5.5" Width="10" Height="10" StrokeThickness="1"
+                  Stroke="{Binding $parent[Button].Foreground}" />
+          </Button>
+          <!-- Its label says Maximize or Restore, so the window sets it with the state. -->
+          <Button x:Name="MaximizeButton" Theme="{StaticResource YuraCaptionButton}" Click="OnMaximize">
+            <Panel Width="10" Height="10">
+              <Path x:Name="MaximizeGlyph" Data="M0.5,0.5 L9.5,0.5 L9.5,9.5 L0.5,9.5 Z" StrokeThickness="1"
+                    Stroke="{Binding $parent[Button].Foreground}" />
+              <Path x:Name="RestoreGlyph" IsVisible="False" StrokeThickness="1"
+                    Data="M2.5,2.5 L2.5,0.5 L9.5,0.5 L9.5,7.5 L7.5,7.5 M0.5,2.5 L7.5,2.5 L7.5,9.5 L0.5,9.5 Z"
+                    Stroke="{Binding $parent[Button].Foreground}" />
+            </Panel>
+          </Button>
+          <Button x:Name="CloseButton" Classes="Close" Theme="{StaticResource YuraCaptionButton}" Click="OnClose"
+                  ToolTip.Tip="{loc:Tr Shell.Close}" AutomationProperties.Name="{loc:Tr Shell.Close}">
+            <Path Data="M0,0 L10,10 M10,0 L0,10" Width="10" Height="10" StrokeThickness="1"
+                  Stroke="{Binding $parent[Button].Foreground}" />
+          </Button>
         </StackPanel>
       </Grid>
-    </Border>
 
-    <!-- ============================== Workspace ============================== -->
-    <Grid Grid.Column="1" RowDefinitions="Auto,Auto,*">
+      <Grid Grid.Row="1" ColumnDefinitions="216,*">
 
-      <!-- Persistent problem banner. Not a toast: it stays true until acted on. -->
-      <Border Grid.Row="0"
-              Background="{DynamicResource YuraWarningSubtle}"
-              BorderBrush="{DynamicResource YuraWarning}"
-              BorderThickness="0,0,0,1"
-              Padding="24,10"
-              IsVisible="{Binding !IsDaemonConnected}">
-        <Grid ColumnDefinitions="Auto,*,Auto">
-          <icons:SymbolIcon Grid.Column="0" Symbol="Warning" FontSize="18"
-                            Foreground="{DynamicResource YuraWarning}"
-                            VerticalAlignment="Center" Margin="0,0,10,0" />
-          <StackPanel Grid.Column="1" Spacing="1" VerticalAlignment="Center">
-            <TextBlock Text="{Binding DaemonStatusText}" FontWeight="SemiBold"
-                       Foreground="{DynamicResource YuraWarning}" />
-            <TextBlock Classes="Caption" Text="{Binding DaemonBannerDetail}" TextWrapping="Wrap" />
-          </StackPanel>
-          <Button Grid.Column="2" Content="{loc:Tr Shell.Reconnect}"
-                  Command="{Binding ReconnectCommand}" VerticalAlignment="Center" />
+        <!-- ====================== Left navigation sidebar ======================
+             Fixed width and always visible: navigation must not move or collapse as the
+             window resizes, so the user's spatial memory of it stays valid. -->
+        <Border Grid.Column="0"
+                Background="{DynamicResource YuraSurfaceRaised}"
+                BorderBrush="{DynamicResource YuraBorderSubtle}"
+                BorderThickness="0,0,1,0">
+          <Grid RowDefinitions="Auto,*,Auto">
+
+            <!-- The name, where the desktop draws the title bar; Yura's own carries it instead. -->
+            <StackPanel x:Name="SidebarHeader" Grid.Row="0" Margin="16,18,16,14" Spacing="2" IsVisible="False">
+              <TextBlock Text="Yura" FontSize="18" FontWeight="SemiBold" />
+              <TextBlock Classes="Caption" Text="{loc:Tr App.Tagline}" />
+            </StackPanel>
+
+            <ListBox Grid.Row="1"
+                     Margin="0,6,0,0"
+                     Classes="Nav"
+                     ItemsSource="{Binding Pages}"
+                     SelectedItem="{Binding SelectedPage}"
+                     Background="Transparent"
+                     BorderThickness="0"
+                     Padding="8,0"
+                     AutomationProperties.Name="Main navigation">
+              <ListBox.ItemTemplate>
+                <DataTemplate x:DataType="vm:NavigationItem">
+                  <StackPanel Orientation="Horizontal" Spacing="10" Height="32">
+                    <icons:SymbolIcon Symbol="{Binding Icon}" FontSize="18" VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding Label}" VerticalAlignment="Center" />
+                  </StackPanel>
+                </DataTemplate>
+              </ListBox.ItemTemplate>
+            </ListBox>
+
+            <!-- Daemon status. Always visible: whether routing can take effect at all is the
+                 single most important piece of ambient state in the application. -->
+            <StackPanel Grid.Row="2" Margin="16,12,16,16" Spacing="8">
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <Ellipse Width="8" Height="8" VerticalAlignment="Center"
+                         Classes="StatusDot"
+                         Classes.Connected="{Binding IsDaemonConnected}" />
+                <TextBlock Classes="Caption" Text="{Binding DaemonStatusText}" />
+              </StackPanel>
+
+            </StackPanel>
+          </Grid>
+        </Border>
+
+        <!-- ============================== Workspace ============================== -->
+        <Grid Grid.Column="1" RowDefinitions="Auto,Auto,*">
+
+          <!-- Persistent problem banner. Not a toast: it stays true until acted on. -->
+          <Border Grid.Row="0"
+                  Background="{DynamicResource YuraWarningSubtle}"
+                  BorderBrush="{DynamicResource YuraWarning}"
+                  BorderThickness="0,0,0,1"
+                  Padding="24,10"
+                  IsVisible="{Binding !IsDaemonConnected}">
+            <Grid ColumnDefinitions="Auto,*,Auto">
+              <icons:SymbolIcon Grid.Column="0" Symbol="Warning" FontSize="18"
+                                Foreground="{DynamicResource YuraWarning}"
+                                VerticalAlignment="Center" Margin="0,0,10,0" />
+              <StackPanel Grid.Column="1" Spacing="1" VerticalAlignment="Center">
+                <TextBlock Text="{Binding DaemonStatusText}" FontWeight="SemiBold"
+                           Foreground="{DynamicResource YuraWarning}" />
+                <TextBlock Classes="Caption" Text="{Binding DaemonBannerDetail}" TextWrapping="Wrap" />
+              </StackPanel>
+              <Button Grid.Column="2" Content="{loc:Tr Shell.Reconnect}"
+                      Command="{Binding ReconnectCommand}" VerticalAlignment="Center" />
+            </Grid>
+          </Border>
+
+          <!-- Every page is kept alive rather than swapped, so search text, filters, column
+               widths and scroll position survive moving between them. The ones that poll are
+               started and stopped by the shell instead. -->
+          <!-- Configuration problems: also persistent, also actionable. -->
+          <Border Grid.Row="1"
+                  Background="{DynamicResource YuraDangerSubtle}"
+                  BorderBrush="{DynamicResource YuraDanger}"
+                  BorderThickness="0,0,0,1"
+                  Padding="24,10"
+                  IsVisible="{Binding ConfigWarning, Converter={x:Static ObjectConverters.IsNotNull}}">
+            <Grid ColumnDefinitions="Auto,*">
+              <icons:SymbolIcon Grid.Column="0" Symbol="Warning" FontSize="18"
+                                Foreground="{DynamicResource YuraDanger}"
+                                VerticalAlignment="Center" Margin="0,0,10,0" />
+              <TextBlock Grid.Column="1" Classes="Caption" Text="{Binding ConfigWarning}"
+                         TextWrapping="Wrap" VerticalAlignment="Center" />
+            </Grid>
+          </Border>
+
+          <Panel Grid.Row="2">
+            <views:ProcessesPage DataContext="{Binding Processes}"
+                                 IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsProcessesSelected}" />
+
+            <views:GamesPage DataContext="{Binding Games}"
+                             IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsGamesSelected}" />
+
+            <views:ConnectionsPage DataContext="{Binding Connections}"
+                                   IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsConnectionsSelected}" />
+
+            <views:ProxiesPage DataContext="{Binding Proxies}"
+                               IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsProxiesSelected}" />
+
+            <views:RulesPage DataContext="{Binding RulesPage}"
+                             IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsRulesSelected}" />
+
+            <views:DiagnosticsPage DataContext="{Binding Diagnostics}"
+                                   IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsDiagnosticsSelected}" />
+
+            <views:SettingsPage DataContext="{Binding Settings}"
+                                IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsSettingsSelected}" />
+          </Panel>
         </Grid>
-      </Border>
-
-      <!-- Every page is kept alive rather than swapped, so search text, filters, column
-           widths and scroll position survive moving between them. The ones that poll are
-           started and stopped by the shell instead. -->
-      <!-- Configuration problems: also persistent, also actionable. -->
-      <Border Grid.Row="1"
-              Background="{DynamicResource YuraDangerSubtle}"
-              BorderBrush="{DynamicResource YuraDanger}"
-              BorderThickness="0,0,0,1"
-              Padding="24,10"
-              IsVisible="{Binding ConfigWarning, Converter={x:Static ObjectConverters.IsNotNull}}">
-        <Grid ColumnDefinitions="Auto,*">
-          <icons:SymbolIcon Grid.Column="0" Symbol="Warning" FontSize="18"
-                            Foreground="{DynamicResource YuraDanger}"
-                            VerticalAlignment="Center" Margin="0,0,10,0" />
-          <TextBlock Grid.Column="1" Classes="Caption" Text="{Binding ConfigWarning}"
-                     TextWrapping="Wrap" VerticalAlignment="Center" />
-        </Grid>
-      </Border>
-
-      <Panel Grid.Row="2">
-        <views:ProcessesPage DataContext="{Binding Processes}"
-                             IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsProcessesSelected}" />
-
-        <views:GamesPage DataContext="{Binding Games}"
-                         IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsGamesSelected}" />
-
-        <views:ConnectionsPage DataContext="{Binding Connections}"
-                               IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsConnectionsSelected}" />
-
-        <views:ProxiesPage DataContext="{Binding Proxies}"
-                           IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsProxiesSelected}" />
-
-        <views:RulesPage DataContext="{Binding RulesPage}"
-                         IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsRulesSelected}" />
-
-        <views:DiagnosticsPage DataContext="{Binding Diagnostics}"
-                               IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsDiagnosticsSelected}" />
-
-        <views:SettingsPage DataContext="{Binding Settings}"
-                            IsVisible="{Binding $parent[Window].((vm:ShellViewModel)DataContext).IsSettingsSelected}" />
-      </Panel>
+      </Grid>
     </Grid>
-  </Grid>
+  </Border>
 </Window>
