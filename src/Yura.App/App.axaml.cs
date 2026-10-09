@@ -75,7 +75,7 @@ public sealed partial class YuraApplication : Application
             var window = new MainWindow { DataContext = shell };
 
             // Flush any debounced change before the process goes away.
-            desktop.ShutdownRequested += (_, _) => shell.SaveConfigurationAsync().GetAwaiter().GetResult();
+            desktop.ShutdownRequested += (_, _) => shell.SaveConfigurationBeforeExit();
             if (options.ScreenshotMode)
             {
                 window.Width = options.Width;

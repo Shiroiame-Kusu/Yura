@@ -385,31 +385,41 @@ public sealed partial class ShellViewModel : ObservableObject, IDisposable
     /// <summary>Lets a page ask for its change to be persisted, on the same debounce.</summary>
     public void RequestSave() => ScheduleSave();
 
-    /// <summary>Writes the configuration now, bypassing the debounce. Used on shutdown.</summary>
+    /// <summary>Writes the configuration now, bypassing the debounce.</summary>
     public async Task SaveConfigurationAsync()
     {
-        var snapshot = new ConfigSnapshot
-        {
-            Settings = new PersistedSettings
-            {
-                Theme = IsDarkTheme ? "dark" : "light",
-                Language = IsChinese ? "zh-Hans" : "en",
-                ReducedMotion = ReducedMotion,
-                DnsPolicy = DnsPolicy,
-                ShowAllProcesses = Processes.FilterScope == ProcessFilterScope.AllProcesses,
-            },
-            Proxies = Rules.Proxies,
-            Chains = Rules.Chains,
-            Games = Games.Profiles,
-            Rules = Rules.Rules,
-        };
-
-        var error = await _config.SaveAsync(snapshot).ConfigureAwait(true);
+        var error = await _config.SaveAsync(Snapshot()).ConfigureAwait(true);
         if (error is not null)
         {
             ConfigWarning = error;
         }
     }
+
+    /// <summary>Writes the configuration as the app exits, and returns once it is written.</summary>
+    /// <remarks>
+    /// For the shutdown handler, which runs on the UI thread and cannot await. Waiting there on
+    /// <see cref="SaveConfigurationAsync"/> hung every exit: it resumes on the UI thread, which
+    /// the handler is holding, so closing the window left it on screen and the process running.
+    /// The store never comes back to the calling thread, so waiting on it is safe, and a failure
+    /// has nowhere left to be shown.
+    /// </remarks>
+    public void SaveConfigurationBeforeExit() => _config.SaveAsync(Snapshot()).GetAwaiter().GetResult();
+
+    private ConfigSnapshot Snapshot() => new()
+    {
+        Settings = new PersistedSettings
+        {
+            Theme = IsDarkTheme ? "dark" : "light",
+            Language = IsChinese ? "zh-Hans" : "en",
+            ReducedMotion = ReducedMotion,
+            DnsPolicy = DnsPolicy,
+            ShowAllProcesses = Processes.FilterScope == ProcessFilterScope.AllProcesses,
+        },
+        Proxies = Rules.Proxies,
+        Chains = Rules.Chains,
+        Games = Games.Profiles,
+        Rules = Rules.Rules,
+    };
 
     // -- daemon status -------------------------------------------------------
 

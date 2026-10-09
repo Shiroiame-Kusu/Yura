@@ -384,7 +384,7 @@ is unreferenced.
   binding compiled. The acceptance suite passes 151/151 on the native daemon and agent, every
   page of the native app renders as the development build does, and switching language in it
   live updates the UI in place
-- 519 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+- 520 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
   wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and tunnel
   manager, the agent protocol end to end against a real agent — full-cone UDP included — the
   agent's systemd unit, its key and token on disk and who may write them, the connect string,

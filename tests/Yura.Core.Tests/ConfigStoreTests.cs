@@ -181,6 +181,39 @@ public sealed class ConfigStoreTests : IDisposable
         Assert.True(document.Settings.ShowAllProcesses);
     }
 
+    /// <summary>A synchronization context whose thread never gets round to anything posted to it.</summary>
+    private sealed class HeldThread : SynchronizationContext
+    {
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+        }
+
+        public override void Send(SendOrPostCallback d, object? state)
+        {
+        }
+    }
+
+    [Fact]
+    public void Saving_never_waits_for_the_thread_that_asked()
+    {
+        // The app saves on exit from the UI thread, which waits for the save and so runs nothing
+        // else. A save that came back to that thread to finish hung every exit, the window left
+        // on screen and the process running.
+        var previous = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(new HeldThread());
+        try
+        {
+            var save = NewStore().SaveAsync(Snapshot(proxies: [Proxy()]));
+
+            Assert.True(save.Wait(TimeSpan.FromSeconds(10)), "the save waited for the thread that is waiting for it");
+            Assert.Null(save.Result);
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previous);
+        }
+    }
+
     [Fact]
     public async Task The_config_file_is_not_readable_by_other_users()
     {
