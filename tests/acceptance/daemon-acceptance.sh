@@ -1154,6 +1154,68 @@ check "the servers inside the namespace saw the probes arrive from the agent" ba
   b=\$(python3 '$LIB/logquery.py' count '$RUN/stun-agent-b.jsonl' --event binding)
   [[ \$a -ge 1 && \$b -ge 1 ]] && echo \"\$a query at ${UNREACHABLE} and \$b at ${UNREACHABLE_B}, inside ${AG_NS}\""
 
+# The filtering question, which tells a NAT2 from a NAT3. These servers have two addresses and
+# two ports and answer from whichever they are asked to, and a firewall in the agent's namespace
+# filters the way a NAT would, a different way for each server. All of it is inside the
+# namespace, so whatever gets in can only have come through the agent's full-cone socket.
+ip netns exec "$AG_NS" python3 "${LIB}/stun_server.py" --listen "$UNREACHABLE" --port 3480 \
+  --alternate "${UNREACHABLE_B}:3481" --log "$RUN/stun-nat1.jsonl" > "$RUN/stun-nat1.out" 2>&1 & BG+=($!)
+ip netns exec "$AG_NS" python3 "${LIB}/stun_server.py" --listen "$UNREACHABLE" --port 3484 \
+  --alternate "${UNREACHABLE_B}:3485" --log "$RUN/stun-nat3.jsonl" > "$RUN/stun-nat3.out" 2>&1 & BG+=($!)
+ip netns exec "$AG_NS" python3 "${LIB}/stun_server.py" --listen "$UNREACHABLE" --port 3486 \
+  --alternate "${UNREACHABLE_B}:3487" --log "$RUN/stun-nat2.jsonl" > "$RUN/stun-nat2.out" 2>&1 & BG+=($!)
+# And one that names a second address and never answers from it.
+ip netns exec "$AG_NS" python3 "${LIB}/stun_server.py" --listen "$UNREACHABLE" --port 3482 \
+  --other "${UNREACHABLE_B}:3483" --log "$RUN/stun-silent.jsonl" > "$RUN/stun-silent.out" 2>&1 & BG+=($!)
+# From 3484-3485 only an answer from exactly where the agent sent gets in, as behind a NAT3 or a
+# stateful cloud firewall; from 3486-3487, an answer from any port of a host the agent sent to,
+# as behind a NAT2.
+ip netns exec "$AG_NS" nft -f - <<NFT
+table inet yura_acceptance_nat {
+  set sent_to { type ipv4_addr; flags dynamic, timeout; timeout 5m; }
+  chain output {
+    type filter hook output priority 0; policy accept;
+    ip saddr $AG_ADDR udp dport 3486-3487 update @sent_to { ip daddr }
+  }
+  chain input {
+    type filter hook input priority 0; policy accept;
+    ip daddr $AG_ADDR udp sport 3484-3485 ct state new drop
+    ip daddr $AG_ADDR udp sport 3486-3487 ip saddr != @sent_to drop
+  }
+}
+NFT
+sleep 1
+
+check "with nothing filtering in front of the agent, its route is NAT1" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"proxyId\":\"$AG_ID\",\"servers\":[\"${UNREACHABLE}:3480\",\"${UNREACHABLE_B}:3478\"],\"routeOnly\":true}}' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)['nat']['routed']
+assert r['verdict']=='open' and r['filtering']=='endpointIndependent', r
+print(f\\\"{r['verdict']}: an answer from an address the agent never sent to got in\\\")\" &&
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/stun-nat1.jsonl' --event answered_from --where-contains source=${UNREACHABLE_B}:3481)
+  [[ \$n -ge 1 ]] && echo \"the server answered \$n time(s) from ${UNREACHABLE_B}:3481\""
+check "behind a firewall that admits only where the agent sent, the route is NAT3, once the server has answered from its other port" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"proxyId\":\"$AG_ID\",\"servers\":[\"${UNREACHABLE}:3484\",\"${UNREACHABLE_B}:3478\"],\"routeOnly\":true}}' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)['nat']['routed']
+assert r['verdict']=='moderate' and r['filtering']=='addressAndPortDependent', r
+print(f\\\"{r['verdict']}, filtering {r['filtering']}\\\")\" &&
+  n=\$(python3 '$LIB/logquery.py' count '$RUN/stun-nat3.jsonl' --event binding --where-contains listen=${UNREACHABLE}:3485)
+  [[ \$n -ge 1 ]] && echo \"and before saying so it sent to ${UNREACHABLE}:3485 itself, which then answered\""
+check "behind a firewall that admits any port of a host the agent sent to, the route is NAT2" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"proxyId\":\"$AG_ID\",\"servers\":[\"${UNREACHABLE}:3486\",\"${UNREACHABLE_B}:3478\"],\"routeOnly\":true}}' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)['nat']['routed']
+assert r['verdict']=='moderate' and r['filtering']=='addressDependent', r
+print(f\\\"{r['verdict']}, filtering {r['filtering']}: the other port got in, the other address did not\\\")\""
+check "a server that never answers from its second address leaves the filtering unknown, not NAT3" bash -c "
+  '$DAEMON' ctl --socket '$SOCK' nat-test '{\"natTest\":{\"proxyId\":\"$AG_ID\",\"servers\":[\"${UNREACHABLE}:3482\",\"${UNREACHABLE_B}:3478\"],\"routeOnly\":true}}' | python3 -c \"
+import json,sys
+r=json.load(sys.stdin)['nat']['routed']
+assert r['verdict']=='moderate' and r['filtering']=='unknown', r
+assert \\\"the silence is the server's\\\" in r['diagnostics'], r
+print(f\\\"{r['verdict']}, filtering {r['filtering']}: nothing is put down to the NAT\\\")\""
+
 # The other half of full cone, which the NAT test cannot see because these STUN servers do not
 # answer the filtering question: whether a peer the game has never sent to can reach it. Asked
 # the way a game asks it. The game learns its address from one server and hands it to a peer at

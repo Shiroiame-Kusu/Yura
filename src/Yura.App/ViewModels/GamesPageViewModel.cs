@@ -1019,6 +1019,8 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HasNatResult));
         OnPropertyChanged(nameof(DirectNatVerdict));
         OnPropertyChanged(nameof(RoutedNatVerdict));
+        OnPropertyChanged(nameof(DirectNatNumber));
+        OnPropertyChanged(nameof(RoutedNatNumber));
         OnPropertyChanged(nameof(DirectNatDetail));
         OnPropertyChanged(nameof(RoutedNatDetail));
         OnPropertyChanged(nameof(NatComparison));
@@ -1543,6 +1545,11 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
 
     public string RoutedNatVerdict => VerdictLabel(RoutedNat);
 
+    /// <summary>NAT1 to NAT4 beside the verdict, or "NAT2 or NAT3" for a Moderate whose filtering is not known.</summary>
+    public string? DirectNatNumber => NumberLabel(DirectNat);
+
+    public string? RoutedNatNumber => NumberLabel(RoutedNat);
+
     public string DirectNatDetail => Detail(DirectNat);
 
     public string RoutedNatDetail => Detail(RoutedNat);
@@ -1555,34 +1562,20 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     {
         get
         {
-            if (DirectNat is not { } direct || RoutedNat is not { } routed)
-            {
-                return null;
-            }
-
             // Named after the route the test ran over, which is not necessarily the one
             // selected now.
             var routeName = _natRouteName ?? RouteName;
-            if (!routed.SupportsP2P() && direct.SupportsP2P())
+            return CompareNat() switch
             {
-                return string.Format(CultureInfo.CurrentCulture,
-                    Loc.Current["Games.Nat.WorseOnRoute"], routeName);
-            }
-
-            if (routed.SupportsP2P() && !direct.SupportsP2P())
-            {
-                return string.Format(CultureInfo.CurrentCulture,
-                    Loc.Current["Games.Nat.BetterOnRoute"], routeName);
-            }
-
-            return routed.Verdict == direct.Verdict
-                ? Loc.Current["Games.Nat.Same"]
-                : null;
+                NatChange.Worse => string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Nat.WorseOnRoute"], routeName),
+                NatChange.Better => string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Nat.BetterOnRoute"], routeName),
+                NatChange.None => Loc.Current["Games.Nat.Same"],
+                _ => null,
+            };
         }
     }
 
-    public bool NatComparisonIsWarning => DirectNat is { } direct && RoutedNat is { } routed &&
-                                          direct.SupportsP2P() && !routed.SupportsP2P();
+    public bool NatComparisonIsWarning => CompareNat() == NatChange.Worse;
 
     /// <summary>The comparison when it is not a warning, which the page shows in the neutral style.</summary>
     public bool HasNatComparisonInfo => NatComparison is not null && !NatComparisonIsWarning;
@@ -1595,6 +1588,78 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
 
     [ObservableProperty]
     public partial bool IsTestingNat { get; set; }
+
+    private enum NatChange
+    {
+        /// <summary>Not established either way.</summary>
+        Unknown,
+
+        None,
+
+        Better,
+
+        Worse,
+    }
+
+    /// <summary>Whether the route lets more players connect than going direct, or fewer.</summary>
+    /// <remarks>
+    /// Judged by who can connect, because that is what a player notices. A NAT2 to NAT3 change
+    /// is a real loss though both are Moderate: a NAT3 cannot reach a NAT4 player. NAT1 to NAT2
+    /// is not, since hole punching gets a NAT2 to every kind. A label that differs without
+    /// changing who can connect gets no sentence, and nor does a pair the measurement leaves open.
+    /// </remarks>
+    private NatChange CompareNat()
+    {
+        if (DirectNat is not { } direct || RoutedNat is not { } routed ||
+            Reach(direct) is not { } before || Reach(routed) is not { } after)
+        {
+            return NatChange.Unknown;
+        }
+
+        if (after.Most < before.Least)
+        {
+            return NatChange.Worse;
+        }
+
+        if (after.Least > before.Most)
+        {
+            return NatChange.Better;
+        }
+
+        var settled = direct.TypeNumber() is not null || direct.Verdict == NatVerdict.Blocked;
+        return settled && routed.Verdict == direct.Verdict && routed.TypeNumber() == direct.TypeNumber()
+            ? NatChange.None
+            : NatChange.Unknown;
+    }
+
+    /// <summary>
+    /// Which players can connect, from 3, everyone, through 2, all but NAT4, and 1, NAT1 and NAT2
+    /// only, to 0, nobody. A range, because a Moderate with unknown filtering is one of two.
+    /// </summary>
+    private static (int Least, int Most)? Reach(NatReportDto report) => report.Verdict switch
+    {
+        NatVerdict.Open => (3, 3),
+        NatVerdict.Moderate => report.TypeNumber() switch
+        {
+            2 => (3, 3),
+            3 => (2, 2),
+            _ => (2, 3),
+        },
+        NatVerdict.Strict => (1, 1),
+        NatVerdict.Blocked => (0, 0),
+        _ => null,
+    };
+
+    /// <summary>The number players use: NAT1 to NAT4, and for a Moderate not settled, the two it can be.</summary>
+    private static string? NumberLabel(NatReportDto? report)
+    {
+        if (report?.TypeNumber() is { } number)
+        {
+            return string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.Nat.Number"], number);
+        }
+
+        return report?.Verdict == NatVerdict.Moderate ? Loc.Current["Games.Nat.TwoOrThree"] : null;
+    }
 
     /// <summary>The verdict in the words games use, or plainly that it is not known.</summary>
     private static string VerdictLabel(NatReportDto? report) => report?.Verdict switch
@@ -1629,11 +1694,13 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             _ => Loc.Current["Games.Nat.MappingUnknown"],
         };
 
+        // A mapping that changes per peer is Strict whatever gets in, and the probe does not ask.
         var filtering = report.Filtering switch
         {
             NatFiltering.EndpointIndependent => Loc.Current["Games.Nat.FilterOpen"],
             NatFiltering.AddressDependent => Loc.Current["Games.Nat.FilterAddress"],
             NatFiltering.AddressAndPortDependent => Loc.Current["Games.Nat.FilterStrict"],
+            _ when report.Verdict == NatVerdict.Strict => null,
             _ => Loc.Current["Games.Nat.FilterUnknown"],
         };
 

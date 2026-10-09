@@ -251,16 +251,23 @@ measured a mapping no game routed through that proxy ever gets. Both paths are m
 reason `NetworkMeasurer` measures its target twice. `Stun` and `NatClassifier` are pure and live
 in `Yura.Core`, so the table of cases is unit tested rather than inferred from a live network.
 
-Three things it deliberately does not do:
+What it deliberately does not do:
 
 - **It does not run in the background.** The test asks a third party what address it sees, so
   it happens when the user presses the button and not before. The servers it used come back
   with the verdict, and the list can be overridden over IPC.
 - **It does not claim filtering behaviour it could not measure.** Telling
-  address-dependent filtering from address-and-port-dependent needs a server with two
-  addresses that honours `CHANGE-REQUEST`, and none of the freely available ones does. When it
-  cannot be tested the verdict is the conservative Moderate, `Filtering` stays `Unknown`, and
-  the panel says which question went unanswered — never the flattering Open.
+  address-dependent filtering (NAT2) from address-and-port-dependent (NAT3) needs a server with
+  two addresses that honours `CHANGE-REQUEST`. Google's and Cloudflare's have one address, and of
+  64 public servers tried on 2026-10-08, a third named a second address that was private,
+  absent or silent. The defaults put three that do answer from it first, each checked through a
+  full-cone route where nothing filtered the answer out. Even so, an answer that does not
+  arrive is only the NAT's doing if the server does answer from that port, so when neither
+  answer gets in, the probe sends to the server's other port itself and asks again: a NAT3 now
+  lets the answer in, and only that makes the verdict NAT3. If it still does not come, the
+  server is the silent one, the next capable server is asked, and failing that `Filtering`
+  stays `Unknown`, the verdict is the conservative Moderate, and the panel shows NAT2 or NAT3,
+  never the flattering Open.
 - **It does not report a mapping comparison it did not really make.** Two server names that
   resolve to one address would agree about the mapping for the trivial reason, so the
   classifier is told whether the second probe reached a genuinely different address, a
@@ -268,10 +275,21 @@ Three things it deliberately does not do:
   rules out a mapping keyed on the port and says nothing about one keyed on the address, so
   it stays Unknown rather than counting as endpoint-independent. The second server is tried
   among those not yet asked — a different address first — until one answers.
-- **It asks about filtering before anything else touches the mapping.** Whether a packet from
-  an address the game never sent to gets in is only a fair question while the game has not
-  sent there; probing the server's other address first would open the very hole the test then
-  reports as open.
+- **It asks about filtering before anything touches the server's other address.** Whether a
+  packet from an address the game never sent to gets in is only a fair question while the game
+  has not sent there; probing that address first, for the mapping, would open the very hole the
+  test then reports as open. So the mapping test asks the other servers first, holds back any at
+  the first server's other address or on its own address's other ports until the filtering is
+  known, and the probe keeps count of where it has sent, skipping a server whose answers
+  something already opened the way for. When the mapping turns out to vary, the filtering is
+  not tested at all: a NAT4 is Strict whatever gets in, and the test would only add seconds of
+  waiting for answers that a filtering NAT keeps out.
+
+The verdict carries the number players use as well as the console word: Open is NAT1,
+Moderate is NAT2 or NAT3 by its filtering, Strict is NAT4. The difference inside Moderate is
+real, because a NAT2 can reach a NAT4 player and a NAT3 cannot, so the panel's comparison of
+the two paths goes by who can connect rather than by the word: from NAT2 directly to NAT3
+through the route is a warning, though both are Moderate.
 
 ## The daemon as a service
 
@@ -413,8 +431,9 @@ Several types exist specifically to stop the UI asserting more than is known:
   them, and share the cone; a datagram from a peer the game never sent to opens a flow of its
   own, answered from that peer's address through the same transparent reply sockets as every
   other answer. So every peer sees one address — endpoint-independent mapping — and a new peer
-  can reach it — endpoint-independent filtering: Open, when the firewall in front of the agent
-  lets the range in, and Moderate behind a stateful one that does not. A few choices keep that
+  can reach it — endpoint-independent filtering: Open (NAT1), when the firewall in front of the
+  agent lets the range in, and Moderate behind a stateful one that does not — NAT3, for a cloud
+  firewall that tracks each address and port, which the NAT test can now tell apart. A few choices keep that
   safe and sane:
   - The agent's destination policy holds both ways: for each destination a channel sends to,
     and for each sender it hears from, so its own network and its own addresses can no more

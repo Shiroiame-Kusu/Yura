@@ -8,9 +8,13 @@ traffic that went through the exit into it, and the address it reports is the ad
 exit gives a game.
 
 Optionally advertises a second address with --other, which is what a client needs before it
-can ask to be answered from somewhere else. CHANGE-REQUEST itself is deliberately not
-honoured: this fixture exists to pin the mapping behaviour, and pretending to support the
-filtering tests would make the harness assert something the fixture is only simulating.
+can ask to be answered from somewhere else, and then ignores the asking: a server that names a
+second address and never answers from it, which a client must not take for a NAT filtering.
+
+With --alternate it is the server RFC 5780 describes instead. It listens on its two addresses
+and two ports, names the other in OTHER-ADDRESS, and honours CHANGE-REQUEST by answering from
+the socket asked for. That is what tells a NAT2 from a NAT3, so the harness puts a firewall
+that filters like one or the other in front of the client and checks which it is called.
 
 Runs unprivileged. Never needs root.
 """
@@ -19,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import select
 import socket
 import struct
 import sys
@@ -32,6 +37,7 @@ ATTR_MAPPED = 0x0001
 ATTR_CHANGE_REQUEST = 0x0003
 ATTR_XOR_MAPPED = 0x0020
 ATTR_SOFTWARE = 0x8022
+ATTR_RESPONSE_ORIGIN = 0x802B
 ATTR_OTHER_ADDRESS = 0x802C
 
 
@@ -78,6 +84,11 @@ def parse_change_request(body: bytes) -> int:
     return change
 
 
+def endpoint(text: str) -> tuple[str, int]:
+    host, _, port = text.rpartition(":")
+    return host, int(port)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--listen", required=True)
@@ -85,64 +96,99 @@ def main() -> int:
     parser.add_argument(
         "--other",
         metavar="ADDR:PORT",
-        help="Advertise this as the server's second address (OTHER-ADDRESS).",
+        help="Advertise this as the server's second address (OTHER-ADDRESS), and never answer from it.",
+    )
+    parser.add_argument(
+        "--alternate",
+        metavar="ADDR:PORT",
+        help="Listen on this second address and port too, advertise it, and honour CHANGE-REQUEST.",
     )
     parser.add_argument("--software", default="yura-acceptance-stun")
     parser.add_argument("--log", required=True)
     args = parser.parse_args()
 
     audit = AuditLog(args.log)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((args.listen, args.port))
-    print(f"stun on {args.listen}:{args.port}", flush=True)
+    primary = (args.listen, args.port)
+    alternate = endpoint(args.alternate) if args.alternate else None
+    advertised = alternate or (endpoint(args.other) if args.other else None)
 
-    other = None
-    if args.other:
-        host, _, port = args.other.rpartition(":")
-        other = (host, int(port))
+    # The primary socket always; with --alternate, the other three combinations of the two
+    # addresses and two ports, which is where CHANGE-REQUEST answers come from.
+    wanted = [primary]
+    if alternate is not None:
+        wanted += [(args.listen, alternate[1]), (alternate[0], args.port), alternate]
+    sockets = {}
+    for address in wanted:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(address)
+        sockets[address] = sock
+    print("stun on " + ", ".join(f"{h}:{p}" for h, p in sockets), flush=True)
 
     while True:
-        try:
-            data, client = sock.recvfrom(2048)
-        except OSError as exc:
-            audit.record(event="receive_failed", error=str(exc))
-            continue
+        readable, _, _ = select.select(list(sockets.values()), [], [])
+        for sock in readable:
+            local = sock.getsockname()
+            try:
+                data, client = sock.recvfrom(2048)
+            except OSError as exc:
+                audit.record(event="receive_failed", error=str(exc))
+                continue
 
-        if len(data) < 20:
-            continue
+            if len(data) < 20:
+                continue
 
-        kind, length, magic = struct.unpack("!HHI", data[:8])
-        transaction = data[8:20]
-        if magic != MAGIC or kind != BINDING_REQUEST or 20 + length > len(data):
-            audit.record(event="not_stun", client=f"{client[0]}:{client[1]}", bytes=len(data))
-            continue
+            kind, length, magic = struct.unpack("!HHI", data[:8])
+            transaction = data[8:20]
+            if magic != MAGIC or kind != BINDING_REQUEST or 20 + length > len(data):
+                audit.record(event="not_stun", client=f"{client[0]}:{client[1]}", bytes=len(data))
+                continue
 
-        change = parse_change_request(data[20:20 + length])
-        audit.record(
-            event="binding",
-            client=f"{client[0]}:{client[1]}",
-            change=change,
-            listen=f"{args.listen}:{args.port}",
-        )
+            change = parse_change_request(data[20:20 + length])
+            audit.record(
+                event="binding",
+                client=f"{client[0]}:{client[1]}",
+                change=change,
+                listen=f"{local[0]}:{local[1]}",
+            )
 
-        # A request to be answered from elsewhere is acknowledged in the log and then
-        # ignored, which is exactly what a server without a second address does.
-        if change:
-            audit.record(event="change_ignored", client=f"{client[0]}:{client[1]}", change=change)
-            continue
+            # Without --alternate, a request to be answered from elsewhere is acknowledged in the
+            # log and then ignored, which is what a server without a working second address does.
+            if change and alternate is None:
+                audit.record(event="change_ignored", client=f"{client[0]}:{client[1]}", change=change)
+                continue
 
-        body = attribute(ATTR_XOR_MAPPED, xor_address_value(client[0], client[1]))
-        body += attribute(ATTR_MAPPED, address_value(client[0], client[1]))
-        body += attribute(ATTR_SOFTWARE, args.software.encode("utf-8"))
-        if other is not None:
-            body += attribute(ATTR_OTHER_ADDRESS, address_value(other[0], other[1]))
+            source = local
+            if change:
+                host, port = local
+                if change & 0x04:
+                    host = alternate[0] if host == args.listen else args.listen
+                if change & 0x02:
+                    port = alternate[1] if port == args.port else args.port
+                source = (host, port)
 
-        reply = struct.pack("!HHI", BINDING_SUCCESS, len(body), MAGIC) + transaction + body
-        try:
-            sock.sendto(reply, client)
-        except OSError as exc:
-            audit.record(event="send_failed", client=f"{client[0]}:{client[1]}", error=str(exc))
+            body = attribute(ATTR_XOR_MAPPED, xor_address_value(client[0], client[1]))
+            body += attribute(ATTR_MAPPED, address_value(client[0], client[1]))
+            body += attribute(ATTR_SOFTWARE, args.software.encode("utf-8"))
+            if advertised is not None:
+                body += attribute(ATTR_OTHER_ADDRESS, address_value(advertised[0], advertised[1]))
+            if alternate is not None:
+                body += attribute(ATTR_RESPONSE_ORIGIN, address_value(source[0], source[1]))
+
+            reply = struct.pack("!HHI", BINDING_SUCCESS, len(body), MAGIC) + transaction + body
+            try:
+                sockets[source].sendto(reply, client)
+            except OSError as exc:
+                audit.record(event="send_failed", client=f"{client[0]}:{client[1]}", error=str(exc))
+                continue
+
+            if source != local:
+                audit.record(
+                    event="answered_from",
+                    client=f"{client[0]}:{client[1]}",
+                    change=change,
+                    source=f"{source[0]}:{source[1]}",
+                )
 
     return 0
 

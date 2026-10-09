@@ -8,7 +8,7 @@ dotnet build src/Yura.Daemon src/Yura.Agent
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-**147 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
+**151 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
 wireguard-tools 1.0: on the development builds, and on the NativeAOT daemon and agent that
 `tools/publish.sh` and `tools/publish-agent.sh` produce.
 
@@ -120,7 +120,7 @@ what a user experiences as "the route does nothing":
 ### NAT type, direct and through a route
 
 What a peer-to-peer game needs is not that its packets leave but that a peer's packets arrive,
-which depends on the route rather than on the machine. Sixteen checks measure it the way the
+which depends on the route rather than on the machine. Twenty checks measure it the way the
 harness proves everything else — with a server that only one path can reach. The first seven
 ask STUN servers what mapping each route gives:
 
@@ -146,8 +146,22 @@ peer — with both servers on one address. The second server now has an address 
 since two ports of one address agreeing about a mapping say nothing about whether it depends on
 the address; and the agent is told its own address with `--own-address`, because this fixture
 puts its "remote" servers on the namespace's own loopback, which the agent otherwise refuses to
-relay to. What this table cannot show is a peer the game never sent to getting through; the
-next one does.
+relay to.
+
+The next four ask what gets in, which is what tells a NAT2 from a NAT3. Each uses a STUN server
+of its own inside the agent's namespace, listening on `198.51.100.7` and `198.51.100.8` and two
+ports of each, that names the other address in OTHER-ADDRESS and answers from whichever socket
+`CHANGE-REQUEST` asks for. An nftables table in the namespace stands in front of the agent and
+filters differently for each server, the way a NAT or a cloud firewall would:
+
+| Check | Result |
+| --- | --- |
+| **Nothing filtering in front of the agent: NAT1** | `open`, `endpointIndependent`: the answer from `198.51.100.8:3481`, an address the agent never sent to, got in, and the server's log shows it sent from there |
+| **Only the exact address and port sent to get in: NAT3** | `moderate`, `addressAndPortDependent` (`ct state new drop` for answers from `3484-3485`). And before saying so the probe sent to the server's other port itself, which the server's log shows arriving at `198.51.100.7:3485`: only once that answer then got in is the silence the NAT's |
+| **Any port of a host sent to gets in: NAT2** | `moderate`, `addressDependent`: a dynamic set of the addresses the agent sent to, and answers from `3486-3487` dropped from any other; the other port got in, the other address did not |
+| **A server that names a second address and never answers from it** | `moderate`, filtering `unknown`, and the detail says the silence is the server's. Taking it for the NAT would have called this NAT1 route NAT3 |
+
+What these tables cannot show is a peer the game never sent to getting through; the next one does.
 
 The other nine ask the question the STUN fixture leaves open: whether a peer the game has never
 sent to gets in, and only the peers it should. A game routed through the agent learns its address
@@ -179,9 +193,11 @@ rule, the stranger at the covered address was answered from the second game's ow
 half is also proved against a real agent in `FullConeTests`, and the daemon's routing by sender
 in `AgentConeTests`.
 
-The fixture (`spikes/lib/stun_server.py`) answers binding requests and logs every query, and
-deliberately ignores `CHANGE-REQUEST`: it exists to pin the mapping behaviour, and simulating
-the filtering tests would let the suite assert something the fixture was only pretending to do.
+The fixture (`spikes/lib/stun_server.py`) answers binding requests and logs every query. By
+default it ignores `CHANGE-REQUEST`, or names a second address it never answers from with
+`--other`; with `--alternate` it listens on two addresses and two ports and answers from the one
+asked for, as RFC 5780 has it. The filtering it is tested against is real either way: a kernel
+firewall in the agent's namespace, which drops or admits each answer on its own terms.
 The game and its peer are `spikes/lib/p2p_game.py`. The game opens a new socket for each binding
 attempt until one is answered, because a socket opened before the exec-time classification
 reached the process is never routed; then it answers whoever sends to that socket.

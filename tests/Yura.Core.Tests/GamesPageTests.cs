@@ -103,6 +103,78 @@ public sealed class GamesPageTests
         Assert.Contains("Tokyo", page.NatComparison, StringComparison.Ordinal);
     }
 
+    private static NatReportDto Nat(NatVerdict verdict, NatFiltering filtering = NatFiltering.Unknown) =>
+        new() { Verdict = verdict, Filtering = filtering };
+
+    private static async Task<GamesPageViewModel> Tested(NatReportDto direct, NatReportDto routed)
+    {
+        var (page, daemon) = New();
+        daemon.NextNatResult = new NatTestResultDto
+        {
+            Direct = direct, Routed = routed, RouteName = "Tokyo", TestedAtUtc = DateTimeOffset.UtcNow,
+        };
+        await page.TestNatCommand.ExecuteAsync(null);
+        return page;
+    }
+
+    [Fact]
+    public async Task A_moderate_NAT_says_whether_it_is_NAT2_or_NAT3_and_both_when_that_is_not_known()
+    {
+        var page = await Tested(
+            Nat(NatVerdict.Moderate, NatFiltering.AddressAndPortDependent), Nat(NatVerdict.Moderate));
+
+        Assert.Equal("NAT3", page.DirectNatNumber);
+        Assert.Equal("NAT2 or NAT3", page.RoutedNatNumber);
+        Assert.Equal("Moderate", page.DirectNatVerdict);
+    }
+
+    [Fact]
+    public async Task From_NAT2_to_NAT3_is_a_warning_though_both_are_moderate()
+    {
+        // A NAT3 cannot reach a player behind a NAT4, which a NAT2 can. Calling that "no
+        // difference" would be the sentence a player is misled by.
+        var page = await Tested(
+            Nat(NatVerdict.Moderate, NatFiltering.AddressDependent),
+            Nat(NatVerdict.Moderate, NatFiltering.AddressAndPortDependent));
+
+        Assert.True(page.NatComparisonIsWarning);
+        Assert.Contains("Tokyo", page.NatComparison, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task From_NAT3_to_NAT1_is_an_improvement()
+    {
+        var page = await Tested(
+            Nat(NatVerdict.Moderate, NatFiltering.AddressAndPortDependent), Nat(NatVerdict.Open, NatFiltering.EndpointIndependent));
+
+        Assert.False(page.NatComparisonIsWarning);
+        Assert.True(page.HasNatComparisonInfo);
+        Assert.Equal("NAT1", page.RoutedNatNumber);
+    }
+
+    [Theory]
+    [InlineData(NatVerdict.Open, NatFiltering.EndpointIndependent, NatVerdict.Moderate, NatFiltering.AddressDependent)]
+    [InlineData(NatVerdict.Moderate, NatFiltering.Unknown, NatVerdict.Moderate, NatFiltering.Unknown)]
+    [InlineData(NatVerdict.Moderate, NatFiltering.Unknown, NatVerdict.Moderate, NatFiltering.AddressAndPortDependent)]
+    public async Task A_difference_that_changes_nobody_who_can_connect_or_is_not_settled_gets_no_sentence(
+        NatVerdict directVerdict, NatFiltering directFiltering, NatVerdict routedVerdict, NatFiltering routedFiltering)
+    {
+        var page = await Tested(Nat(directVerdict, directFiltering), Nat(routedVerdict, routedFiltering));
+
+        Assert.Null(page.NatComparison);
+        Assert.False(page.NatComparisonIsWarning);
+    }
+
+    [Fact]
+    public async Task The_same_settled_type_both_ways_makes_no_difference()
+    {
+        var page = await Tested(
+            Nat(NatVerdict.Moderate, NatFiltering.AddressAndPortDependent),
+            Nat(NatVerdict.Moderate, NatFiltering.AddressAndPortDependent));
+
+        Assert.Equal("The route makes no difference to peer-to-peer connectivity.", page.NatComparison);
+    }
+
     [Fact]
     public async Task Choosing_another_route_does_not_credit_it_with_the_last_result()
     {

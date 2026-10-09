@@ -335,12 +335,24 @@
               <TextBlock Grid.Row="0" Grid.Column="1" Classes="FieldLabel" Text="{loc:Tr Games.Direct}" />
               <TextBlock Grid.Row="0" Grid.Column="2" Classes="FieldLabel" Text="{loc:Tr Games.Routed}" />
 
+              <!-- The verdict in console words, and beside it the NAT1 to NAT4 number players
+                   compare; for a Moderate whose filtering was not established, both it can be. -->
               <TextBlock Grid.Row="1" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Games.Nat.Verdict}"
-                         Margin="0,0,0,6" />
-              <TextBlock Grid.Row="1" Grid.Column="1" Classes="Metric" Text="{Binding DirectNatVerdict}"
-                         Margin="0,0,0,6" />
-              <TextBlock Grid.Row="1" Grid.Column="2" Classes="Metric" Text="{Binding RoutedNatVerdict}"
-                         Margin="0,0,0,6" />
+                         Margin="0,0,0,6" VerticalAlignment="Center" />
+              <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Spacing="8" Margin="0,0,0,6">
+                <TextBlock Classes="Metric" Text="{Binding DirectNatVerdict}" VerticalAlignment="Center" />
+                <Border Classes="Badge" ToolTip.Tip="{loc:Tr Games.Nat.NumberHint}"
+                        IsVisible="{Binding DirectNatNumber, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                  <TextBlock Text="{Binding DirectNatNumber}" />
+                </Border>
+              </StackPanel>
+              <StackPanel Grid.Row="1" Grid.Column="2" Orientation="Horizontal" Spacing="8" Margin="0,0,0,6">
+                <TextBlock Classes="Metric" Text="{Binding RoutedNatVerdict}" VerticalAlignment="Center" />
+                <Border Classes="Badge" ToolTip.Tip="{loc:Tr Games.Nat.NumberHint}"
+                        IsVisible="{Binding RoutedNatNumber, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                  <TextBlock Text="{Binding RoutedNatNumber}" />
+                </Border>
+              </StackPanel>
 
               <TextBlock Grid.Row="2" Grid.Column="0" Classes="Secondary" Text="{loc:Tr Games.Nat.Behaviour}" />
               <TextBlock Grid.Row="2" Grid.Column="1" Classes="Caption" Text="{Binding DirectNatDetail}"

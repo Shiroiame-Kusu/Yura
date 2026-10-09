@@ -159,18 +159,21 @@ internal static class DemoData
 
         shell.Games.SelectedGame = shell.Games.Games.FirstOrDefault(g => g.Name.StartsWith("Counter", StringComparison.Ordinal));
         shell.Games.SelectedRoute = shell.Rules.FindRoute(socks.Id);
-        // A NAT result too, and the case worth laying out: a home connection that cannot do
-        // peer-to-peer at all, and a route that fixes it.
+        // A NAT result too, and the case worth laying out: a home connection behind a NAT3, which
+        // cannot reach players behind a NAT4, and a route that fixes it.
         shell.Games.DirectNat = new NatReportDto
         {
-            Verdict = NatVerdict.Strict,
-            Mapping = NatMapping.AddressAndPortDependent,
+            Verdict = NatVerdict.Moderate,
+            Mapping = NatMapping.EndpointIndependent,
             Filtering = NatFiltering.AddressAndPortDependent,
             MappedEndpoint = "203.0.113.44:51820",
             BehindNat = true,
-            Servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"],
-            Diagnostics = "Two different servers saw two different mappings, so the address a peer " +
-                          "would be told is not the address it would see.",
+            Servers = ["111.206.174.3:3478", "138.201.243.186:3478"],
+            Diagnostics = "The far side sees 203.0.113.44:51820. Two different servers saw the same mapping, so it " +
+                          "does not depend on the destination. Hole punching can work. An answer from another port " +
+                          "of a host already sent to was kept out until this route had sent to that port itself, so " +
+                          "only the exact address and port sent to can answer. Filtering was tested against " +
+                          "111.206.174.3:3478, which can answer from 111.206.174.2:3479.",
         };
         shell.Games.RoutedNat = new NatReportDto
         {
@@ -179,7 +182,7 @@ internal static class DemoData
             Filtering = NatFiltering.EndpointIndependent,
             MappedEndpoint = "198.51.100.9:41003",
             BehindNat = false,
-            Servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"],
+            Servers = ["111.206.174.3:3478", "138.201.243.186:3478"],
             Diagnostics = "The far side sees the route's own address and port, so nothing is " +
                           "translating it.",
         };

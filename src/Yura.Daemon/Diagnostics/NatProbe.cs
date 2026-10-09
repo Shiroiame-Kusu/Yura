@@ -37,17 +37,38 @@ public static class NatProbe
     /// Servers used when the caller names none.
     /// </summary>
     /// <remarks>
-    /// Two operators rather than two names from one, because the mapping test is only
-    /// meaningful between two genuinely different addresses and two names from one operator
-    /// can resolve to the same one. Which servers answered is reported back, so the verdict
+    /// <para>
+    /// The first three can tell NAT2 from NAT3. Each has a second public address, names it in
+    /// OTHER-ADDRESS, and on 2026-10-08 answered from it when asked, measured through a
+    /// full-cone route where nothing filtered the answer out. Most public servers cannot:
+    /// Google's and Cloudflare's have one address, and of 64 servers tried, a third named a
+    /// second address that was private, absent or silent. Xiaomi's comes first because it is
+    /// near most of the people this is for; when one turns out not to answer from its other
+    /// address after all, the filtering test moves on to the next.
+    /// </para>
+    /// <para>
+    /// Google's and Cloudflare's are there for the mapping test, which needs only a second
+    /// operator, and they almost always answer. Every server is a different operator, because
+    /// two names from one can resolve to one address, which would make the mapping comparison
+    /// agree for the trivial reason. Which servers answered is reported back, so the verdict
     /// is never attributed to a server that was silent.
+    /// </para>
     /// </remarks>
     public static readonly string[] DefaultServers =
     [
+        "stun.miwifi.com:3478",
+        "stun.easybell.de:3478",
+        "stun.fitauto.ru:3478",
         "stun.l.google.com:19302",
         "stun.cloudflare.com:3478",
-        "stun.nextcloud.com:3478",
     ];
+
+    /// <summary>How many servers the filtering test is tried against before it gives up.</summary>
+    /// <remarks>
+    /// A second chance for when the first turns out not to answer from its other port, without
+    /// making a NAT that really does keep everything out wait through the whole list.
+    /// </remarks>
+    private const int FilteringServersTried = 2;
 
     /// <summary>
     /// How long to wait for each attempt, in order.
@@ -115,66 +136,44 @@ public static class NatProbe
         }
     }
 
-    private static async Task<NatReportDto> ProbeAsync(
-        INatTransport transport, List<IPEndPoint> servers, CancellationToken ct)
+    /// <param name="attempts">How long to wait for each try; the tests' simulated NAT needs no retries.</param>
+    internal static async Task<NatReportDto> ProbeAsync(
+        INatTransport transport, IReadOnlyList<IPEndPoint> servers, CancellationToken ct,
+        IReadOnlyList<TimeSpan>? attempts = null)
     {
-        var used = new List<string>();
+        var session = new ProbeSession(transport, attempts ?? Attempts);
         var stopwatch = Stopwatch.StartNew();
 
-        // The first server that answers anchors everything else: its answer carries the
-        // mapping, and its OTHER-ADDRESS decides whether the filtering tests are possible.
+        // The first server that answers anchors everything else: its answer carries the mapping,
+        // and its OTHER-ADDRESS decides whether it can run the filtering test.
         StunMessage? first = null;
-        IPEndPoint? firstServer = null;
+        IPEndPoint? anchor = null;
         var firstIndex = -1;
         double? roundTrip = null;
         for (var i = 0; i < servers.Count; i++)
         {
             var attempt = Stopwatch.StartNew();
-            var answer = await RequestAsync(transport, servers[i], Stun.Change.None, ct).ConfigureAwait(false);
-            if (answer?.Message.MappedEndpoint is not null)
+            var answer = await session.BindAsync(servers[i], ct).ConfigureAwait(false);
+            if (answer is not null)
             {
-                first = answer.Value.Message;
-                firstServer = servers[i];
+                first = answer;
+                anchor = servers[i];
                 firstIndex = i;
                 roundTrip = attempt.Elapsed.TotalMilliseconds;
-                used.Add(servers[i].ToString());
+                session.Used(anchor);
                 break;
             }
         }
 
-        if (first is null || firstServer is null)
+        if (first is null || anchor is null)
         {
             return new NatReportDto
             {
                 Verdict = NatVerdict.Blocked,
                 Diagnostics = $"No answer from any of {servers.Count} STUN server(s) in " +
                               $"{stopwatch.Elapsed.TotalSeconds:0.#} s, so UDP is not getting out and back.",
-                Servers = used,
+                Servers = session.Answered,
             };
-        }
-
-        IPEndPoint anchor = firstServer;
-
-        // Filtering first, while the only address this route has sent to is the first server's.
-        // Asked after the mapping test, the second server — or the first server's own other
-        // address, which is where that test falls back to — would already have opened the NAT
-        // to the very address the answer comes back from, and a filter that admits only hosts
-        // it has sent to would pass for one that admits anybody: the flattering Open, given to
-        // a Moderate NAT. It needs a server with a second address, which most public ones lack.
-        bool? fromOtherAddressAndPort = null;
-        bool? fromOtherPort = null;
-        if (first.OtherAddress is { } other && !other.Address.Equals(anchor.Address))
-        {
-            fromOtherAddressAndPort = await FilteringProbeAsync(
-                transport, anchor, Stun.Change.Address | Stun.Change.Port,
-                from => !from.Address.Equals(anchor.Address), ct).ConfigureAwait(false);
-
-            if (fromOtherAddressAndPort is false)
-            {
-                fromOtherPort = await FilteringProbeAsync(
-                    transport, anchor, Stun.Change.Port,
-                    from => from.Address.Equals(anchor.Address) && from.Port != anchor.Port, ct).ConfigureAwait(false);
-            }
         }
 
         // The mapping: a second server on the same route. If the mapping differs between the
@@ -185,45 +184,57 @@ public static class NatProbe
         // servers after the first one that answered are candidates: those before it have
         // already failed to answer once, and asking again cost the wait a second time and left
         // the mapping unknown when a later server would have answered.
+        //
+        // Asked in two rounds, either side of the filtering test. A NAT that admits only hosts
+        // it has sent to would let an answer from the first server's other address in just
+        // because the mapping test had sent there: the flattering Open, given to a Moderate NAT.
+        // So anything at that address, or at the first server's own address on another port,
+        // waits until the filtering is known. Everything else goes first, so that a mapping that
+        // varies is known before the filtering test starts, and that test, seconds of waiting
+        // for answers a filtering NAT keeps out, is skipped where it would change nothing.
+        var alternate = first.OtherAddress is { } advertised && !advertised.Equals(anchor) ? advertised : null;
         var untried = servers.Skip(firstIndex + 1).ToList();
-        var candidates = untried.Where(s => !s.Address.Equals(anchor.Address))
+        var early = untried
+            .Where(s => !s.Address.Equals(anchor.Address) && (alternate is null || !s.Address.Equals(alternate.Address)))
+            .ToList();
+        var late = untried.Where(s => !s.Address.Equals(anchor.Address) && !early.Contains(s))
             .Concat(untried.Where(s => s.Address.Equals(anchor.Address) && !s.Equals(anchor)))
             .ToList();
-        if (first.OtherAddress is { } alternate && !alternate.Equals(anchor) && !candidates.Contains(alternate))
+        if (alternate is not null && !untried.Contains(alternate))
         {
-            candidates.Add(alternate);
+            late.Add(alternate);
         }
 
-        StunMessage? secondAnswer = null;
-        var distinct = false;
-        var onlyPortDiffers = false;
-        foreach (var candidate in candidates)
-        {
-            var answer = await RequestAsync(transport, candidate, Stun.Change.None, ct).ConfigureAwait(false);
-            if (answer?.Message.MappedEndpoint is null)
-            {
-                continue;
-            }
+        var second = await SecondMappingAsync(session, early, anchor, ct).ConfigureAwait(false);
 
-            secondAnswer = answer.Value.Message;
-            distinct = true;
-            onlyPortDiffers = candidate.Address.Equals(anchor.Address);
-            used.Add(candidate.ToString());
-            break;
-        }
+        // A mapping that varies is Strict whatever gets in, and an address nothing translates is
+        // Open, so in either case the filtering test would change nothing.
+        var varies = second is { } seen && !seen.Message.MappedEndpoint!.Equals(first.MappedEndpoint);
+        var untranslated = transport.LocalEndpoint is { } local && local.Equals(first.MappedEndpoint);
+        var filtering = varies || untranslated
+            ? FilteringOutcome.Untested
+            : await FilteringAsync(session, servers, firstIndex, ct).ConfigureAwait(false);
+
+        second ??= await SecondMappingAsync(session, late, anchor, ct).ConfigureAwait(false);
 
         var assessment = NatClassifier.Classify(new NatObservations
         {
             Local = transport.LocalEndpoint,
             FirstMapped = first.MappedEndpoint,
-            SecondMapped = secondAnswer?.MappedEndpoint,
-            SecondServerDistinct = distinct,
-            SecondServerDiffersOnlyByPort = onlyPortDiffers,
-            AnsweredFromOtherAddressAndPort = fromOtherAddressAndPort,
-            AnsweredFromOtherPort = fromOtherPort,
+            SecondMapped = second?.Message.MappedEndpoint,
+            SecondServerDistinct = second is not null,
+            SecondServerDiffersOnlyByPort = second?.OnlyPortDiffers ?? false,
+            AnsweredFromOtherAddressAndPort = filtering.FromOtherAddressAndPort,
+            AnsweredFromOtherPort = filtering.FromOtherPort,
+            OtherPortAnswersOnceSentTo = filtering.OtherPortOnceSentTo,
         });
 
         var detail = assessment.Diagnostics;
+        if (filtering is { Server: { } filteredBy, Other: { } otherAddress })
+        {
+            detail = $"{detail} Filtering was tested against {filteredBy}, which can answer from {otherAddress}.";
+        }
+
         if (transport.Detail is { Length: > 0 } note)
         {
             detail = $"{detail} {note}";
@@ -237,7 +248,7 @@ public static class NatProbe
             MappedEndpoint = assessment.MappedEndpoint?.ToString(),
             BehindNat = assessment.BehindNat,
             Diagnostics = detail,
-            Servers = used,
+            Servers = session.Answered,
             RoundTripMilliseconds = roundTrip,
         };
     }
@@ -248,81 +259,104 @@ public static class NatProbe
         Diagnostics = reason,
     };
 
-    /// <summary>
-    /// Asks the server to answer from somewhere else, and says whether an answer from there got
-    /// through.
-    /// </summary>
-    /// <param name="expectedFrom">Whether an answer came from where it was asked to come from.</param>
-    /// <returns>
-    /// True when it did; false when nothing came back, which is the NAT filtering it out; null
-    /// when the server answered from somewhere it was asked not to — it ignored the request, so
-    /// the answer says nothing about filtering and must not be counted as if it did.
-    /// </returns>
-    private static async Task<bool?> FilteringProbeAsync(
-        INatTransport transport, IPEndPoint server, Stun.Change change, Func<IPEndPoint, bool> expectedFrom,
-        CancellationToken ct)
+    /// <summary>The first of the candidates that answers, as the second half of the mapping test.</summary>
+    private static async Task<SecondMapping?> SecondMappingAsync(
+        ProbeSession session, IReadOnlyList<IPEndPoint> candidates, IPEndPoint anchor, CancellationToken ct)
     {
-        var answer = await RequestAsync(transport, server, change, ct).ConfigureAwait(false);
-        if (answer is null)
+        foreach (var candidate in candidates)
         {
-            return false;
-        }
-
-        return answer.Value.From is not { } from || expectedFrom(from) ? true : null;
-    }
-
-    /// <summary>One request, retried, and the matching answer with the address it came from.</summary>
-    /// <remarks>
-    /// Matched on the transaction id and never on the source address: the whole point of the
-    /// filtering tests is that the answer arrives from somewhere else. Datagrams that are not
-    /// this transaction's answer are discarded, because the route's socket may carry other
-    /// traffic. Every retransmission carries the same transaction id, as RFC 5389 §7.2.1 has
-    /// it, so an answer to the first send that arrives during the second wait is still the
-    /// answer; a fresh id per attempt threw exactly those away, turning a slow route into a
-    /// silent one.
-    /// </remarks>
-    private static async Task<StunAnswer?> RequestAsync(
-        INatTransport transport, IPEndPoint server, Stun.Change change, CancellationToken ct)
-    {
-        var transactionId = Stun.NewTransactionId();
-        var request = Stun.BuildBindingRequest(transactionId, change);
-
-        foreach (var wait in Attempts)
-        {
-            try
+            if (await session.BindAsync(candidate, ct).ConfigureAwait(false) is { } answer)
             {
-                await transport.SendAsync(server, request, ct).ConfigureAwait(false);
-            }
-            catch (Exception e) when (e is SocketException or ObjectDisposedException or AgentProtocolException
-                                         or IOException or ProxyHandshakeException or UdpUnsupportedException)
-            {
-                // The route would not carry a datagram to this server: as far as the test is
-                // concerned, the server did not answer.
-                return null;
-            }
-
-            var deadline = DateTimeOffset.UtcNow + wait;
-            while (DateTimeOffset.UtcNow < deadline)
-            {
-                var datagram = await transport
-                    .ReceiveAsync(deadline - DateTimeOffset.UtcNow, ct)
-                    .ConfigureAwait(false);
-                if (datagram is null)
-                {
-                    break;
-                }
-
-                if (Stun.TryParse(datagram.Value.Payload, out var message) && message is not null &&
-                    message.TransactionId.AsSpan().SequenceEqual(transactionId) &&
-                    message.Kind == StunMessageKind.BindingSuccess)
-                {
-                    return new StunAnswer(message, datagram.Value.From);
-                }
+                session.Used(candidate);
+                return new SecondMapping(answer, candidate.Address.Equals(anchor.Address));
             }
         }
 
         return null;
     }
+
+    /// <summary>
+    /// Which unsolicited answers get in, asked of the first server that can answer from a second
+    /// address, and of the next one if the first one's answers turn out to prove nothing.
+    /// </summary>
+    private static async Task<FilteringOutcome> FilteringAsync(
+        ProbeSession session, IReadOnlyList<IPEndPoint> servers, int firstIndex, CancellationToken ct)
+    {
+        var outcome = FilteringOutcome.Untested;
+        var tried = 0;
+        for (var i = firstIndex; i < servers.Count && tried < FilteringServersTried; i++)
+        {
+            var server = servers[i];
+            var answer = await session.BindAsync(server, ct).ConfigureAwait(false);
+            if (answer?.OtherAddress is not { } other || other.Address.Equals(server.Address))
+            {
+                continue;
+            }
+
+            // Its answers prove something only while nothing has been sent to where they come
+            // from: a NAT that admits whoever it has sent to would let them in for that reason.
+            if (session.HasSentTo(other.Address) || session.HasSentTo(new IPEndPoint(server.Address, other.Port)))
+            {
+                continue;
+            }
+
+            tried++;
+            session.Used(server);
+            outcome = await FilterAgainstAsync(session, server, other, ct).ConfigureAwait(false);
+            if (outcome.Settled)
+            {
+                break;
+            }
+        }
+
+        return outcome;
+    }
+
+    /// <summary>
+    /// RFC 5780's filtering test against one server, and a check on what its silence means.
+    /// </summary>
+    /// <remarks>
+    /// Both requests go out together, while nothing has been sent to the server's other address
+    /// or port. An answer from the other address means anyone gets in: NAT1. One from the other
+    /// port alone means a host already sent to gets in from any of its ports: NAT2. When neither
+    /// gets in, the route sends to that other port itself and asks again in the same breath. A
+    /// NAT that admits only the exact address and port it has sent to now lets the answer in, so
+    /// its arriving shows the server does answer from there and the first silence was the NAT:
+    /// NAT3. Still nothing, and the silence is the server's, which is what gets reported.
+    /// </remarks>
+    private static async Task<FilteringOutcome> FilterAgainstAsync(
+        ProbeSession session, IPEndPoint server, IPEndPoint other, CancellationToken ct)
+    {
+        bool FromOtherPort(IPEndPoint from) => from.Address.Equals(server.Address) && from.Port != server.Port;
+
+        var cold = await session
+            .RequestAllAsync([(server, Stun.Change.Address | Stun.Change.Port), (server, Stun.Change.Port)], ct)
+            .ConfigureAwait(false);
+        var fromOtherAddressAndPort = Credited(cold[0], from => !from.Address.Equals(server.Address));
+        var fromOtherPort = Credited(cold[1], FromOtherPort);
+
+        bool? onceSentTo = null;
+        if (fromOtherAddressAndPort is false && fromOtherPort is false)
+        {
+            var warm = await session
+                .RequestAllAsync([(new IPEndPoint(server.Address, other.Port), Stun.Change.None), (server, Stun.Change.Port)], ct)
+                .ConfigureAwait(false);
+            onceSentTo = Credited(warm[1], FromOtherPort);
+        }
+
+        return new FilteringOutcome(server, other, fromOtherAddressAndPort, fromOtherPort, onceSentTo);
+    }
+
+    /// <summary>Whether an answer came from where it was asked to come from.</summary>
+    /// <returns>
+    /// True when it did; false when nothing came back; null when the server answered from
+    /// somewhere it was asked not to. That server ignored the request, so its answer says
+    /// nothing about filtering and must not be counted as if it did.
+    /// </returns>
+    private static bool? Credited(StunAnswer? answer, Func<IPEndPoint, bool> expectedFrom) =>
+        answer is not { } received ? false
+        : received.From is not { } from || expectedFrom(from) ? true
+        : null;
 
     private static async Task<List<IPEndPoint>> ResolveAsync(IReadOnlyList<string> servers, CancellationToken ct)
     {
@@ -390,6 +424,165 @@ public static class NatProbe
     }
 
     private readonly record struct StunAnswer(StunMessage Message, IPEndPoint? From);
+
+    private sealed record SecondMapping(StunMessage Message, bool OnlyPortDiffers);
+
+    /// <summary>What the filtering test found, and which server it asked.</summary>
+    private sealed record FilteringOutcome(
+        IPEndPoint? Server,
+        IPEndPoint? Other,
+        bool? FromOtherAddressAndPort,
+        bool? FromOtherPort,
+        bool? OtherPortOnceSentTo)
+    {
+        public static readonly FilteringOutcome Untested = new(null, null, null, null, null);
+
+        /// <summary>True when the answers settle the filtering, so no other server need be asked.</summary>
+        public bool Settled => (FromOtherAddressAndPort, FromOtherPort, OtherPortOnceSentTo) switch
+        {
+            (true, _, _) => true,
+            (false, true, _) => true,
+            (false, false, true) => true,
+            _ => false,
+        };
+    }
+
+    /// <summary>
+    /// One probe's requests over one transport: what was sent where, and what each server said to
+    /// a plain binding request.
+    /// </summary>
+    /// <remarks>
+    /// Keeping count is what keeps the filtering test honest. Its answers count only while
+    /// nothing has been sent to where they come from, and with the mapping test and up to two
+    /// servers' filtering tests sharing one socket, that has to be checked rather than assumed.
+    /// </remarks>
+    private sealed class ProbeSession(INatTransport transport, IReadOnlyList<TimeSpan> attempts)
+    {
+        private readonly HashSet<IPEndPoint> _sent = [];
+        private readonly Dictionary<IPEndPoint, StunMessage?> _bindings = [];
+
+        /// <summary>The servers the verdict rests on, in the order they were used.</summary>
+        public List<string> Answered { get; } = [];
+
+        public void Used(IPEndPoint server)
+        {
+            var name = server.ToString();
+            if (!Answered.Contains(name))
+            {
+                Answered.Add(name);
+            }
+        }
+
+        public bool HasSentTo(IPEndPoint destination) => _sent.Contains(destination);
+
+        public bool HasSentTo(IPAddress address) => _sent.Any(sent => sent.Address.Equals(address));
+
+        /// <summary>A plain binding request, asked once per server however many steps want its answer.</summary>
+        /// <returns>The answer, or null when the server did not answer with a mapped address.</returns>
+        public async Task<StunMessage?> BindAsync(IPEndPoint server, CancellationToken ct)
+        {
+            if (_bindings.TryGetValue(server, out var known))
+            {
+                return known;
+            }
+
+            var answers = await RequestAllAsync([(server, Stun.Change.None)], ct).ConfigureAwait(false);
+            var message = answers[0] is { Message: { MappedEndpoint: not null } mapped } ? mapped : null;
+            _bindings[server] = message;
+            return message;
+        }
+
+        /// <summary>Requests sent together and retried together, each matched to its own answer.</summary>
+        /// <remarks>
+        /// Matched on the transaction id and never on the source address: the whole point of the
+        /// filtering tests is that the answer arrives from somewhere else. Datagrams that are not
+        /// an answer to one of these are discarded, because the route's socket may carry other
+        /// traffic. Every retransmission carries the same transaction id, as RFC 5389 §7.2.1 has
+        /// it, so an answer to the first send that arrives during the second wait is still the
+        /// answer; a fresh id per attempt threw exactly those away, turning a slow route into a
+        /// silent one. Sent together because each request the NAT keeps the answer out of costs
+        /// the whole retransmission schedule, and waiting for two at once costs the time of one.
+        /// </remarks>
+        public async Task<StunAnswer?[]> RequestAllAsync(
+            IReadOnlyList<(IPEndPoint Server, Stun.Change Change)> requests, CancellationToken ct)
+        {
+            var ids = new byte[requests.Count][];
+            var messages = new byte[requests.Count][];
+            for (var i = 0; i < requests.Count; i++)
+            {
+                ids[i] = Stun.NewTransactionId();
+                messages[i] = Stun.BuildBindingRequest(ids[i], requests[i].Change);
+            }
+
+            var answers = new StunAnswer?[requests.Count];
+            var unreachable = new bool[requests.Count];
+            bool Waiting()
+            {
+                for (var i = 0; i < answers.Length; i++)
+                {
+                    if (answers[i] is null && !unreachable[i])
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            foreach (var wait in attempts)
+            {
+                for (var i = 0; i < requests.Count; i++)
+                {
+                    if (answers[i] is not null || unreachable[i])
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        await transport.SendAsync(requests[i].Server, messages[i], ct).ConfigureAwait(false);
+                        _sent.Add(requests[i].Server);
+                    }
+                    catch (Exception e) when (e is SocketException or ObjectDisposedException or AgentProtocolException
+                                                 or IOException or ProxyHandshakeException or UdpUnsupportedException)
+                    {
+                        // The route would not carry a datagram to this server: as far as the test
+                        // is concerned, the server did not answer.
+                        unreachable[i] = true;
+                    }
+                }
+
+                var deadline = DateTimeOffset.UtcNow + wait;
+                while (Waiting() && DateTimeOffset.UtcNow < deadline)
+                {
+                    var datagram = await transport
+                        .ReceiveAsync(deadline - DateTimeOffset.UtcNow, ct)
+                        .ConfigureAwait(false);
+                    if (datagram is null)
+                    {
+                        break;
+                    }
+
+                    if (Stun.TryParse(datagram.Value.Payload, out var message) &&
+                        message is { Kind: StunMessageKind.BindingSuccess })
+                    {
+                        var index = Array.FindIndex(ids, id => id.AsSpan().SequenceEqual(message.TransactionId));
+                        if (index >= 0)
+                        {
+                            answers[index] ??= new StunAnswer(message, datagram.Value.From);
+                        }
+                    }
+                }
+
+                if (!Waiting())
+                {
+                    break;
+                }
+            }
+
+            return answers;
+        }
+    }
 }
 
 /// <summary>Raised when a route cannot carry UDP at all, which is an answer rather than an error.</summary>

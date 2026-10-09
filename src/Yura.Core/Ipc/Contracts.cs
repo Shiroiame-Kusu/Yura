@@ -350,6 +350,10 @@ public sealed class NatReportDto
     /// carries what was measured, and this is a reading of it.
     /// </remarks>
     public bool SupportsP2P() => Verdict is NatVerdict.Open or NatVerdict.Moderate;
+
+    /// <summary>NAT1 to NAT4, or null when the measurement does not settle which.</summary>
+    /// <remarks>A method for the same reason as <see cref="SupportsP2P"/>.</remarks>
+    public int? TypeNumber() => NatClassifier.TypeNumber(Verdict, Filtering);
 }
 
 /// <summary>A NAT test: the direct path, and the route, measured the same way.</summary>

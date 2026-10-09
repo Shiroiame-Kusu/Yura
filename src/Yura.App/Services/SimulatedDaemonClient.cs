@@ -281,14 +281,14 @@ public sealed class SimulatedDaemonClient : IDaemonClient
         {
             Direct = new NatReportDto
             {
-                Verdict = NatVerdict.Strict,
-                Mapping = NatMapping.AddressAndPortDependent,
+                Verdict = NatVerdict.Moderate,
+                Mapping = NatMapping.EndpointIndependent,
                 Filtering = NatFiltering.AddressAndPortDependent,
                 MappedEndpoint = "203.0.113.44:51820",
                 BehindNat = true,
-                Servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"],
+                Servers = ["111.206.174.3:3478", "138.201.243.186:3478"],
                 RoundTripMilliseconds = 31.4,
-                Diagnostics = "Two different servers saw two different mappings.",
+                Diagnostics = "Two different servers saw the same mapping. Only the exact address and port sent to can answer.",
             },
             Routed = proxyId is null && chainId is null ? null : new NatReportDto
             {
@@ -296,7 +296,7 @@ public sealed class SimulatedDaemonClient : IDaemonClient
                 Mapping = NatMapping.EndpointIndependent,
                 Filtering = NatFiltering.EndpointIndependent,
                 MappedEndpoint = "198.51.100.9:41003",
-                Servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"],
+                Servers = ["111.206.174.3:3478", "138.201.243.186:3478"],
                 RoundTripMilliseconds = 12.8,
                 Diagnostics = "Two different servers saw the same mapping.",
             },

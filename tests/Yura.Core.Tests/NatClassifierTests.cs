@@ -119,6 +119,7 @@ public sealed class NatClassifierTests
             SecondServerDistinct = true,
             AnsweredFromOtherAddressAndPort = false,
             AnsweredFromOtherPort = false,
+            OtherPortAnswersOnceSentTo = true,
         });
 
         // Port-restricted cone: hole punching still works, because the peer's own packet
@@ -126,6 +127,62 @@ public sealed class NatClassifierTests
         Assert.Equal(NatVerdict.Moderate, assessment.Verdict);
         Assert.Equal(NatFiltering.AddressAndPortDependent, assessment.Filtering);
         Assert.True(assessment.SupportsPeerToPeer);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(null)]
+    public void Silence_from_the_other_port_is_not_filtering_unless_the_server_answers_from_there(bool? onceSentTo)
+    {
+        var assessment = NatClassifier.Classify(new NatObservations
+        {
+            Local = Local,
+            FirstMapped = Mapped,
+            SecondMapped = Mapped,
+            SecondServerDistinct = true,
+            AnsweredFromOtherAddressAndPort = false,
+            AnsweredFromOtherPort = false,
+            OtherPortAnswersOnceSentTo = onceSentTo,
+        });
+
+        // A server that names a second address and never answers from it is silent too. Taken for
+        // the NAT, that silence would call a NAT2 a NAT3.
+        Assert.Equal(NatVerdict.Moderate, assessment.Verdict);
+        Assert.Equal(NatFiltering.Unknown, assessment.Filtering);
+        Assert.Null(NatClassifier.TypeNumber(assessment.Verdict, assessment.Filtering));
+        Assert.Contains("NAT", assessment.Diagnostics, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(NatVerdict.Open, NatFiltering.EndpointIndependent, 1)]
+    [InlineData(NatVerdict.Open, NatFiltering.Unknown, 1)]
+    [InlineData(NatVerdict.Moderate, NatFiltering.AddressDependent, 2)]
+    [InlineData(NatVerdict.Moderate, NatFiltering.AddressAndPortDependent, 3)]
+    [InlineData(NatVerdict.Moderate, NatFiltering.Unknown, null)]
+    [InlineData(NatVerdict.Strict, NatFiltering.Unknown, 4)]
+    [InlineData(NatVerdict.Strict, NatFiltering.AddressAndPortDependent, 4)]
+    [InlineData(NatVerdict.Blocked, NatFiltering.Unknown, null)]
+    [InlineData(NatVerdict.Unknown, NatFiltering.AddressDependent, null)]
+    public void The_number_players_use_is_given_only_where_the_measurement_settles_it(
+        NatVerdict verdict, NatFiltering filtering, int? expected)
+    {
+        Assert.Equal(expected, NatClassifier.TypeNumber(verdict, filtering));
+    }
+
+    [Fact]
+    public void A_varying_mapping_does_not_claim_the_filtering_went_untested_for_want_of_a_server()
+    {
+        var assessment = NatClassifier.Classify(new NatObservations
+        {
+            Local = Local,
+            FirstMapped = Mapped,
+            SecondMapped = OtherMapped,
+            SecondServerDistinct = true,
+        });
+
+        Assert.Equal(NatVerdict.Strict, assessment.Verdict);
+        Assert.Contains("makes no difference", assessment.Diagnostics, StringComparison.Ordinal);
+        Assert.DoesNotContain("none answered", assessment.Diagnostics, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -32,20 +32,28 @@ public enum NatMapping
 /// <summary>Which unsolicited packets the NAT lets back in.</summary>
 public enum NatFiltering
 {
-    /// <summary>Not established — the usual case, since it needs a server with two addresses.</summary>
+    /// <summary>
+    /// Not established: it needs a server with two addresses that really answers from the other
+    /// one, or the mapping already decided the verdict.
+    /// </summary>
     Unknown,
 
-    /// <summary>Anything may reach an open mapping. A "full cone" NAT.</summary>
+    /// <summary>Anything may reach an open mapping. A "full cone" NAT, NAT1.</summary>
     EndpointIndependent,
 
-    /// <summary>Only a host already sent to, from any of its ports.</summary>
+    /// <summary>Only a host already sent to, from any of its ports. A restricted cone, NAT2.</summary>
     AddressDependent,
 
-    /// <summary>Only the exact address and port already sent to.</summary>
+    /// <summary>Only the exact address and port already sent to. A port-restricted cone, NAT3.</summary>
     AddressAndPortDependent,
 }
 
 /// <summary>The verdict in the words a game shows its players.</summary>
+/// <remarks>
+/// The words are the ones consoles use. Players also number NATs 1 to 4, after the four kinds
+/// RFC 3489 named; <see cref="NatClassifier.TypeNumber"/> gives that number, where the
+/// measurement settles one.
+/// </remarks>
 public enum NatVerdict
 {
     Unknown,
@@ -53,13 +61,16 @@ public enum NatVerdict
     /// <summary>No UDP reached the other side at all, so peer-to-peer cannot work.</summary>
     Blocked,
 
-    /// <summary>Type 1 / Open. Direct connections in both directions.</summary>
+    /// <summary>Open, NAT1. Direct connections in both directions.</summary>
     Open,
 
-    /// <summary>Type 2 / Moderate. Hole punching works; unsolicited traffic does not.</summary>
+    /// <summary>
+    /// Moderate: NAT2 or NAT3. Hole punching works; unsolicited traffic does not. Which of the two
+    /// depends on the filtering alone.
+    /// </summary>
     Moderate,
 
-    /// <summary>Type 3 / Strict. A different mapping per peer, so hole punching fails.</summary>
+    /// <summary>Strict, NAT4. A different mapping per peer, so hole punching fails.</summary>
     Strict,
 }
 
@@ -98,6 +109,19 @@ public sealed record NatObservations
 
     /// <summary>An answer arrived from the server's other port, or null if untested.</summary>
     public bool? AnsweredFromOtherPort { get; init; }
+
+    /// <summary>
+    /// Asked again after the route had sent to the server's other port, the server answered from
+    /// there. Null if this was not tried.
+    /// </summary>
+    /// <remarks>
+    /// This is what turns silence from the other port into a finding. A server that advertises a
+    /// second address and never answers from it is silent too, and taking that for the NAT
+    /// filtering would call a NAT2 a NAT3. Once the route has sent to that port itself, a NAT
+    /// that filters by address and port lets the answer in, so an answer now shows the server
+    /// does answer from there, and the first silence was the NAT.
+    /// </remarks>
+    public bool? OtherPortAnswersOnceSentTo { get; init; }
 }
 
 /// <summary>A NAT verdict and the behaviour it was derived from.</summary>
@@ -142,6 +166,26 @@ public sealed record NatAssessment
 /// </remarks>
 public static class NatClassifier
 {
+    /// <summary>
+    /// The NAT1 to NAT4 number players compare, or null when the measurement does not settle one.
+    /// </summary>
+    /// <remarks>
+    /// The numbering follows RFC 3489's four kinds of NAT, which is how many players, forums and
+    /// tools such as NatTypeTester name them: NAT1 full cone, NAT2 restricted cone, NAT3
+    /// port-restricted cone, NAT4 symmetric. Moderate covers two of them, told apart by the
+    /// filtering alone. So a Moderate whose filtering was not established has no number: it is
+    /// NAT2 or NAT3, and saying either would be a guess. The difference matters to a player: a
+    /// NAT2 can reach a NAT4 peer, and a NAT3 cannot.
+    /// </remarks>
+    public static int? TypeNumber(NatVerdict verdict, NatFiltering filtering) => (verdict, filtering) switch
+    {
+        (NatVerdict.Open, _) => 1,
+        (NatVerdict.Moderate, NatFiltering.AddressDependent) => 2,
+        (NatVerdict.Moderate, NatFiltering.AddressAndPortDependent) => 3,
+        (NatVerdict.Strict, _) => 4,
+        _ => null,
+    };
+
     public static NatAssessment Classify(NatObservations observations)
     {
         ArgumentNullException.ThrowIfNull(observations);
@@ -177,6 +221,14 @@ public static class NatClassifier
             (NatMapping.EndpointIndependent, _) => NatVerdict.Moderate,
             _ => NatVerdict.Strict,
         };
+
+        // A mapping that changes per destination is Strict whatever gets in, so the probe does
+        // not spend seconds finding out; saying no server was available would be untrue.
+        if (verdict == NatVerdict.Strict && filtering == NatFiltering.Unknown)
+        {
+            filteringDetail = "Which unsolicited packets get in was not tested: with a mapping " +
+                              "that changes per destination, it makes no difference.";
+        }
 
         // Nothing between this socket and the server rewrote anything: the address the far
         // side sees is this socket's own. That is Open whatever the filtering test managed,
@@ -266,7 +318,7 @@ public static class NatClassifier
         if (observations.AnsweredFromOtherAddressAndPort is null)
         {
             detail = "Whether unsolicited packets get in was not tested: it needs a STUN server " +
-                     "with two addresses, and none was available.";
+                     "with two addresses, and none answered.";
             return NatFiltering.Unknown;
         }
 
@@ -283,7 +335,21 @@ public static class NatClassifier
             return NatFiltering.Unknown;
         }
 
-        detail = "Only the exact address and port already sent to can answer.";
-        return NatFiltering.AddressAndPortDependent;
+        // Nothing came from the other port. That is the NAT only if the server does answer from
+        // there, which is what asking again, after sending to that port, showed or failed to.
+        if (observations.OtherPortAnswersOnceSentTo is true)
+        {
+            detail = "An answer from another port of a host already sent to was kept out until this " +
+                     "route had sent to that port itself, so only the exact address and port sent to " +
+                     "can answer.";
+            return NatFiltering.AddressAndPortDependent;
+        }
+
+        detail = observations.OtherPortAnswersOnceSentTo is false
+            ? "No answer came from the server's other port, not even once this route had sent to " +
+              "it, so the silence is the server's and says nothing about the NAT."
+            : "No answer came from the server's other port, and whether it answers from there at " +
+              "all was not checked, so the silence cannot be put down to the NAT.";
+        return NatFiltering.Unknown;
     }
 }

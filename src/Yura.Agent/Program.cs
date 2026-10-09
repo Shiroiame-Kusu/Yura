@@ -559,16 +559,17 @@ public static class Program
                                  when it is on no interface, as behind a cloud's 1:1 NAT
               --cone-ports A-B   UDP ports for full-cone channels (default {AgentOptions.DefaultConePorts})
               --no-full-cone     give every destination its own socket instead, which a
-                                 peer-to-peer game sees as a Strict NAT
+                                 peer-to-peer game sees as a Strict NAT (NAT4)
 
             The agent refuses private, loopback and link-local destinations unless told
             otherwise, so a client holding the token cannot use it to reach the server's own
             network.
 
             Full-cone UDP gives each of a game's sockets one address here for every peer, and
-            lets anyone send to it: a peer-to-peer game sees an Open NAT, provided a firewall in
-            front of this server lets the --cone-ports range in. Behind a stateful firewall that
-            does not, it is Moderate, which most peer-to-peer games still manage.
+            lets anyone send to it: a peer-to-peer game sees an Open NAT (NAT1), provided a
+            firewall in front of this server lets the --cone-ports range in. Behind a stateful
+            firewall that does not, it is Moderate (NAT3), which most peer-to-peer games still
+            manage.
             """);
         return 0;
     }

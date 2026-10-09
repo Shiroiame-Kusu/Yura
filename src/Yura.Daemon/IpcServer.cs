@@ -406,12 +406,17 @@ public sealed class IpcServer : IAsyncDisposable
                     (route, routeName) = (hops, name);
                 }
 
-                var routed = route is { Count: > 0 }
-                    ? await NatProbe.RunAsync(wanted.Servers, route, ct).ConfigureAwait(false)
-                    : null;
-                var direct = wanted.RouteOnly && routed is not null
-                    ? null
-                    : await NatProbe.RunAsync(wanted.Servers, null, ct).ConfigureAwait(false);
+                // Both at once, each on sockets of its own. The filtering test can spend seconds
+                // waiting for answers a NAT keeps out, and the two paths have no reason to queue.
+                async Task<NatReportDto?> ProbeAsync(IReadOnlyList<ProxyHop>? path) =>
+                    await NatProbe.RunAsync(wanted.Servers, path, ct).ConfigureAwait(false);
+
+                var hasRoute = route is { Count: > 0 };
+                var routedProbe = hasRoute ? ProbeAsync(route) : Task.FromResult<NatReportDto?>(null);
+                var directProbe = wanted.RouteOnly && hasRoute ? Task.FromResult<NatReportDto?>(null) : ProbeAsync(null);
+                await Task.WhenAll(routedProbe, directProbe).ConfigureAwait(false);
+                var routed = await routedProbe.ConfigureAwait(false);
+                var direct = await directProbe.ConfigureAwait(false);
 
                 return new IpcResponse
                 {
