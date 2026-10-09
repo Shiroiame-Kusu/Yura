@@ -54,7 +54,7 @@ public sealed class ServiceManagerTests
         Assert.Contains("ExecStart=/usr/share/dotnet/dotnet /usr/local/lib/yura/daemon/yura-daemon.dll --socket", script);
         Assert.Contains("ProtectHome=yes\n", script);
         Assert.DoesNotContain("ProtectHome=read-only", script);
-        Assert.Contains("systemctl enable --now yura-daemon.service", script);
+        Assert.Contains("systemctl enable yura-daemon.service", script);
         Assert.Contains("cat > '/etc/systemd/system/yura-daemon.service' <<'YURA_UNIT'", script);
 
         var installed = ServiceManager.InstalledUnitText(location, unit);
@@ -93,7 +93,24 @@ public sealed class ServiceManagerTests
         Assert.Contains("if [ \"$(cd \"$src\" && pwd -P)\" = \"$(cd \"$dst\" 2>/dev/null && pwd -P || echo none)\" ]; then", script);
         Assert.Contains("leaving the files as they are", script);
         Assert.Contains("cat > '/etc/systemd/system/yura-daemon.service' <<'YURA_UNIT'", script);
-        Assert.Contains("systemctl enable --now yura-daemon.service", script);
+        Assert.Contains("systemctl enable yura-daemon.service", script);
+    }
+
+    [Fact]
+    public void Reinstalling_over_a_running_service_restarts_it_onto_the_new_daemon()
+    {
+        // enable --now starts a service only if it is stopped. Over a running one, the install
+        // replaced the files and the old daemon ran on from the deleted binary, so an update did
+        // nothing until the next boot: the NAT test kept its old servers after "Install".
+        var location = new DaemonLocation(Exec, "/opt/yura/daemon", DaemonSource.Explicit, InHome: false);
+        var script = ServiceManager.BuildInstallScript(
+            location, SystemdUnit.Generate(Exec, 1000, "/run/yura/yura.sock", daemonInHome: false));
+
+        Assert.DoesNotContain("--now", script);
+        var copied = script.IndexOf("mv \"$dst.new\" \"$dst\"", StringComparison.Ordinal);
+        var reloaded = script.IndexOf("systemctl daemon-reload", StringComparison.Ordinal);
+        var restarted = script.IndexOf("systemctl restart yura-daemon.service", StringComparison.Ordinal);
+        Assert.True(copied >= 0 && reloaded > copied && restarted > reloaded, script);
     }
 
     [Fact]

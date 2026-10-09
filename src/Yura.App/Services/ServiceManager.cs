@@ -371,7 +371,10 @@ public sealed class ServiceManager : IServiceManager
         sb.Append("YURA_UNIT\n");
         sb.Append(CultureInfo.InvariantCulture, $"chmod 644 {Quote(SystemdUnit.UnitPath)}\n");
         sb.Append("systemctl daemon-reload\n");
-        sb.Append(CultureInfo.InvariantCulture, $"systemctl enable --now {SystemdUnit.UnitName}\n");
+        sb.Append(CultureInfo.InvariantCulture, $"systemctl enable {SystemdUnit.UnitName}\n");
+        sb.Append("# Restart, not start: a service already running would go on running the daemon the copy\n");
+        sb.Append("# above has just replaced, under the unit it started with, until the next boot.\n");
+        sb.Append(CultureInfo.InvariantCulture, $"systemctl restart {SystemdUnit.UnitName}\n");
         sb.Append(CultureInfo.InvariantCulture, $"systemctl --no-pager --lines=0 status {SystemdUnit.UnitName} || true\n");
         return sb.ToString();
     }
