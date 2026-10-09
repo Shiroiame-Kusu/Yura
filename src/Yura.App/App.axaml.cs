@@ -21,9 +21,16 @@ public sealed partial class YuraApplication : Application
             // The daemon is the only source of privileged truth. Absent one, the app runs
             // fully but reports that nothing will take effect; --demo swaps in a simulated
             // daemon for design review only.
+            //
+            // A screenshot of the real app must not reach the real daemon either. On connecting,
+            // the app pushes its proxies and rules, and a screenshot's are a scratch configuration,
+            // so it would remove every rule the user's own Yura had applied. Pointed at a socket
+            // nothing listens on, it shows the app without a daemon, which is what those
+            // screenshots are for.
+            var scratch = Path.Combine(Path.GetTempPath(), $"yura-scratch-{Environment.ProcessId}");
             IDaemonClient daemon = options.Demo
                 ? new SimulatedDaemonClient()
-                : new UnixSocketDaemonClient();
+                : new UnixSocketDaemonClient(options.ScreenshotMode ? Path.Combine(scratch, "no-daemon.sock") : null);
 
             // Design review and screenshots must never touch the real configuration: they
             // would otherwise overwrite the user's proxies with demo data.
@@ -31,7 +38,7 @@ public sealed partial class YuraApplication : Application
             var config = options.ConfigDirectory is { Length: > 0 } explicitDirectory
                 ? new ConfigStore(explicitDirectory)
                 : isolated
-                    ? new ConfigStore(Path.Combine(Path.GetTempPath(), $"yura-scratch-{Environment.ProcessId}"))
+                    ? new ConfigStore(scratch)
                     : new ConfigStore();
             // Kept for the session as well as in the secret service: a secret the service will
             // not take must still work until the app exits, which is what the editor promises.

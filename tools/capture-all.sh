@@ -65,7 +65,21 @@ shot --out "$OUT/32-settings-light-demo.png"          --page settings --theme li
 shot --out "$OUT/33-settings-min-demo.png"            --page settings --theme dark  --size 960x640 --demo
 shot --out "$OUT/34-proxies-min-demo.png"             --page proxies  --theme dark  --size 960x640 --demo --demo-editor wireguard
 shot --out "$OUT/35-proxies-wireguard-zh-demo.png"    --page proxies  --theme dark  --lang zh-Hans --demo --demo-editor wireguard
-shot --out "$OUT/36-settings-not-installed.png"       --page settings --theme dark
+# The real service manager and the real systemd, asked about a unit that is installed nowhere,
+# so the shot is the not-installed page wherever it is taken, this machine's own service or not.
+NOT_INSTALLED="$(mktemp -d)"
+cat > "$NOT_INSTALLED/systemctl" <<'STUB'
+#!/usr/bin/env bash
+args=()
+for a in "$@"; do
+  [[ $a == yura-daemon.service ]] && a=yura-screenshot-not-installed.service
+  args+=("$a")
+done
+exec /usr/bin/systemctl "${args[@]}"
+STUB
+chmod +x "$NOT_INSTALLED/systemctl"
+PATH="$NOT_INSTALLED:$PATH" shot --out "$OUT/36-settings-not-installed.png" --page settings --theme dark
+rm -rf "$NOT_INSTALLED"
 
 echo "== disconnected: the default, with no daemon =="
 shot --out "$OUT/28-connections-disconnected.png" --page connections --theme dark
