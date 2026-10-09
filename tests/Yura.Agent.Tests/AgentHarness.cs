@@ -203,7 +203,7 @@ internal sealed class UdpEchoServer : IDisposable
 
     private async Task ReceiveAsync(CancellationToken ct)
     {
-        var buffer = new byte[2048];
+        var buffer = new byte[65535];
         var from = new IPEndPoint(IPAddress.Any, 0);
         while (!ct.IsCancellationRequested)
         {

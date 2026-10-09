@@ -45,6 +45,12 @@ public sealed record AgentClientOptions
     /// </summary>
     public bool FullCone { get; init; }
 
+    /// <summary>
+    /// Ask to carry datagrams too large for one packet in pieces. On unless a test needs a client
+    /// from before it. See <see cref="AgentProtocol.Features.Fragments"/>.
+    /// </summary>
+    public bool Fragments { get; init; } = true;
+
     public static AgentClientOptions From(AgentConnection connection, string? label = null) => new()
     {
         Host = connection.Host,
@@ -160,6 +166,11 @@ public static class AgentClient
             {
                 // A session's property, so only the control connection that makes one asks.
                 wanted |= AgentProtocol.Features.FullCone;
+            }
+
+            if (options.Fragments && role == AgentRole.Control)
+            {
+                wanted |= AgentProtocol.Features.Fragments;
             }
 
             await AgentProtocol.WriteFrameAsync(tls, AgentFrameKind.Hello,
@@ -305,6 +316,10 @@ public sealed class AgentSession : IAsyncDisposable
     private Socket? _datagrams;
     private TaskCompletionSource<byte[]>? _echo;
     private int _nextChannel;
+
+    private int _nextFragmentId;
+
+    private readonly AgentFragmentAssembler _assembler = new();
     private int _probing;
 
     private AgentSession(AgentClientOptions options, Socket socket, SslStream control, AgentWelcome welcome)
@@ -327,6 +342,11 @@ public sealed class AgentSession : IAsyncDisposable
     /// may send to any destination, and hears from anyone, each answer labelled with its source.
     /// </summary>
     public bool FullCone => UdpAvailable && Welcome.Available.HasFlag(AgentProtocol.Features.FullCone);
+
+    /// <summary>
+    /// True when the agent will carry a datagram too large for one packet in pieces, either way.
+    /// </summary>
+    public bool Fragments => UdpAvailable && Welcome.Available.HasFlag(AgentProtocol.Features.Fragments);
 
     /// <summary>Null while the session is up; the reason once it is not.</summary>
     public string? Failure { get; private set; }
@@ -626,12 +646,15 @@ public sealed class AgentSession : IAsyncDisposable
             throw new AgentProtocolException("this agent session has no datagram channel");
         }
 
-        if (payload.Length > Math.Min((int)Welcome.MaxDatagramPayload, AgentProtocol.MaxDatagramPayload))
+        // One packet's worth goes as it is. More than that goes in pieces when the agent can put
+        // them back together, and is refused, with a reason, when it cannot: never split for an
+        // agent that would see only garbage, never cut short.
+        var onePacket = Math.Min((int)Welcome.MaxDatagramPayload, AgentProtocol.MaxDatagramPayload);
+        var largest = Fragments ? AgentProtocol.MaxFragmentedPayload : onePacket;
+        if (payload.Length > largest)
         {
-            // Dropped rather than fragmented: a game packet that arrives in pieces, late, is
-            // worse than one that never arrives.
             throw new AgentProtocolException(
-                $"a {payload.Length}-byte datagram is over the agent's limit of {Welcome.MaxDatagramPayload}");
+                $"a {payload.Length}-byte datagram is over the agent's limit of {largest}");
         }
 
         // A channel this session never opened, or has closed, goes out as an ordinary one: the
@@ -639,8 +662,24 @@ public sealed class AgentSession : IAsyncDisposable
         var cone = _channels.TryGetValue(channel, out var entry) && entry.Cone;
         var plain = new byte[AgentDatagram.MaxRelayHeaderBytes + payload.Length];
         var length = AgentDatagram.WriteRelay(plain, channel, target, payload.Span, cone);
-        var packet = new byte[AgentDatagramCrypto.SealedSize(length)];
-        var sealedLength = crypto.Seal(plain.AsSpan(0, length), packet);
+        if (length <= AgentDatagram.MaxBodyBytes)
+        {
+            await SendSealedAsync(socket, crypto, plain.AsMemory(0, length), ct).ConfigureAwait(false);
+            return;
+        }
+
+        var id = (uint)Interlocked.Increment(ref _nextFragmentId);
+        foreach (var fragment in AgentDatagram.Split(plain.AsSpan(0, length), id))
+        {
+            await SendSealedAsync(socket, crypto, fragment, ct).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task SendSealedAsync(
+        Socket socket, AgentDatagramCrypto crypto, ReadOnlyMemory<byte> plain, CancellationToken ct)
+    {
+        var packet = new byte[AgentDatagramCrypto.SealedSize(plain.Length)];
+        var sealedLength = crypto.Seal(plain.Span, packet);
         await socket.SendAsync(packet.AsMemory(0, sealedLength), SocketFlags.None, ct).ConfigureAwait(false);
     }
 
@@ -716,14 +755,29 @@ public sealed class AgentSession : IAsyncDisposable
                     break;
 
                 case AgentDatagramKind.Relay or AgentDatagramKind.ConeRelay:
-                    if (AgentDatagram.TryReadRelay(body, out var channel, out var from, out var payload) &&
-                        from is not null && _channels.TryGetValue(channel, out var entry))
+                    DeliverRelay(body);
+                    break;
+
+                case AgentDatagramKind.Fragment when Fragments:
+                    // The body the pieces make up is a relayed datagram, handled as if it had
+                    // come in one; anything else they claim to be is dropped.
+                    if (_assembler.Add(body) is { } whole &&
+                        AgentDatagram.KindOf(whole) is AgentDatagramKind.Relay or AgentDatagramKind.ConeRelay)
                     {
-                        entry.Handler(from, payload.ToArray());
+                        DeliverRelay(whole);
                     }
 
                     break;
             }
+        }
+    }
+
+    private void DeliverRelay(ReadOnlySpan<byte> body)
+    {
+        if (AgentDatagram.TryReadRelay(body, out var channel, out var from, out var payload) &&
+            from is not null && _channels.TryGetValue(channel, out var entry))
+        {
+            entry.Handler(from, payload.ToArray());
         }
     }
 

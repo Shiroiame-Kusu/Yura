@@ -1295,6 +1295,23 @@ assert c['route']=='confirmedProxied' and c['proxyName']=='Agent', c
 assert 'Opened by the peer' in (c.get('note') or ''), c
 assert c['bytesUp']>0 and c['bytesDown']>0, c
 print(f\\\"{c['remote']} via {c['proxyName']}: {c['note']}\\\")\""
+
+# A datagram too large for one packet of the agent's channel, both ways. PlayFab Party's relay
+# sends one in its DTLS handshake, and when the agent cut it to 1350 bytes, Helldivers 2 stopped
+# at "Establishing up-link to host ship". 1472 bytes is the most a 1500-byte path carries, and
+# the game's answer, its prefix and the payload, is 1488.
+P2P_BIG="$(python3 -c "print('YURA-P2P-BIG-' + 'x' * 1459)")"
+ip netns exec "$AG_NS" python3 "${LIB}/p2p_game.py" peer --bind "${UNREACHABLE_B}:6113" --to "$P2P_MAPPED" \
+  --payload "$P2P_BIG" --log "$RUN/p2p-big.jsonl" > "$RUN/p2p-big.out" 2>&1 || true
+check "a peer's datagram too large for one packet reaches the game whole, and so does the game's answer" bash -c "
+  python3 -c \"
+import json
+def events(path, kind): return [r for r in map(json.loads, filter(str.strip, open(path))) if r.get('event')==kind]
+heard=[len(r['detail']) for r in events('$RUN/p2p-game.jsonl','peer') if r['sender']=='${UNREACHABLE_B}:6113']
+answered=[len(r['detail']) for r in events('$RUN/p2p-big.jsonl','answer')]
+assert heard and heard[0]==1472, heard
+assert answered and answered[0]==1488, answered
+print(f\\\"the game heard {heard[0]} bytes and the peer {answered[0]}, each in pieces through the agent\\\")\""
 ctl remove-rule "{\"ruleId\":\"$RULE_PP\"}" > /dev/null
 kill -9 "$P2P_PID" 2>/dev/null || true
 

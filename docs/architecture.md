@@ -210,6 +210,18 @@ Yura provides both halves of, and that is what it buys:
   key issued inside the authenticated TLS connection, with a 64-packet replay window. Carrying
   UDP inside the TCP connection instead would put every game packet behind the retransmission
   of the one before it, which is the damage an accelerator exists to avoid.
+- **Full-size datagrams, in pieces.** One packet of the channel carries 1350 bytes of payload,
+  so that with the agent's header and an IPv6 and UDP header it still clears a 1500-byte path.
+  The internet's datagrams are bigger: a DTLS server's certificate flight, a QUIC packet or a
+  DNS answer reach 1472 bytes and more. A session granted `Features.Fragments` carries those,
+  up to 8192 bytes, as pieces that are each sealed and counted like any datagram and put back
+  together at the far end. A datagram still missing a piece after two seconds is lost, as a lost
+  datagram would be, and only sixteen can be in progress. Before this, the agent read what the
+  internet sent into a 1350-byte buffer and passed the first 1350 bytes on without a word. That
+  is how Helldivers 2 stuck at "Establishing up-link to host ship": its PlayFab Party relay's
+  certificate arrived cut short, a truncated DTLS record is discarded, and the handshake never
+  finished, relay after relay. The agent now reads every datagram whole, and one too large for
+  a client that cannot take pieces is dropped and logged, never cut short.
 - **Latency from the agent's own vantage point.** It will measure a destination on request, so
   the Games page can say where a routed round trip went: this far to the agent, that much
   further to the game. That is the difference between knowing a route is faster and knowing

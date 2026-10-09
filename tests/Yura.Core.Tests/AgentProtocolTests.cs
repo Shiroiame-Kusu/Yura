@@ -504,4 +504,128 @@ public sealed class AgentProtocolTests
 
         Assert.True(largest <= 1500, $"a full datagram needs {largest} bytes on the wire");
     }
+
+    // -- fragments: datagrams too large for one packet ---------------------------------------
+
+    private sealed class ManualTime : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = DateTimeOffset.UtcNow;
+
+        public override DateTimeOffset GetUtcNow() => Now;
+    }
+
+    private static byte[] RelayBody(int payloadBytes)
+    {
+        var payload = new byte[payloadBytes];
+        for (var i = 0; i < payload.Length; i++)
+        {
+            payload[i] = (byte)(i * 7);
+        }
+
+        var body = new byte[AgentDatagram.MaxRelayHeaderBytes + payload.Length];
+        var length = AgentDatagram.WriteRelay(body, 9, IPEndPoint.Parse("20.212.192.74:30539"), payload, cone: true);
+        return body[..length];
+    }
+
+    [Theory]
+    [InlineData(1400)]
+    [InlineData(1472)]
+    [InlineData(4096)]
+    [InlineData(AgentProtocol.MaxFragmentedPayload)]
+    public void A_body_too_large_for_one_packet_travels_in_pieces_that_each_fit_and_come_back_whole(int payloadBytes)
+    {
+        var body = RelayBody(payloadBytes);
+        var fragments = AgentDatagram.Split(body, 77);
+
+        Assert.InRange(fragments.Count, 2, AgentDatagram.MaxPieces);
+        Assert.All(fragments, f => Assert.True(f.Length <= AgentDatagram.MaxBodyBytes, $"{f.Length} bytes"));
+
+        // In whatever order they arrive.
+        var assembler = new AgentFragmentAssembler();
+        byte[]? whole = null;
+        foreach (var fragment in Enumerable.Reverse(fragments))
+        {
+            Assert.Null(whole);
+            whole = assembler.Add(fragment);
+        }
+
+        Assert.Equal(body, whole);
+        Assert.True(AgentDatagram.TryReadRelay(whole, out var channel, out var from, out var payload));
+        Assert.Equal(9, channel);
+        Assert.Equal(IPEndPoint.Parse("20.212.192.74:30539"), from);
+        Assert.Equal(payloadBytes, payload.Length);
+        Assert.Equal(0, assembler.InProgress);
+    }
+
+    [Fact]
+    public void A_datagram_missing_a_piece_is_given_up_on_and_forgotten()
+    {
+        var time = new ManualTime();
+        var assembler = new AgentFragmentAssembler(time);
+        var late = AgentDatagram.Split(RelayBody(1472), 1);
+
+        Assert.Null(assembler.Add(late[0]));
+        Assert.Equal(1, assembler.InProgress);
+
+        // Past its patience the first piece is forgotten, so the last one alone makes nothing.
+        time.Now += AgentFragmentAssembler.Patience + TimeSpan.FromMilliseconds(1);
+        var other = AgentDatagram.Split(RelayBody(1472), 2);
+        Assert.Null(assembler.Add(other[0]));
+        Assert.Null(assembler.Add(late[1]));
+        Assert.NotNull(assembler.Add(other[1]));
+    }
+
+    [Fact]
+    public void Datagrams_in_progress_are_bounded_however_many_are_started()
+    {
+        var assembler = new AgentFragmentAssembler();
+        for (uint id = 0; id < AgentFragmentAssembler.MaxPending * 4; id++)
+        {
+            assembler.Add(AgentDatagram.Split(RelayBody(1472), id)[0]);
+        }
+
+        Assert.Equal(AgentFragmentAssembler.MaxPending, assembler.InProgress);
+    }
+
+    [Fact]
+    public void Pieces_that_could_not_make_one_datagram_are_refused()
+    {
+        var assembler = new AgentFragmentAssembler();
+        var pieces = AgentDatagram.Split(RelayBody(4096), 5);
+
+        // A middle piece short of full size would let a whole outgrow the limit.
+        var shortMiddle = pieces[1][..^1];
+        Assert.Null(assembler.Add(shortMiddle));
+
+        // An index past the count, a count of one, and pieces disagreeing about the count.
+        var pastCount = (byte[])pieces[0].Clone();
+        pastCount[5] = pastCount[6];
+        Assert.Null(assembler.Add(pastCount));
+        var alone = (byte[])pieces[^1].Clone();
+        alone[5] = 0;
+        alone[6] = 1;
+        Assert.Null(assembler.Add(alone));
+        Assert.Null(assembler.Add(pieces[0]));
+        var disagreeing = (byte[])pieces[1].Clone();
+        disagreeing[6] = (byte)(pieces.Count + 1);
+        Assert.Null(assembler.Add(disagreeing));
+        Assert.Equal(0, assembler.InProgress);
+
+        // A piece already in does not count twice.
+        var fresh = new AgentFragmentAssembler();
+        Assert.Null(fresh.Add(pieces[0]));
+        Assert.Null(fresh.Add(pieces[0]));
+        Assert.Equal(1, fresh.InProgress);
+    }
+
+    [Fact]
+    public void A_welcome_says_whether_pieces_are_taken()
+    {
+        var welcome = AgentWelcome.Decode(new AgentWelcome(
+            new byte[AgentProtocol.SessionIdBytes], new byte[AgentProtocol.KeyBytes], 7311,
+            AgentProtocol.MaxDatagramPayload,
+            AgentProtocol.Features.Udp | AgentProtocol.Features.Fragments, "0.5.0", "tokyo-1").Encode());
+
+        Assert.True(welcome.Available.HasFlag(AgentProtocol.Features.Fragments));
+    }
 }

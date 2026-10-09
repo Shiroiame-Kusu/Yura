@@ -10,7 +10,7 @@ traffic goes there.
 
 > **Status: working end to end.** The privileged daemon routes selected running processes
 > through user-supplied proxies and WireGuard exits, verified by
-> [151 acceptance checks](docs/daemon-acceptance.md) driven through its real IPC socket, and
+> [152 acceptance checks](docs/daemon-acceptance.md) driven through its real IPC socket, and
 > the desktop application drives it and can install it as a systemd service. All eleven
 > mandatory acceptance tests are covered. See [Current state](#current-state) for what is
 > proven and what is not.
@@ -211,9 +211,9 @@ sudo jq -c 'select(.event == "rule-removed")' /var/log/yura/events.jsonl
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-151 checks against a controlled network on a dummy interface, where each marker payload is
+152 checks against a controlled network on a dummy interface, where each marker payload is
 reachable only through one specific proxy — or, for a WireGuard exit and a Yura agent, only
-inside a network namespace that the tunnel or the agent is the sole way into. **151 passed, 0
+inside a network namespace that the tunnel or the agent is the sole way into. **152 passed, 0
 failed.** All eleven mandatory acceptance tests are covered, including child exclusion, rule
 precedence in the kernel, and Wine/Proton isolation. See
 [docs/daemon-acceptance.md](docs/daemon-acceptance.md) for the evidence behind each one and for
@@ -331,7 +331,7 @@ is unreferenced.
 - All seven pages: Processes, Games, Connections, Proxies, Rules, Diagnostics, Settings
 - Design system, both themes, both languages, 960×640 to 1280×800, 100–200% scaling —
   see [docs/ux-verification.md](docs/ux-verification.md)
-- **Routing spike passing 12/12** and the **daemon acceptance suite passing 151/151**: a
+- **Routing spike passing 12/12** and the **daemon acceptance suite passing 152/152**: a
   running process migrated into a cgroup live, classified by nftables, captured by TPROXY and
   forwarded to a SOCKS5 proxy, through a WireGuard tunnel, or through a Yura agent — TCP and
   UDP, per instance, with the process still running as its original user
@@ -343,8 +343,9 @@ is unreferenced.
 - WireGuard exits imported from a wg-quick `.conf`, probed by a real handshake and a DNS
   answer through the tunnel, with the peer's handshake time and transfer shown live
 - **Yura agents**: a server-side relay with its own protocol — TLS 1.3 with a pinned public
-  key, a shared token, an AES-GCM datagram channel for UDP, full-cone UDP so a peer-to-peer game
-  routed through it has an Open NAT, latency measured from the agent's own vantage point, and
+  key, a shared token, an AES-GCM datagram channel for UDP that carries full-size datagrams in
+  pieces, full-cone UDP so a peer-to-peer game routed through it has an Open NAT, latency
+  measured from the agent's own vantage point, and
   the resolver it offers used for lookups on that exit. Added by pasting one connect string,
   deployable as one native file with one command
 - **NAT type for peer-to-peer games**, measured over the route rather than guessed from the
@@ -386,16 +387,17 @@ is unreferenced.
   page
 - **NativeAOT** for all three executables: the app, the daemon and the agent publish as native
   binaries needing no .NET installed, with JSON through source-generated serializers and every
-  binding compiled. The acceptance suite passes 151/151 on the native daemon and agent, every
+  binding compiled. The acceptance suite passes 152/152 on the native daemon and agent, every
   page of the native app renders as the development build does, and switching language in it
   live updates the UI in place
-- 522 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
+- 536 unit tests over the rule system, the `/proc` reader, the nftables ruleset, the netlink
   wire format, the DNS parser, the SNI parser, the WireGuard configuration importer and tunnel
   manager, the agent protocol end to end against a real agent — full-cone UDP included — the
   agent's systemd unit, its key and token on disk and who may write them, the connect string,
-  the datagram sealing and its replay window, the systemd unit generators, the Steam library
-  reader and its KeyValues parser, the STUN codec, the NAT classifier's table of cases and the
-  probe against a simulated NAT of each kind and STUN servers that misbehave in each way, the
+  the datagram sealing and its replay window, datagrams carried in pieces, the systemd unit
+  generators, the Steam library reader and its KeyValues parser, the STUN codec, the NAT
+  classifier's table of cases and the probe against a simulated NAT of each kind and STUN
+  servers that misbehave in each way, the
   socket-abort request's byte layout, socket lookups against the running kernel, the flow
   registry, full-cone routing in the daemon, the rule store and the rule editor, the process
   inspector, the Games page — a boost started before its game, what it learns, and the session

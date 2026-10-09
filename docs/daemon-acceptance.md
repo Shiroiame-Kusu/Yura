@@ -8,7 +8,7 @@ dotnet build src/Yura.Daemon src/Yura.Agent
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-**151 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
+**152 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
 wireguard-tools 1.0: on the development builds, and on the NativeAOT daemon and agent that
 `tools/publish.sh` and `tools/publish-agent.sh` produce.
 
@@ -163,7 +163,7 @@ filters differently for each server, the way a NAT or a cloud firewall would:
 
 What these tables cannot show is a peer the game never sent to getting through; the next one does.
 
-The other nine ask the question the STUN fixture leaves open: whether a peer the game has never
+The other ten ask the question the STUN fixture leaves open: whether a peer the game has never
 sent to gets in, and only the peers it should. A game routed through the agent learns its address
 from the server at `198.51.100.7:3478`, and a second client at `198.51.100.8:6112`, on another
 address and another port that both exist only inside the agent's namespace, sends to it. Then a
@@ -178,6 +178,7 @@ and from one somewhere else:
 | **The game's answer reaches the peer from the address the server saw** | One socket at the agent for the server and the stranger alike, so the peer can tell the game's answer from anyone else's |
 | Nothing from the agent's own loopback reaches the game | Two datagrams from `127.0.0.1` inside the namespace, sent ahead of the peer's on the same socket; the game hears only the peer |
 | The Connections view lists the peer's flow under the game | `confirmedProxied` through the agent, with bytes both ways, and the note "Opened by the peer, through the full-cone channel at the agent." |
+| **A peer's datagram too large for one packet reaches the game whole, and so does the game's answer** | 1472 bytes from `198.51.100.8:6113`, the most a 1500-byte path carries and more than one packet of the agent's channel holds: the game hears all 1472, and the peer the game's 1488-byte answer, each carried in pieces. Cut to 1350 bytes, as the agent once cut them, this is what kept Helldivers 2 at "Establishing up-link to host ship" |
 | A rule routes a second game through the agent for one address only | `networks: 198.51.100.7/32`, so only the server's address takes the agent's route |
 | **A stranger at that one address still gets through** | From `198.51.100.7:6112`, a port the game never sent to, and it hears the answer from the game's address |
 | **A stranger anywhere else is turned away, by the daemon** | Two datagrams from `198.51.100.8:6112`, which the agent passes on, as the check above shows: the game hears neither, and no flow is opened. Its answer would not take the agent's route, so the peer could never have heard it |

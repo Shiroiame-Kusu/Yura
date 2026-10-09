@@ -30,6 +30,16 @@ public enum AgentDatagramKind : byte
     /// open for minutes after it.
     /// </remarks>
     ConeRelay = 5,
+
+    /// <summary>
+    /// One piece of a body too large for one packet: id(4) index(1) count(1), then the piece.
+    /// </summary>
+    /// <remarks>
+    /// Only in a session granted <see cref="AgentProtocol.Features.Fragments"/>. Each piece is
+    /// sealed and counted like any datagram, so nobody outside the session can forge or repeat
+    /// one, and the body they make up is handled as if it had arrived whole.
+    /// </remarks>
+    Fragment = 6,
 }
 
 /// <summary>
@@ -271,6 +281,46 @@ public static class AgentDatagram
     public static int MaxPacketBytes =>
         AgentProtocol.DatagramOverheadBytes + MaxRelayHeaderBytes + AgentProtocol.MaxDatagramPayload;
 
+    /// <summary>The largest body one packet carries: a relay header and a full payload.</summary>
+    public static int MaxBodyBytes => MaxRelayHeaderBytes + AgentProtocol.MaxDatagramPayload;
+
+    /// <summary>kind(1) id(4) index(1) count(1).</summary>
+    public const int FragmentHeaderBytes = 7;
+
+    /// <summary>The most of a body one fragment carries.</summary>
+    public static int MaxPieceBytes => MaxBodyBytes - FragmentHeaderBytes;
+
+    /// <summary>The most pieces the largest datagram carried at all is split into.</summary>
+    public static int MaxPieces => (MaxRelayHeaderBytes + AgentProtocol.MaxFragmentedPayload + MaxPieceBytes - 1) / MaxPieceBytes;
+
+    /// <summary>
+    /// Splits a body too large for one packet into fragments, each a datagram body of its own:
+    /// every piece full-size but the last.
+    /// </summary>
+    public static List<byte[]> Split(ReadOnlySpan<byte> body, uint id)
+    {
+        var count = (body.Length + MaxPieceBytes - 1) / MaxPieceBytes;
+        if (count < 2 || count > MaxPieces)
+        {
+            throw new ArgumentException($"a {body.Length}-byte body is not split into {count} piece(s)", nameof(body));
+        }
+
+        var fragments = new List<byte[]>(count);
+        for (var index = 0; index < count; index++)
+        {
+            var piece = body.Slice(index * MaxPieceBytes, Math.Min(MaxPieceBytes, body.Length - (index * MaxPieceBytes)));
+            var fragment = new byte[FragmentHeaderBytes + piece.Length];
+            fragment[0] = (byte)AgentDatagramKind.Fragment;
+            BinaryPrimitives.WriteUInt32BigEndian(fragment.AsSpan(1), id);
+            fragment[5] = (byte)index;
+            fragment[6] = (byte)count;
+            piece.CopyTo(fragment.AsSpan(FragmentHeaderBytes));
+            fragments.Add(fragment);
+        }
+
+        return fragments;
+    }
+
     /// <param name="cone">Write it as <see cref="AgentDatagramKind.ConeRelay"/>, for a full-cone channel.</param>
     public static int WriteRelay(
         Span<byte> destination, ushort channel, IPEndPoint target, ReadOnlySpan<byte> payload, bool cone = false)
@@ -332,5 +382,121 @@ public static class AgentDatagram
             BinaryPrimitives.ReadUInt16BigEndian(body[(4 + addressLength)..]));
         payload = body[(4 + addressLength + 2)..];
         return true;
+    }
+}
+
+/// <summary>
+/// Puts fragmented datagrams back together, within bounds the other end cannot push.
+/// </summary>
+/// <remarks>
+/// Every piece arrived sealed and through the replay window, so nothing outside the session can
+/// forge or repeat one. What is bounded here is what the session's own peer can make this end
+/// hold: <see cref="MaxPending"/> datagrams in progress, each no larger than
+/// <see cref="AgentProtocol.MaxFragmentedPayload"/>, none for longer than <see cref="Patience"/>.
+/// After that, a datagram still missing a piece is as lost as one that never arrived, which is
+/// what anything using UDP is built to expect.
+/// </remarks>
+public sealed class AgentFragmentAssembler(TimeProvider? time = null)
+{
+    /// <summary>How long a datagram may wait for its missing pieces.</summary>
+    public static readonly TimeSpan Patience = TimeSpan.FromSeconds(2);
+
+    /// <summary>How many datagrams may be in progress at once; a new one pushes out the oldest.</summary>
+    public const int MaxPending = 16;
+
+    private readonly TimeProvider _time = time ?? TimeProvider.System;
+    private readonly Dictionary<uint, Pending> _pending = [];
+    private readonly Lock _gate = new();
+
+    private sealed class Pending(int count, DateTimeOffset started)
+    {
+        public byte[]?[] Pieces { get; } = new byte[]?[count];
+
+        public int Missing { get; set; } = count;
+
+        public DateTimeOffset Started { get; } = started;
+    }
+
+    /// <summary>Datagrams now in progress.</summary>
+    public int InProgress
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _pending.Count;
+            }
+        }
+    }
+
+    /// <summary>Takes one fragment, and returns the whole body once its last piece is in.</summary>
+    /// <returns>The body, or null while pieces are missing or when the fragment was not a valid one.</returns>
+    public byte[]? Add(ReadOnlySpan<byte> fragment)
+    {
+        if (fragment.Length <= AgentDatagram.FragmentHeaderBytes || fragment[0] != (byte)AgentDatagramKind.Fragment)
+        {
+            return null;
+        }
+
+        var id = BinaryPrimitives.ReadUInt32BigEndian(fragment[1..]);
+        int index = fragment[5];
+        int count = fragment[6];
+        var piece = fragment[AgentDatagram.FragmentHeaderBytes..];
+
+        // Every piece but the last is full-size, which is what holds the whole to the limit.
+        if (count < 2 || count > AgentDatagram.MaxPieces || index >= count ||
+            piece.Length > AgentDatagram.MaxPieceBytes ||
+            (index < count - 1 && piece.Length != AgentDatagram.MaxPieceBytes))
+        {
+            return null;
+        }
+
+        lock (_gate)
+        {
+            var now = _time.GetUtcNow();
+            foreach (var stale in _pending.Where(p => now - p.Value.Started > Patience).Select(p => p.Key).ToList())
+            {
+                _pending.Remove(stale);
+            }
+
+            if (!_pending.TryGetValue(id, out var pending))
+            {
+                if (_pending.Count >= MaxPending)
+                {
+                    _pending.Remove(_pending.MinBy(p => p.Value.Started).Key);
+                }
+
+                pending = new Pending(count, now);
+                _pending[id] = pending;
+            }
+            else if (pending.Pieces.Length != count)
+            {
+                // Pieces that disagree about how many there are cannot make one datagram.
+                _pending.Remove(id);
+                return null;
+            }
+
+            if (pending.Pieces[index] is not null)
+            {
+                return null;
+            }
+
+            pending.Pieces[index] = piece.ToArray();
+            if (--pending.Missing > 0)
+            {
+                return null;
+            }
+
+            _pending.Remove(id);
+            var whole = new byte[pending.Pieces.Sum(p => p!.Length)];
+            var offset = 0;
+            foreach (var part in pending.Pieces)
+            {
+                part!.CopyTo(whole, offset);
+                offset += part.Length;
+            }
+
+            return whole;
+        }
     }
 }

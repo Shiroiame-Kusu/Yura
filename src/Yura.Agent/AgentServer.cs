@@ -103,6 +103,14 @@ public sealed class AgentServer : IAsyncDisposable
     private long _bytesUp;
     private long _bytesDown;
     private long _rejected;
+    private long _oversize;
+
+    /// <summary>
+    /// The largest datagram there is, which is what the sockets facing the internet read into:
+    /// a smaller buffer cuts a larger datagram short without a word, and a DTLS handshake given
+    /// a truncated certificate simply never finishes.
+    /// </summary>
+    private const int MaxReceivedDatagram = 65535;
 
     public AgentServer(AgentOptions options, AgentIdentity identity, Action<string> log)
     {
@@ -172,6 +180,9 @@ public sealed class AgentServer : IAsyncDisposable
 
         _ = ExpireChannelsAsync(_stopping.Token);
     }
+
+    /// <summary>Datagrams from the far side dropped as too large for their client to take.</summary>
+    public long OversizeDropped => Interlocked.Read(ref _oversize);
 
     public AgentStats Snapshot() => new(
         (uint)_sessions.Count,
@@ -323,7 +334,11 @@ public sealed class AgentServer : IAsyncDisposable
         // Granted per session, and used per channel: the client still chooses, for each one,
         // whether it stands for a socket or for one destination.
         var cone = hello.Wanted.HasFlag(AgentProtocol.Features.FullCone) && _options.FullCone && UdpAvailable;
-        var session = Session.Create(peer, hello.Label, cone);
+
+        // Granted to whoever asks: this agent can always put pieces back together, and a client
+        // that did not ask is one that cannot, so it is never sent any.
+        var fragments = hello.Wanted.HasFlag(AgentProtocol.Features.Fragments) && UdpAvailable;
+        var session = Session.Create(peer, hello.Label, cone, fragments);
         if (!_sessions.TryAdd(session.Key, session))
         {
             await RejectAsync(stream, AgentRejection.TooMany, "Session id collision.", ct).ConfigureAwait(false);
@@ -353,7 +368,8 @@ public sealed class AgentServer : IAsyncDisposable
                 session.Master,
                 DatagramPort,
                 AgentProtocol.MaxDatagramPayload,
-                Features | (session.Cone ? AgentProtocol.Features.FullCone : AgentProtocol.Features.None),
+                Features | (session.Cone ? AgentProtocol.Features.FullCone : AgentProtocol.Features.None)
+                         | (session.Fragments ? AgentProtocol.Features.Fragments : AgentProtocol.Features.None),
                 typeof(AgentServer).Assembly.GetName().Version?.ToString(3) ?? "0",
                 _identity.Name,
                 _resolver?.ToString() ?? string.Empty);
@@ -775,8 +791,9 @@ public sealed class AgentServer : IAsyncDisposable
                 IPEndPoint? target;
                 byte[] payload;
                 {
+                    var largest = session.Fragments ? AgentProtocol.MaxFragmentedPayload : AgentProtocol.MaxDatagramPayload;
                     if (!AgentDatagram.TryReadRelay(body.Span, out channelId, out target, out var raw) ||
-                        target is null || raw.Length > AgentProtocol.MaxDatagramPayload)
+                        target is null || raw.Length > largest)
                     {
                         return;
                     }
@@ -834,6 +851,20 @@ public sealed class AgentServer : IAsyncDisposable
                 }
 
                 Interlocked.Add(ref _bytesUp, payload.Length);
+                return;
+            }
+
+            case AgentDatagramKind.Fragment:
+            {
+                // A piece of a datagram too large for one packet. What the pieces make up is
+                // handled as if it had arrived whole, provided it is a relayed datagram; anything
+                // else they claim to be is dropped.
+                if (session.Fragments && session.Assembler.Add(body.Span) is { } whole &&
+                    AgentDatagram.KindOf(whole) is AgentDatagramKind.Relay or AgentDatagramKind.ConeRelay)
+                {
+                    await DispatchAsync(socket, session, whole, ct).ConfigureAwait(false);
+                }
+
                 return;
             }
 
@@ -904,8 +935,8 @@ public sealed class AgentServer : IAsyncDisposable
     /// <summary>Carries one channel's answers back to the client, sealed and labelled.</summary>
     private async Task PumpChannelAsync(Socket socket, Session session, DestinationChannel channel, CancellationToken ct)
     {
-        var buffer = new byte[AgentProtocol.MaxDatagramPayload];
-        var plain = new byte[AgentDatagram.MaxRelayHeaderBytes + AgentProtocol.MaxDatagramPayload];
+        var buffer = new byte[MaxReceivedDatagram];
+        var plain = new byte[AgentDatagram.MaxRelayHeaderBytes + MaxReceivedDatagram];
 
         while (!ct.IsCancellationRequested)
         {
@@ -925,6 +956,11 @@ public sealed class AgentServer : IAsyncDisposable
 
             channel.Touch();
             session.Touch();
+            if (!Deliverable(session, channel, received))
+            {
+                continue;
+            }
+
             var length = AgentDatagram.WriteRelay(plain, channel.Id, channel.Target, buffer.AsSpan(0, received));
             if (!await RelayToClientAsync(socket, session, plain.AsMemory(0, length), received, ct).ConfigureAwait(false))
             {
@@ -943,8 +979,8 @@ public sealed class AgentServer : IAsyncDisposable
     /// </remarks>
     private async Task PumpConeAsync(Socket socket, Session session, ConeChannel channel, CancellationToken ct)
     {
-        var buffer = new byte[AgentProtocol.MaxDatagramPayload];
-        var plain = new byte[AgentDatagram.MaxRelayHeaderBytes + AgentProtocol.MaxDatagramPayload];
+        var buffer = new byte[MaxReceivedDatagram];
+        var plain = new byte[AgentDatagram.MaxRelayHeaderBytes + MaxReceivedDatagram];
         var any = new IPEndPoint(
             channel.Socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0);
 
@@ -972,7 +1008,7 @@ public sealed class AgentServer : IAsyncDisposable
             // A dual-stack socket reports an IPv4 sender as ::ffff:a.b.c.d; the client sent to,
             // and expects to hear from, the plain IPv4 address.
             var from = raw.Address.IsIPv4MappedToIPv6 ? new IPEndPoint(raw.Address.MapToIPv4(), raw.Port) : raw;
-            if (!channel.MayHearFrom(from, _policy))
+            if (!channel.MayHearFrom(from, _policy) || !Deliverable(session, channel, received.ReceivedBytes))
             {
                 continue;
             }
@@ -987,13 +1023,53 @@ public sealed class AgentServer : IAsyncDisposable
         }
     }
 
-    /// <summary>Seals one relayed datagram to the client; false once there is nobody to send to.</summary>
+    /// <summary>
+    /// Whether a datagram from the far side can go to the client at all: in one packet, or in
+    /// pieces to a client that takes them.
+    /// </summary>
+    /// <remarks>
+    /// Said in the log once per channel when it cannot, because a datagram that silently never
+    /// arrives is the hardest thing there is to find.
+    /// </remarks>
+    private bool Deliverable(Session session, Channel channel, int length)
+    {
+        var largest = session.Fragments ? AgentProtocol.MaxFragmentedPayload : AgentProtocol.MaxDatagramPayload;
+        if (length <= largest)
+        {
+            return true;
+        }
+
+        Interlocked.Increment(ref _oversize);
+        if (channel.FirstOversize())
+        {
+            _log($"session {session.Key:x16}: channel {channel.Id} dropped a {length}-byte datagram, over the limit of {largest}" +
+                 (session.Fragments ? string.Empty : "; this client cannot take one in pieces, and updating it would let it"));
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Seals one relayed datagram to the client, in pieces when it is too large for one packet;
+    /// false once there is nobody to send to.
+    /// </summary>
     private async Task<bool> RelayToClientAsync(
         Socket socket, Session session, ReadOnlyMemory<byte> plain, int payloadBytes, CancellationToken ct)
     {
         try
         {
-            await SendSealedAsync(socket, session, plain, ct).ConfigureAwait(false);
+            if (plain.Length <= AgentDatagram.MaxBodyBytes)
+            {
+                await SendSealedAsync(socket, session, plain, ct).ConfigureAwait(false);
+            }
+            else
+            {
+                foreach (var fragment in AgentDatagram.Split(plain.Span, session.NewFragmentId()))
+                {
+                    await SendSealedAsync(socket, session, fragment, ct).ConfigureAwait(false);
+                }
+            }
+
             Interlocked.Add(ref _bytesDown, payloadBytes);
             return true;
         }
@@ -1147,7 +1223,9 @@ public sealed class AgentServer : IAsyncDisposable
     /// <summary>One client: its keys, where its datagrams come from, and its channels.</summary>
     private sealed class Session : IAsyncDisposable
     {
-        private Session(ulong key, byte[] id, byte[] master, IPAddress control, string label, bool cone)
+        private int _nextFragmentId;
+
+        private Session(ulong key, byte[] id, byte[] master, IPAddress control, string label, bool cone, bool fragments)
         {
             Key = key;
             Id = id;
@@ -1155,10 +1233,11 @@ public sealed class AgentServer : IAsyncDisposable
             Control = control;
             Label = label;
             Cone = cone;
+            Fragments = fragments;
             Crypto = AgentDatagramCrypto.ForAgent(id, master);
         }
 
-        public static Session Create(IPAddress control, string label, bool cone)
+        public static Session Create(IPAddress control, string label, bool cone, bool fragments)
         {
             var id = RandomNumberGenerator.GetBytes(AgentProtocol.SessionIdBytes);
             return new Session(
@@ -1167,11 +1246,20 @@ public sealed class AgentServer : IAsyncDisposable
                 RandomNumberGenerator.GetBytes(AgentProtocol.KeyBytes),
                 control,
                 label,
-                cone);
+                cone,
+                fragments);
         }
 
         /// <summary>True when the session was granted full-cone UDP: its channels are the client's sockets.</summary>
         public bool Cone { get; }
+
+        /// <summary>True when datagrams too large for one packet travel in pieces, both ways.</summary>
+        public bool Fragments { get; }
+
+        /// <summary>Where the client's pieces are put back together.</summary>
+        public AgentFragmentAssembler Assembler { get; } = new();
+
+        public uint NewFragmentId() => (uint)Interlocked.Increment(ref _nextFragmentId);
 
         public ulong Key { get; }
 
@@ -1216,7 +1304,12 @@ public sealed class AgentServer : IAsyncDisposable
 
         public DateTimeOffset LastActivityUtc { get; private set; } = DateTimeOffset.UtcNow;
 
+        private int _oversizeReported;
+
         public void Touch() => LastActivityUtc = DateTimeOffset.UtcNow;
+
+        /// <summary>True the first time only: an oversized datagram is said once per channel.</summary>
+        public bool FirstOversize() => Interlocked.Exchange(ref _oversizeReported, 1) == 0;
 
         public ValueTask DisposeAsync()
         {

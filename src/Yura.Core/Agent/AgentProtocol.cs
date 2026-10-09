@@ -138,6 +138,16 @@ public static class AgentProtocol
     /// </remarks>
     public const int MaxDatagramPayload = 1350;
 
+    /// <summary>
+    /// The largest datagram payload carried at all, in pieces, by a session granted
+    /// <see cref="Features.Fragments"/>.
+    /// </summary>
+    /// <remarks>
+    /// Room for a 4096-byte DNS answer and for anything a game's handshake sends, in at most
+    /// seven pieces: few enough that one lost in a lossy moment is not close to certain.
+    /// </remarks>
+    public const int MaxFragmentedPayload = 8192;
+
     /// <summary>sessionId(8) | direction(1) | counter(8).</summary>
     public const int DatagramHeaderBytes = 17;
 
@@ -183,6 +193,20 @@ public static class AgentProtocol
         /// without it has a channel per destination, each with a socket of its own.
         /// </remarks>
         FullCone = 1 << 3,
+
+        /// <summary>
+        /// A datagram too large for one packet travels in pieces and is put back together at the
+        /// far end, up to <see cref="MaxFragmentedPayload"/>.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="MaxDatagramPayload"/> keeps every packet clear of a 1500-byte path, but the
+        /// internet's datagrams are not that small: a DTLS server's certificate flight, a QUIC
+        /// packet or a DNS answer can run to 1472 bytes and beyond. Without this an agent can
+        /// only drop them; before it, one cut them short, and the DTLS handshake with a PlayFab
+        /// Party relay, which is how Helldivers 2 reaches a host's ship, never finished. Asked
+        /// for and granted per session, so either end may be older than the other.
+        /// </remarks>
+        Fragments = 1 << 4,
     }
 
     // -- framing -------------------------------------------------------------
