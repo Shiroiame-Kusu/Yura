@@ -1176,6 +1176,9 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     /// </summary>
     private bool _routeAnswersEarly;
 
+    /// <summary>The server the samples in <see cref="History"/> are of.</summary>
+    private string? _historyTarget;
+
     public bool HasHistory => !History.IsEmpty;
 
     /// <summary>The monitor's card shows for the whole session, and afterwards until another starts.</summary>
@@ -1356,15 +1359,28 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         _sampleInFlight = true;
         var sampling = new CancellationTokenSource();
         _sampling = sampling;
+        var endpoint = Endpoint(target.Host, target.Port);
         try
         {
             var (proxyId, chainId) = route.IsChain ? ((Guid?)null, (Guid?)route.Id) : (route.Id, null);
             var measurement = await _daemon.MeasureAsync(target.Host, target.Port, proxyId, chainId, 1, sampling.Token)
                 .ConfigureAwait(true);
             if (measurement is null || sampling.IsCancellationRequested ||
-                State is not (BoostState.Routing or BoostState.Degraded))
+                State is not (BoostState.Routing or BoostState.Degraded) ||
+                MonitorTarget() is not { } now || Endpoint(now.Host, now.Port) != endpoint)
             {
                 return;
+            }
+
+            // The history is one server's. Carried over to the next, the last server's answers
+            // made every probe the new one ignores count as loss: a game's first server is often
+            // a web API that answers, and the relay it moves to may answer no probe at all, as
+            // PlayFab's do not. That drew a route losing everything, where the page means to say
+            // the server does not answer.
+            if (_historyTarget != endpoint)
+            {
+                History.Clear();
+                _historyTarget = endpoint;
             }
 
             _routeAnswersEarly = measurement.RouteAnswersBeforeConnecting;
@@ -1478,6 +1494,7 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     {
         History.Clear();
         HistoryVersion = History.Version;
+        _historyTarget = null;
         _sessionEndedAt = null;
         _routeAnswersEarly = false;
         RaiseMonitor();
@@ -1487,6 +1504,7 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     internal void SeedHistory(IEnumerable<LatencySample> samples)
     {
         History.Clear();
+        _historyTarget = MonitorTarget() is { } target ? Endpoint(target.Host, target.Port) : null;
         foreach (var sample in samples)
         {
             History.Add(sample);

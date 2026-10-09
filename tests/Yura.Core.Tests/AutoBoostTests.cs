@@ -400,6 +400,69 @@ public sealed class AutoBoostTests
     }
 
     [Fact]
+    public async Task A_server_that_answers_no_probe_after_one_that_did_is_said_not_to_answer_not_drawn_as_loss()
+    {
+        // Helldivers 2 behind an agent: the monitor began on a web API the game opened at start,
+        // which answered, and moved to the PlayFab relay the play went to, which drops every TCP
+        // connect. The API's answers stayed in the history, and the page drew 100 % loss through
+        // the route and directly alike, as if the route were losing everything.
+        var (page, daemon) = New(SteamGame());
+        page.ApplyRunning([Process(4242, Folder + "/bin/game")]);
+        await page.StartBoostCommand.ExecuteAsync(null);
+
+        daemon.NextMeasurement = Measurement(routed: 45, direct: 80);
+        daemon.Connections.Add(Flow("198.51.100.7:443", TransportProtocol.Tcp, 1_000_000));
+        await page.RefreshEvidenceAsync();
+        Assert.Equal((45, 80), (page.History.Latest?.RoutedMilliseconds, page.History.Latest?.DirectMilliseconds));
+
+        daemon.NextMeasurement = Measurement(routed: null, direct: null);
+        daemon.Connections.Clear();
+        daemon.Connections.Add(Flow("20.42.240.23:31166", TransportProtocol.Udp, 100_000));
+        await page.RefreshEvidenceAsync();
+        for (var i = 0; i < 4; i++)
+        {
+            await page.SampleAsync();
+        }
+
+        Assert.Equal("20.42.240.23", daemon.Measured[^1].Host);
+        Assert.Equal(5, page.History.Samples.Count);
+        Assert.All(page.History.Samples, s => Assert.Null(s.RoutedMilliseconds ?? s.DirectMilliseconds));
+        Assert.Equal(string.Format(Loc.Current["Games.Monitor.NotAnswering"], "20.42.240.23:31166"), page.MonitorStatus);
+        Assert.Equal(Loc.Current["Common.NotMeasured"], page.MonitorLossDisplay);
+        Assert.False(page.MonitorLossIsWarning);
+        Assert.Empty(page.History.RouteLossBuckets(TimeSpan.FromSeconds(30)));
+        page.Dispose();
+    }
+
+    [Fact]
+    public async Task A_probe_still_out_when_the_monitor_moves_to_another_server_is_not_counted_for_it()
+    {
+        var (page, daemon) = New(SteamGame());
+        page.ApplyRunning([Process(4242, Folder + "/bin/game")]);
+        daemon.NextMeasurement = Measurement(routed: 45, direct: 80);
+        page.MeasurementTargetInput = "198.51.100.7:443";
+        await page.StartBoostCommand.ExecuteAsync(null);
+        Assert.Single(page.History.Samples);
+
+        daemon.HoldMeasurements = new TaskCompletionSource();
+        var late = page.SampleAsync();
+        page.MeasurementTargetInput = "20.42.240.23:31166";
+        daemon.HoldMeasurements.SetResult();
+        await late;
+        daemon.HoldMeasurements = null;
+
+        daemon.NextMeasurement = Measurement(routed: null, direct: null);
+        await page.SampleAsync();
+
+        // The new server's one sample, and nothing of the old one's: neither the answer it gave
+        // before the move nor the one that came back after it.
+        var sample = Assert.Single(page.History.Samples);
+        Assert.Equal((null, null), (sample.RoutedMilliseconds, sample.DirectMilliseconds));
+        Assert.False(page.History.RouteHasAnswered);
+        page.Dispose();
+    }
+
+    [Fact]
     public void Through_an_agent_the_route_is_its_two_halves_not_a_fresh_encrypted_connect()
     {
         // The connect through the agent opens a new TLS stream each time; the game's datagrams
