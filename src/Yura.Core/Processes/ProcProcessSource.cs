@@ -342,6 +342,18 @@ public sealed class ProcProcessSource
         return new ProcessEnvironment(prefix, steamAppId);
     }
 
+    /// <summary>
+    /// The Wine prefix one process works in, read from its environment whether or not
+    /// <see cref="ReadEnvironment"/> is on; null when it cannot be read.
+    /// </summary>
+    /// <remarks>
+    /// For the daemon, which reads no environments while it can help it, but has to know which
+    /// wineserver serves a Wine process it routes: that is where the process's sockets are made.
+    /// See <see cref="WineProcess"/>.
+    /// </remarks>
+    public static string? ReadWinePrefix(int pid) =>
+        ReadTextOrNull($"{ProcRoot}/{pid}/environ") is { } environ ? WineProcess.PrefixFromEnvironment(environ) : null;
+
     // -- users ---------------------------------------------------------------
 
     private string ResolveUserName(uint uid) =>

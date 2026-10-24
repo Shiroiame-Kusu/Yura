@@ -25,6 +25,14 @@ public enum ProcessSelectorKind
 
     /// <summary>Matches every process owned by a uid.</summary>
     User,
+
+    /// <summary>
+    /// Matches Steam's launch of one app: the process Steam starts a game through, whose command
+    /// line reads <c>SteamLaunch AppId=&lt;id&gt;</c>. Everything the game runs descends from it,
+    /// so with descendants it routes the whole game, and it names nothing an update can change.
+    /// See <see cref="SteamLaunch"/>.
+    /// </summary>
+    SteamApp,
 }
 
 /// <summary>What to do about a matched process's children.</summary>
@@ -70,6 +78,9 @@ public sealed record ProcessSelector
     /// <summary>Set for <see cref="ProcessSelectorKind.User"/>.</summary>
     public uint? Uid { get; init; }
 
+    /// <summary>Set for <see cref="ProcessSelectorKind.SteamApp"/>.</summary>
+    public string? SteamAppId { get; init; }
+
     public DescendantPolicy Descendants { get; init; } = DescendantPolicy.Exclude;
 
     /// <summary>
@@ -114,6 +125,9 @@ public sealed record ProcessSelector
                 (string.Equals(ProcessName, process.Name, StringComparison.Ordinal) ||
                  string.Equals(ProcessName, Path.GetFileName(process.ExecutablePath), StringComparison.Ordinal)),
             ProcessSelectorKind.User => Uid == process.Identity.Uid,
+            ProcessSelectorKind.SteamApp =>
+                SteamAppId is { Length: > 0 } appId &&
+                string.Equals(process.SteamLaunchAppId, appId, StringComparison.Ordinal),
             _ => false,
         };
     }
@@ -151,6 +165,7 @@ public sealed record ProcessSelector
         ProcessSelectorKind.ExecutablePath => $"Path {ExecutablePath}",
         ProcessSelectorKind.ProcessName => $"Name {ProcessName}",
         ProcessSelectorKind.User => $"User {Uid}",
+        ProcessSelectorKind.SteamApp => $"Steam app {SteamAppId}",
         _ => Kind.ToString(),
     };
 }

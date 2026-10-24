@@ -145,9 +145,14 @@ public static class RuleEvaluator
         // current /proc state would give the wrong answer for a process that has since
         // exited, or for a child that has been re-parented.
         // When the owning process could not be read at all, the classifier's answer is the
-        // only evidence there is, so it decides every process-scoped rule.
+        // only evidence there is, so it decides every process-scoped rule. And when the owner is
+        // a wineserver, the socket is a Windows program's, made on its behalf: the wineserver is
+        // in a group because of the programs it serves, which nothing about the wineserver itself
+        // shows. Matched by its own path, it covered no rule, and a game's captured connection
+        // was dialled directly.
         if (request.ClassifierMatchedRuleIds is { } classified &&
-            (rule.Process.IsInstanceScoped || rule.Process.Descendants != DescendantPolicy.Exclude || request.Process is null))
+            (rule.Process.IsInstanceScoped || rule.Process.Descendants != DescendantPolicy.Exclude ||
+             request.Process is null || WineProcess.IsServer(request.Process.ExecutablePath)))
         {
             return classified.Contains(rule.Id);
         }

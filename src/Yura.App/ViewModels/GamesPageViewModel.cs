@@ -55,17 +55,22 @@ public sealed partial class GameRowViewModel : ObservableObject
     /// What is known about how to route this game, stated rather than implied.
     /// </summary>
     /// <remarks>
-    /// A Steam manifest names an install directory, not a binary, so a freshly discovered game
-    /// has nothing to match on. Saying so — and asking the user to start it — is honest; guessing
-    /// a binary would produce a rule that silently covers nothing.
+    /// A Steam game is matched by Steam's launch of it, so its app id is what it is known by.
+    /// Steam's launch is named as such: labelled by the executable in its command line, as other
+    /// processes are, it read "Attached to start_protected_game.exe" for Helldivers 2, which looked
+    /// like Yura had caught Easy Anti-Cheat's launcher instead of the game.
     /// </remarks>
     public string SubtitleText => Running is { } process
-        ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.AttachedTo"], process.DisplayName, process.Identity.Pid)
-        : Profile.WineTargetExecutable
-          ?? Profile.ExecutablePath
-          ?? (Profile.SteamAppId is { } appId
-              ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.SteamNotStarted"], appId)
-              : Loc.Current["Games.NotStarted"]);
+        ? process.SteamLaunchAppId is not null
+            ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.AttachedToSteamLaunch"], process.Identity.Pid)
+            : string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.AttachedTo"], process.DisplayName, process.Identity.Pid)
+        : Profile.SteamLaunchAppId is { } launched
+            ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.SteamNotStarted"], launched)
+            : Profile.WineTargetExecutable
+              ?? Profile.ExecutablePath
+              ?? (Profile.SteamAppId is { } appId
+                  ? string.Format(CultureInfo.CurrentCulture, Loc.Current["Games.SteamNotStarted"], appId)
+                  : Loc.Current["Games.NotStarted"]);
 
     public void Update(GameProfile profile, ProcessSnapshot? running)
     {
@@ -414,13 +419,16 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     /// </remarks>
     public void AddFromProcess(ProcessSnapshot process)
     {
+        // Steam's launch of a game is remembered by the app id it names, not by Steam's launcher
+        // and the executable it was told to start, which an update can change.
+        var launched = process.SteamLaunchAppId;
         var profile = new GameProfile
         {
             Id = Guid.NewGuid(),
             Name = process.DisplayName,
-            ExecutablePath = process.ExecutablePath,
-            WineTargetExecutable = process.Wine?.TargetExecutable,
-            SteamAppId = process.SteamAppId,
+            ExecutablePath = launched is null ? process.ExecutablePath : null,
+            WineTargetExecutable = launched is null ? process.Wine?.TargetExecutable : null,
+            SteamAppId = launched ?? process.SteamAppId,
             Source = GameSource.Manual,
         };
 
@@ -440,12 +448,14 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
             return;
         }
 
-        row.Update(row.Profile with
-        {
-            ExecutablePath = process.ExecutablePath,
-            WineTargetExecutable = process.Wine?.TargetExecutable ?? row.Profile.WineTargetExecutable,
-            SteamAppId = process.SteamAppId ?? row.Profile.SteamAppId,
-        }, process);
+        row.Update(process.SteamLaunchAppId is { } launched
+            ? row.Profile with { ExecutablePath = null, WineTargetExecutable = null, SteamAppId = launched }
+            : row.Profile with
+            {
+                ExecutablePath = process.ExecutablePath,
+                WineTargetExecutable = process.Wine?.TargetExecutable ?? row.Profile.WineTargetExecutable,
+                SteamAppId = process.SteamAppId ?? row.Profile.SteamAppId,
+            }, process);
 
         ProfilesChanged?.Invoke(this, EventArgs.Empty);
         OnPropertyChanged(nameof(CanStart));
@@ -590,18 +600,22 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     /// higher for more specific evidence.
     /// </summary>
     /// <remarks>
-    /// Several processes match one game. Steam's launch wrapper and every runtime process under it
-    /// carry the game's app id; a native game's own binary, inside its folder, outranks them. A
-    /// Proton game is different: the wrapper's command line names the game's .exe, so the wrapper
-    /// is recognised by it as surely as the Wine process running it — and, being the root of the
-    /// tree, it is the better process to route, since everything else descends from it. Either
-    /// way the page does not rely on this one process for anything but a rule: the evidence and
+    /// Several processes match one game. Steam's launch of it outranks them all: it is what a
+    /// Steam game's rule matches, and the root of everything the game runs. Under it, every runtime
+    /// process carries the game's app id, and a game's own binary, inside its folder, outranks
+    /// them. The page does not rely on this one process for anything but a rule: the evidence and
     /// the monitor read the whole tree, <see cref="GamePids"/>. The executable path of a Wine game
     /// is the runtime's, shared by every game on that runtime, so such a game is recognised by its
     /// Windows executable alone, as the daemon matches it.
     /// </remarks>
     internal static int MatchRank(GameProfile profile, ProcessSnapshot process)
     {
+        if (profile.SteamLaunchAppId is { } launched &&
+            string.Equals(process.SteamLaunchAppId, launched, StringComparison.Ordinal))
+        {
+            return 4;
+        }
+
         var exact = profile.WineTargetExecutable is { Length: > 0 } wine
             ? string.Equals(process.Wine?.TargetExecutable, wine, StringComparison.OrdinalIgnoreCase)
             : profile.ExecutablePath is { Length: > 0 } path &&
@@ -670,11 +684,13 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
 
     /// <summary>
     /// Whether a game that just appeared still has to be given a rule: the session has none yet,
-    /// or it has one for an earlier run of the game that matched by process.
+    /// it has one for an earlier run of the game that matched by process, or it has a Steam launch
+    /// rule and the game was started some other way.
     /// </summary>
     private bool NeedsRuleFor(ProcessSnapshot process) =>
         _sessionRule is not { } rule ||
-        (rule.Process.Kind == ProcessSelectorKind.Instance && rule.Process.Identity != process.Identity);
+        (rule.Process.Kind == ProcessSelectorKind.Instance && rule.Process.Identity != process.Identity) ||
+        (rule.Process.Kind == ProcessSelectorKind.SteamApp && !rule.Process.MatchesProcess(process));
 
     // -- evidence -------------------------------------------------------------
 
@@ -1963,9 +1979,13 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
         _arrivalInFlight = true;
         try
         {
-            if (_sessionRule is { Process.Kind: ProcessSelectorKind.Instance } earlier)
+            if (_sessionRule is { } earlier &&
+                (earlier.Process.Kind == ProcessSelectorKind.Instance ||
+                 (earlier.Process.Kind == ProcessSelectorKind.SteamApp && !earlier.Process.MatchesProcess(process))))
             {
                 // A rule for an earlier run of the game, matched by process: that process is gone.
+                // Or one for Steam's launch of a game that was started some other way, which
+                // matches nothing of this run.
                 await _daemon.RemoveRuleAsync(earlier.Id).ConfigureAwait(true);
                 _rules.Remove(earlier.Id);
                 _sessionRule = null;
@@ -2024,15 +2044,24 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     /// What to match a game that has just appeared, and what about it is worth remembering.
     /// </summary>
     /// <remarks>
-    /// Only what is evidently the game's own is remembered: a Windows executable or a binary
-    /// inside the game's folder, under <c>steamapps/common/&lt;this game&gt;</c>. A game found by
-    /// its Steam app id can be running from outside it, through a Proton or Steam runtime wrapper
-    /// every other game shares, and a rule for that binary would route all of them. That run is
-    /// routed by process instead, and nothing is remembered.
+    /// Only what is evidently the game's own is remembered: Steam's launch of it, by the app id it
+    /// names, or a Windows executable or a binary inside the game's folder, under
+    /// <c>steamapps/common/&lt;this game&gt;</c>. A game found by its Steam app id can be running
+    /// from outside it, through a Proton or Steam runtime wrapper every other game shares, and a
+    /// rule for that binary would route all of them. That run is routed by process instead, and
+    /// nothing is remembered.
     /// </remarks>
     /// <returns>The selector, and the profile with what was learned, or null for the profile when nothing was.</returns>
     internal static (ProcessSelector Selector, GameProfile? Learned) LearnSelector(GameProfile profile, ProcessSnapshot process)
     {
+        // Steam's launch names the executable Steam was told to start as well as the app id. Only
+        // the app id is kept: the executable is what changed under Helldivers 2's rule.
+        if (process.SteamLaunchAppId is { } launched)
+        {
+            return (SteamLaunchSelector(launched),
+                profile with { ExecutablePath = null, WineTargetExecutable = null, SteamAppId = launched });
+        }
+
         if (process.Wine?.TargetExecutable is { Length: > 0 } wine && profile.MatchesInstalledPath(wine))
         {
             return (new ProcessSelector
@@ -2071,10 +2100,19 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     /// Works out what the session's rule should match.
     /// </summary>
     /// <remarks>
-    /// Prefers the Wine target, because that is the only thing that distinguishes two games
-    /// sharing a runtime. Falls back to the executable path. A profile with no path at all — a
-    /// Steam game that has never been attached — is matched by what its running process turns
-    /// out to be, as in <see cref="LearnSelector"/>, and by nothing while it is not running.
+    /// <para>
+    /// A Steam game is matched by Steam's launch of it, from its app id alone, so the rule is in
+    /// place before the game has ever run. Everything the game runs descends from that launch,
+    /// Proton's wineserver included, and the wineserver is what opens a Proton game's sockets. A
+    /// Steam game running without Steam's launch around it was started some other way; that run
+    /// is routed by what is running, and nothing is remembered from it.
+    /// </para>
+    /// <para>
+    /// Otherwise the Wine target comes first, because that is the only thing that distinguishes
+    /// two games sharing a runtime, then the executable path. A profile with neither is matched by
+    /// what its running process turns out to be, as in <see cref="LearnSelector"/>, and by nothing
+    /// while it is not running.
+    /// </para>
     /// </remarks>
     /// <returns>
     /// The selector, or null when there is nothing to match yet; and the profile with what was
@@ -2083,6 +2121,20 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
     private static (ProcessSelector? Selector, GameProfile? Learned) BuildSelector(GameRowViewModel row)
     {
         var profile = row.Profile;
+
+        if (profile.SteamLaunchAppId is { } appId)
+        {
+            if (row.Running is { SteamLaunchAppId: null } outside)
+            {
+                return (LearnSelector(profile, outside).Selector, null);
+            }
+
+            // What used to be remembered of Steam's launch, its launcher and the executable it was
+            // told to start, is forgotten, so the page stops naming an executable it does not match.
+            return (SteamLaunchSelector(appId), SteamLaunch.IsLauncher(profile.ExecutablePath)
+                ? profile with { ExecutablePath = null, WineTargetExecutable = null }
+                : null);
+        }
 
         if (profile.WineTargetExecutable is { Length: > 0 } wine)
         {
@@ -2109,6 +2161,16 @@ public sealed partial class GamesPageViewModel : ObservableObject, IDisposable
 
         return row.Running is { } running ? LearnSelector(profile, running) : (null, null);
     }
+
+    /// <summary>Steam's launch of one game, and everything it runs.</summary>
+    private static ProcessSelector SteamLaunchSelector(string appId) => new()
+    {
+        Kind = ProcessSelectorKind.SteamApp,
+        SteamAppId = appId,
+        // Proton's wrappers, the wineserver that opens the game's sockets, the game, its
+        // anti-cheat and its crash handler all descend from the launch.
+        Descendants = DescendantPolicy.IncludeExistingAndFuture,
+    };
 
     private void Fail(string? reason)
     {

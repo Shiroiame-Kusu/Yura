@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using Yura.Core.Processes;
@@ -189,6 +190,29 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     private readonly Dictionary<Guid, HashSet<int>> _tree = [];
 
     /// <summary>
+    /// The rules each wineserver is placed under, because a Wine process of its prefix is.
+    /// </summary>
+    /// <remarks>
+    /// Wine opens every socket a Windows program asks for inside the wineserver of its prefix, so
+    /// the socket's cgroup, fixed when it is created, is the wineserver's. Without this, a rule on
+    /// a Wine game routed none of its Winsock traffic: Helldivers 2's own process sat in its rule's
+    /// group while every HTTPS and PlayFab connection it made was born in Steam's. A rule on Steam's
+    /// launch never needed it, because the wineserver is born under the launch. Re-derived on every
+    /// sweep, so a wineserver is let go once nothing of its prefix is covered. See
+    /// <see cref="WineProcess"/>.
+    /// </remarks>
+    private Dictionary<int, HashSet<Guid>> _wineServers = [];
+
+    /// <summary>
+    /// The prefix of each Wine process and wineserver seen, read from its environment once per
+    /// instance: the daemon reads no environments unless it has to.
+    /// </summary>
+    private readonly Dictionary<int, (ulong StartTicks, string? Executable, string? Prefix)> _winePrefixes = [];
+
+    /// <summary>Wineservers seen by the last sweep, so finding one on an exec rarely reads all of /proc.</summary>
+    private readonly Dictionary<int, ulong> _knownWineServers = [];
+
+    /// <summary>
     /// The group each pid was last placed in by us. Concurrent because the fork fast path
     /// reads it from the netlink thread without taking the gate.
     /// </summary>
@@ -226,6 +250,26 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     /// Replaced wholesale on each reconcile, so the fast path needs no lock.
     /// </remarks>
     private volatile IReadOnlyDictionary<string, string> _fastInclude = new Dictionary<string, string>();
+
+    /// <summary>
+    /// Steam app id to the group Steam's launch of it belongs in, for the exec fast path.
+    /// </summary>
+    /// <remarks>
+    /// Steam's reaper forks the game's first process within a millisecond of starting, which is
+    /// usually before the ordinary handler has placed it. Placed on the netlink thread instead,
+    /// the whole game is born in the group. Replaced wholesale on each reconcile.
+    /// </remarks>
+    private volatile IReadOnlyDictionary<string, string> _fastSteamLaunches = new Dictionary<string, string>();
+
+    /// <summary>
+    /// The wineservers last seen, for the listeners: a flow's owner is looked for among them last.
+    /// </summary>
+    /// <remarks>
+    /// A wineserver holds a copy of every socket the programs of its prefix have open, among
+    /// thousands of handles. Asked first, it was named as the owner of a game's connections, and
+    /// its whole table was read for each one. Replaced wholesale, so the listeners need no lock.
+    /// </remarks>
+    private volatile IReadOnlySet<int> _wineServerPids = new HashSet<int>();
 
     private long _excludedChildren;
     private long _excludeMisses;
@@ -458,11 +502,18 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     /// same group twice costs nothing, and moving it to a wider group — one covering several
     /// rules that all match it — is what the slow path is for.
     /// </para>
+    /// <para>
+    /// Steam's launch of a game is placed here too, by the app id in its command line, which is
+    /// read only for a process running Steam's launcher. It never opens a socket itself, but it
+    /// forks the game's first process at once, and a child forked before the launch is placed
+    /// starts outside the group with everything it goes on to run.
+    /// </para>
     /// </remarks>
     public bool TryIncludeOnExecFast(int pid)
     {
         var map = _fastInclude;
-        if (map.Count == 0 || pid == 1 || pid == Environment.ProcessId)
+        var launches = _fastSteamLaunches;
+        if ((map.Count == 0 && launches.Count == 0) || pid == 1 || pid == Environment.ProcessId)
         {
             return false;
         }
@@ -477,7 +528,14 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             return false;
         }
 
-        if (executable is null || !map.TryGetValue(executable, out var group))
+        if (executable is null)
+        {
+            return false;
+        }
+
+        if (!map.TryGetValue(executable, out var group) &&
+            !(launches.Count > 0 && SteamLaunch.IsLauncher(executable) &&
+              ReadSteamLaunchAppId(pid) is { } appId && launches.TryGetValue(appId, out group)))
         {
             return false;
         }
@@ -490,6 +548,19 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         Interlocked.Increment(ref _includedOnExec);
         Journal.ProcessPlaced(pid, Path.GetFileName(executable), CgroupManager.RelativePathFor(group), "at exec");
         return true;
+    }
+
+    /// <summary>The app id a process's command line launches, read straight from <c>/proc</c>.</summary>
+    private static string? ReadSteamLaunchAppId(int pid)
+    {
+        try
+        {
+            return SteamLaunch.AppIdOf(File.ReadAllText($"/proc/{pid}/cmdline"));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     // -- configuration ---------------------------------------------------------
@@ -676,15 +747,20 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
                 }
             }
 
+            // The wineserver of a Wine program the rule covers joins the rule with it, being where
+            // the program's sockets are made, so what it holds open is the program's too.
+            var servers = WineServersJoining(rule, snapshot, joining);
+            var covered = servers.Count == 0 ? joining : joining.Union(servers).ToHashSet();
+
             // Counted BEFORE the rule is installed: afterwards these sockets are
             // indistinguishable from ones opened under the new rule, and they are exactly
             // the connections that will keep their previous route.
-            var preExisting = CountExistingSockets(rule, snapshot, joining);
+            var preExisting = CountExistingSockets(rule, snapshot, covered);
 
             // Listed before the install too, and for the same reason: the route each of those
             // sockets is on can only be worked out from the rules as they stand now. Which of
             // them the new rule actually changes is decided once it is in place.
-            var resetCandidates = resetExisting ? GatherResetCandidates(rule, snapshot, joining) : [];
+            var resetCandidates = resetExisting ? GatherResetCandidates(rule, snapshot, covered) : [];
 
             var previous = _rules.GetValueOrDefault(rule.Id);
             _rules[rule.Id] = rule;
@@ -914,7 +990,12 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
 
         var (desired, created) = GroupFor(members);
         _placed[child] = desired.Name;
-        if (desired.Name != inherited.Name)
+
+        // Inheriting the parent's group is not the same as being in it. A child forked before its
+        // parent was moved is still where the parent came from: Steam's reaper forks the game's
+        // first process within a millisecond of starting, often before the reaper's own exec has
+        // been handled, and the child then took the whole game outside the group until a sweep.
+        if (desired.Name != inherited.Name || CgroupManager.GroupOf(child) != desired.Name)
         {
             _cgroups.Move(desired.Name, child, childSnapshot.DisplayName);
         }
@@ -934,6 +1015,15 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         }
 
         var created = PlaceProcess(snapshot, null);
+
+        // A Windows program's sockets are made by its prefix's wineserver, which is usually running
+        // already. It joins the program's rules now, before the program's first connection, rather
+        // than at the next sweep.
+        if (WineProcess.IsLoader(snapshot.ExecutablePath) && RulesCovering(snapshot) is { Count: > 0 } rules)
+        {
+            created |= JoinWineServer(snapshot, rules);
+        }
+
         if (created)
         {
             await ReinstallAsync(ct).ConfigureAwait(false);
@@ -945,6 +1035,17 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         _direct.Remove(pid);
         _placed.TryRemove(pid, out _);
         _cgroups.Forget(pid);
+        _winePrefixes.Remove(pid);
+        if (_knownWineServers.Remove(pid))
+        {
+            _wineServerPids = _knownWineServers.Keys.ToHashSet();
+        }
+
+        if (_wineServers.ContainsKey(pid))
+        {
+            _wineServers = new Dictionary<int, HashSet<Guid>>(_wineServers.Where(kv => kv.Key != pid));
+            RefreshFastExclusion();
+        }
         foreach (var set in _tree.Values)
         {
             set.Remove(pid);
@@ -1065,6 +1166,14 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             set.RemoveWhere(p => !live.Contains(p));
         }
 
+        foreach (var pid in _winePrefixes.Keys.Where(p => !live.Contains(p)).ToList())
+        {
+            _winePrefixes.Remove(pid);
+        }
+
+        // Before anything is placed: a wineserver goes where the programs it serves go.
+        RecomputeWineServers(snapshot, live);
+
         var created = false;
         foreach (var process in snapshot)
         {
@@ -1072,6 +1181,33 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         }
 
         return created;
+    }
+
+    /// <summary>
+    /// The enabled rules that cover a process, by its selector or through its process tree.
+    /// </summary>
+    /// <param name="direct">Receives the ones that cover it by its selector, when given.</param>
+    private HashSet<Guid> RulesCovering(ProcessSnapshot process, HashSet<Guid>? direct = null)
+    {
+        var covering = new HashSet<Guid>();
+        foreach (var rule in _rules.Values)
+        {
+            if (rule.Enabled && rule.Process.Kind != ProcessSelectorKind.Any && rule.Process.MatchesProcess(process))
+            {
+                covering.Add(rule.Id);
+                direct?.Add(rule.Id);
+            }
+        }
+
+        foreach (var (ruleId, pids) in _tree)
+        {
+            if (pids.Contains(process.Identity.Pid) && _rules.TryGetValue(ruleId, out var rule) && rule.Enabled)
+            {
+                covering.Add(ruleId);
+            }
+        }
+
+        return covering;
     }
 
     /// <summary>Evaluates one process's rule set and moves it if it is not where it should be.</summary>
@@ -1084,21 +1220,12 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         }
 
         var direct = new HashSet<Guid>();
-        foreach (var rule in _rules.Values)
-        {
-            if (rule.Enabled && rule.Process.Kind != ProcessSelectorKind.Any && rule.Process.MatchesProcess(process))
-            {
-                direct.Add(rule.Id);
-            }
-        }
+        var members = RulesCovering(process, direct);
 
-        var members = new HashSet<Guid>(direct);
-        foreach (var (ruleId, pids) in _tree)
+        // A wineserver goes where the programs of its prefix go, being where their sockets are made.
+        if (_wineServers.TryGetValue(pid, out var served))
         {
-            if (pids.Contains(pid) && _rules.TryGetValue(ruleId, out var rule) && rule.Enabled)
-            {
-                members.Add(ruleId);
-            }
+            members.UnionWith(served);
         }
 
         if (direct.Count == 0)
@@ -1142,6 +1269,234 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         }
 
         return created;
+    }
+
+    // -- wineservers -------------------------------------------------------------
+
+    /// <summary>
+    /// Works out from the process table which wineservers serve a covered Wine program, and under
+    /// which rules. Caller holds the gate.
+    /// </summary>
+    private void RecomputeWineServers(IReadOnlyList<ProcessSnapshot> snapshot, IReadOnlySet<int> live)
+    {
+        var covered = new Dictionary<(uint Uid, string Prefix), HashSet<Guid>>();
+        var servers = new List<ProcessSnapshot>();
+        foreach (var process in snapshot)
+        {
+            if (WineProcess.IsServer(process.ExecutablePath))
+            {
+                servers.Add(process);
+            }
+            else if (WineProcess.IsLoader(process.ExecutablePath) &&
+                     RulesCovering(process) is { Count: > 0 } rules &&
+                     WinePrefixOf(process) is { } prefix)
+            {
+                var key = (process.Identity.Uid, prefix);
+                if (!covered.TryAdd(key, rules))
+                {
+                    covered[key].UnionWith(rules);
+                }
+            }
+        }
+
+        _knownWineServers.Clear();
+        var placed = new Dictionary<int, HashSet<Guid>>();
+        foreach (var server in servers)
+        {
+            _knownWineServers[server.Identity.Pid] = server.Identity.StartTicks;
+            if (covered.Count > 0 &&
+                WinePrefixOf(server) is { } prefix &&
+                covered.TryGetValue((server.Identity.Uid, prefix), out var rules) &&
+                MissingFrom(server, rules) is { Count: > 0 } joining)
+            {
+                placed[server.Identity.Pid] = joining;
+            }
+        }
+
+        _wineServerPids = _knownWineServers.Keys.ToHashSet();
+        SetWineServers(placed, live);
+    }
+
+    /// <summary>
+    /// Places the wineserver of a Wine program that has just been covered under the program's
+    /// rules, so the program's first socket is made inside them. Caller holds the gate.
+    /// </summary>
+    /// <returns>True when a group had to be created.</returns>
+    private bool JoinWineServer(ProcessSnapshot program, HashSet<Guid> rules)
+    {
+        if (WinePrefixOf(program) is not { } prefix)
+        {
+            return false;
+        }
+
+        var created = false;
+        foreach (var server in FindWineServers(program.Identity.Uid, prefix))
+        {
+            var served = _wineServers.GetValueOrDefault(server.Identity.Pid);
+            var wanted = served is null ? rules : [.. served, .. rules];
+            if (MissingFrom(server, wanted) is not { Count: > 0 } joining ||
+                (served is not null && served.SetEquals(joining)))
+            {
+                continue;
+            }
+
+            var placed = new Dictionary<int, HashSet<Guid>>(_wineServers) { [server.Identity.Pid] = joining };
+            SetWineServers(placed, null);
+            created |= PlaceProcess(server, null);
+        }
+
+        return created;
+    }
+
+    /// <summary>
+    /// The rules a wineserver still has to join: those it is not already under in its own right,
+    /// as it is when it was born under a rule's process tree, like a game's Steam launch.
+    /// </summary>
+    private HashSet<Guid> MissingFrom(ProcessSnapshot server, HashSet<Guid> rules)
+    {
+        var missing = new HashSet<Guid>(rules);
+        missing.ExceptWith(RulesCovering(server));
+        return missing;
+    }
+
+    /// <summary>Replaces the wineservers' memberships, and says which joined and which were let go.</summary>
+    /// <param name="live">The processes alive now, when known; one let go that has exited needs no line.</param>
+    private void SetWineServers(Dictionary<int, HashSet<Guid>> placed, IReadOnlySet<int>? live)
+    {
+        var changed = placed.Count != _wineServers.Count;
+        foreach (var (pid, rules) in placed)
+        {
+            if (_wineServers.TryGetValue(pid, out var before) && before.SetEquals(rules))
+            {
+                continue;
+            }
+
+            changed = true;
+            var names = string.Join(", ", rules.Select(id => _rules.TryGetValue(id, out var rule) ? $"'{rule.Name}'" : id.ToString()));
+            _log($"wineserver pid {pid} joins {names}: it opens the sockets of every Windows program in its prefix");
+        }
+
+        foreach (var pid in _wineServers.Keys.Where(p => !placed.ContainsKey(p)))
+        {
+            changed = true;
+            if (live?.Contains(pid) != false)
+            {
+                _log($"wineserver pid {pid} let go: no program in its prefix is covered by a rule now");
+            }
+        }
+
+        if (changed)
+        {
+            _wineServers = placed;
+            RefreshFastExclusion();
+        }
+    }
+
+    /// <summary>
+    /// The wineservers serving one prefix: those the last sweep saw, or, when none of them does,
+    /// whatever <c>/proc</c> has now.
+    /// </summary>
+    private List<ProcessSnapshot> FindWineServers(uint uid, string prefix)
+    {
+        var found = new List<ProcessSnapshot>();
+        foreach (var (pid, startTicks) in _knownWineServers)
+        {
+            if (_processes.TryRead(pid) is { } server && server.Identity.StartTicks == startTicks && Serves(server))
+            {
+                found.Add(server);
+            }
+        }
+
+        if (found.Count > 0)
+        {
+            return found;
+        }
+
+        // Started since the last sweep, which is usual for a game that is the first program of its
+        // prefix. Only the executable is read for most processes.
+        foreach (var directory in Directory.EnumerateDirectories("/proc"))
+        {
+            if (!int.TryParse(Path.GetFileName(directory), NumberStyles.None, CultureInfo.InvariantCulture, out var pid) ||
+                _knownWineServers.ContainsKey(pid))
+            {
+                continue;
+            }
+
+            string? executable;
+            try
+            {
+                executable = File.ResolveLinkTarget($"{directory}/exe", returnFinalTarget: false)?.FullName;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                continue;
+            }
+
+            if (WineProcess.IsServer(executable) && _processes.TryRead(pid) is { } server)
+            {
+                _knownWineServers[pid] = server.Identity.StartTicks;
+                _wineServerPids = _knownWineServers.Keys.ToHashSet();
+                if (Serves(server))
+                {
+                    found.Add(server);
+                }
+            }
+        }
+
+        return found;
+
+        bool Serves(ProcessSnapshot server) =>
+            server.Identity.Uid == uid &&
+            WineProcess.IsServer(server.ExecutablePath) &&
+            string.Equals(WinePrefixOf(server), prefix, StringComparison.Ordinal);
+    }
+
+    /// <summary>The prefix a Wine process or wineserver works in, read once per process image.</summary>
+    private string? WinePrefixOf(ProcessSnapshot process)
+    {
+        var pid = process.Identity.Pid;
+        if (_winePrefixes.TryGetValue(pid, out var known) &&
+            known.StartTicks == process.Identity.StartTicks &&
+            string.Equals(known.Executable, process.ExecutablePath, StringComparison.Ordinal))
+        {
+            return known.Prefix;
+        }
+
+        var prefix = ProcProcessSource.ReadWinePrefix(pid);
+        _winePrefixes[pid] = (process.Identity.StartTicks, process.ExecutablePath, prefix);
+        return prefix;
+    }
+
+    /// <summary>
+    /// The wineservers a rule is about to take in along with the Wine programs it covers, so
+    /// what they hold open is counted, and reset, with the programs' own connections.
+    /// </summary>
+    /// <param name="joining">Existing descendants the rule is about to take in.</param>
+    private HashSet<int> WineServersJoining(RoutingRule rule, IReadOnlyList<ProcessSnapshot> snapshot, IReadOnlySet<int> joining)
+    {
+        if (rule.Process.Kind == ProcessSelectorKind.Any)
+        {
+            return [];
+        }
+
+        var prefixes = new HashSet<(uint, string)>();
+        foreach (var process in snapshot)
+        {
+            if (WineProcess.IsLoader(process.ExecutablePath) &&
+                (rule.Process.MatchesProcess(process) || joining.Contains(process.Identity.Pid)) &&
+                WinePrefixOf(process) is { } prefix)
+            {
+                prefixes.Add((process.Identity.Uid, prefix));
+            }
+        }
+
+        return prefixes.Count == 0
+            ? []
+            : snapshot
+                .Where(p => WineProcess.IsServer(p.ExecutablePath) &&
+                            WinePrefixOf(p) is { } prefix && prefixes.Contains((p.Identity.Uid, prefix)))
+                .Select(p => p.Identity.Pid)
+                .ToHashSet();
     }
 
     /// <summary>
@@ -1361,24 +1716,9 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
     {
         var ordered = RuleEvaluator.Sort(_rules.Values);
 
-        // A child can never match an instance rule in its own right, so a group made only of
-        // instance rules that exclude descendants is one a forked child must leave at once.
-        var excluding = _groupsByName.Values
-            .Where(g => g.RuleIds.All(id =>
-                _rules.TryGetValue(id, out var rule) &&
-                rule.Process.Kind == ProcessSelectorKind.Instance &&
-                rule.Process.Descendants == DescendantPolicy.Exclude))
-            .ToList();
-
-        _fastExcludeMembers = excluding.ToDictionary(
-            g => g.Name,
-            g => (IReadOnlySet<int>)g.RuleIds
-                .Select(id => _rules.TryGetValue(id, out var rule) ? rule.Process.Identity?.Pid : null)
-                .Where(pid => pid is not null)
-                .Select(pid => pid!.Value)
-                .ToHashSet());
-        _fastExcludeGroups = excluding.Select(g => g.Name).ToHashSet();
+        RefreshFastExclusion();
         _fastInclude = BuildFastInclude();
+        _fastSteamLaunches = BuildFastSteamLaunches();
 
         // The environment is the most expensive thing read per process and the Wine prefix is
         // the only thing the daemon wants from it, so it is read only while a rule names one.
@@ -1398,6 +1738,66 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             AgentResolvers = _agents.Resolvers,
             HasHostRules = ordered.Any(r => r.Enabled && r.Destination.Hosts.Count > 0),
         };
+    }
+
+    /// <summary>
+    /// Works out which groups a forked child must leave at once, and which pids belong in them.
+    /// </summary>
+    /// <remarks>
+    /// A child can never match an instance rule in its own right, so a group made only of
+    /// instance rules that exclude descendants is one a forked child must leave at once. What
+    /// belongs is the instances its rules name, and any wineserver placed there for one of them:
+    /// that was not inherited, and evicted it would take the program's sockets out with it.
+    /// </remarks>
+    private void RefreshFastExclusion()
+    {
+        var excluding = _groupsByName.Values
+            .Where(g => g.RuleIds.All(id =>
+                _rules.TryGetValue(id, out var rule) &&
+                rule.Process.Kind == ProcessSelectorKind.Instance &&
+                rule.Process.Descendants == DescendantPolicy.Exclude))
+            .ToList();
+
+        _fastExcludeMembers = excluding.ToDictionary(
+            g => g.Name,
+            g => (IReadOnlySet<int>)g.RuleIds
+                .Select(id => _rules.TryGetValue(id, out var rule) ? rule.Process.Identity?.Pid : null)
+                .Where(pid => pid is not null)
+                .Select(pid => pid!.Value)
+                .Concat(_wineServers.Keys)
+                .ToHashSet());
+        _fastExcludeGroups = excluding.Select(g => g.Name).ToHashSet();
+    }
+
+    /// <summary>
+    /// The Steam apps whose launch the exec fast path can place, and the group each belongs in.
+    /// </summary>
+    /// <remarks>
+    /// As for <see cref="BuildFastInclude"/>: only when every rule naming the app is decided by
+    /// the app id alone, and only into a group that already exists.
+    /// </remarks>
+    private IReadOnlyDictionary<string, string> BuildFastSteamLaunches()
+    {
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        var launches = _rules.Values
+            .Where(r => r.Enabled && r.Process.Kind == ProcessSelectorKind.SteamApp && r.Process.SteamAppId is { Length: > 0 })
+            .GroupBy(r => r.Process.SteamAppId!, StringComparer.Ordinal);
+        foreach (var launch in launches)
+        {
+            if (launch.Any(r => r.Process.WineTargetExecutable is { Length: > 0 } || r.Process.WinePrefix is { Length: > 0 }))
+            {
+                continue;
+            }
+
+            var wanted = launch.Select(r => r.Id).ToHashSet();
+            var group = _groupsByName.Values.FirstOrDefault(g => g.RuleIds.SetEquals(wanted));
+            if (group is not null && _cgroups.GroupExists(group.Name))
+            {
+                map[launch.Key] = group.Name;
+            }
+        }
+
+        return map;
     }
 
     /// <summary>
@@ -1585,10 +1985,14 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
         socket.Remote.Port != 0 &&
         !IPAddress.IsLoopback(socket.Remote.Address);
 
-    /// <summary>Whether a rule covers a process, by its selector or through its process tree.</summary>
+    /// <summary>
+    /// Whether a rule covers a process: by its selector, through its process tree, or as the
+    /// wineserver of a program it covers.
+    /// </summary>
     private bool CoveredByRule(RoutingRule rule, ProcessSnapshot process) =>
         rule.Process.MatchesProcess(process) ||
-        (_tree.TryGetValue(rule.Id, out var members) && members.Contains(process.Identity.Pid));
+        (_tree.TryGetValue(rule.Id, out var members) && members.Contains(process.Identity.Pid)) ||
+        (_wineServers.TryGetValue(process.Identity.Pid, out var served) && served.Contains(rule.Id));
 
     /// <summary>
     /// What the rule list does with one open socket.
@@ -1688,7 +2092,15 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
 
     // -- per-flow decisions ----------------------------------------------------
 
-    /// <summary>Pids that could own a flow captured by <paramref name="slot"/>: the members of every group its rule is in.</summary>
+    /// <summary>
+    /// Pids that could own a flow captured by <paramref name="slot"/>: the members of every group
+    /// its rule is in, wineservers last.
+    /// </summary>
+    /// <remarks>
+    /// The first one holding the socket is taken for its owner. A Windows program's socket is held
+    /// by the program and by its wineserver, and the program is the one to name: it is what the
+    /// user knows the game as, and the one its rule was written for.
+    /// </remarks>
     public IReadOnlyCollection<int> CandidateOwners(RuleSlot slot)
     {
         var state = _state;
@@ -1701,7 +2113,10 @@ public sealed class RuleRuntime : IAsyncDisposable, IRouteDecider
             }
         }
 
-        return pids;
+        var servers = _wineServerPids;
+        return servers.Count > 0 && pids.Exists(servers.Contains)
+            ? [.. pids.Where(p => !servers.Contains(p)), .. pids.Where(servers.Contains)]
+            : pids;
     }
 
     /// <summary>

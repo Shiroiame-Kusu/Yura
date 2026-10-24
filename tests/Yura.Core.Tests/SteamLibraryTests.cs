@@ -280,18 +280,19 @@ public sealed class SteamLibraryTests : IDisposable
     }
 
     [Fact]
-    public void A_discovered_game_has_nothing_to_match_on_yet_and_says_so()
+    public void A_discovered_game_is_matched_by_steams_launch_of_it_and_no_binary_is_guessed()
     {
         var library = Library();
         WriteManifest(library, "730", "Counter-Strike 2");
 
         var game = Assert.Single(SteamLibrary.Discover([_root]));
 
-        // A manifest names an install directory, not a binary. Guessing one would produce a
-        // rule that silently covers nothing, so the profile stays unroutable until the user
-        // attaches it to a running process — or until one of the game's own binaries is seen.
+        // A manifest names an install directory, not a binary, and guessing one would produce a
+        // rule that silently covers nothing. It does name the app id, and that is what Steam's
+        // launch of the game names too, so the game is routable before it has ever run.
         Assert.Null(game.ExecutablePath);
-        Assert.False(game.IsRoutable);
+        Assert.Equal("730", game.SteamLaunchAppId);
+        Assert.True(game.IsRoutable);
         Assert.False(game.IsMeasurable);
     }
 

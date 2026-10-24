@@ -510,6 +510,150 @@ ctl remove-rule "{\"ruleId\":\"$RULE_W\"}" > /dev/null
 kill -9 "$WINE_A_PID" "$WINE_B_PID" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
+step "Acceptance 10b: a game Steam launches is routed from its launch, by its app id alone"
+# A stand-in for Steam's reaper, the one process Steam starts every game through: compiled, so
+# its command line reads exactly as Steam's does, and forking the game at once, as Steam's does.
+# The rule names only the app id. Helldivers 2's update changed the executable Steam launches,
+# and a rule keyed on that executable matched nothing from then on.
+FAKE_REAPER="$RUN/reaper"
+cc -O2 -o "$FAKE_REAPER" "${LIB}/fake_reaper.c"
+steam_launch() {
+  local app="$1" label="$2"
+  as_user "$FAKE_REAPER" SteamLaunch "AppId=${app}" -- python3 "${LIB}/spike_client.py" --label "$label" \
+    --tcp-target "${UNREACHABLE}:8080" --out "$RUN/client-${label}.jsonl" \
+    --interval 0.4 --timeout 1.5 > "$RUN/client-${label}.out" 2>&1 &
+  await_pid "$RUN/client-${label}.jsonl"
+}
+RULE_STEAM="88880000-0000-4000-8000-00000000008a"
+check "daemon applies a rule on Steam's launch of one app" ctl apply-rule \
+  "{\"rule\":{\"id\":\"$RULE_STEAM\",\"order\":107,\"name\":\"Steam app 999999991 via proxy A\",\"enabled\":true,\"origin\":\"gameProfile\",\"lifetime\":\"session\",\"createdAtUtc\":\"2026-10-24T00:00:00Z\",\"processKind\":\"steamApp\",\"steamAppId\":\"999999991\",\"descendants\":\"includeExistingAndFuture\",\"protocol\":\"any\",\"action\":\"proxy\",\"proxyId\":\"$PROXY_A_ID\"}}"
+STEAM_GAME_PID="$(steam_launch 999999991 steam-game)"; BG+=("$STEAM_GAME_PID")
+STEAM_OTHER_PID="$(steam_launch 999999992 steam-other)"; BG+=("$STEAM_OTHER_PID")
+info "app 999999991's game is pid $STEAM_GAME_PID; app 999999992's is pid $STEAM_OTHER_PID"
+sleep 4
+check "10b: the game is routed from its very first connection" lq assert "$RUN/client-steam-game.jsonl" --event tcp --min-count 3 --expect-ok true --expect-contains "$MARK_A"
+check "10b: the game runs inside the rule's group" grep -m1 '^0::/yura/' "/proc/${STEAM_GAME_PID}/cgroup"
+check "10b: Steam's launch was placed on the kernel's exec event, before it forked the game" python3 -c "
+import json, sys
+placed = [r for r in (json.loads(l) for l in open(sys.argv[1]) if l.strip())
+          if r.get('event') == 'process-placed' and r.get('process') == 'reaper' and r.get('how') == 'at exec']
+print(f'{len(placed)} launch(es) placed at exec')
+sys.exit(0 if len(placed) == 1 else 1)" "$JOURNAL/events.jsonl"
+check "10b: another app Steam launches is not routed" lq assert "$RUN/client-steam-other.jsonl" --event tcp --min-count 2 --expect-ok false
+ctl remove-rule "{\"ruleId\":\"$RULE_STEAM\"}" > /dev/null
+kill -9 "$STEAM_GAME_PID" "$STEAM_OTHER_PID" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+step "Acceptance 10c: a rule on a Windows program takes its prefix's wineserver along"
+# Wine opens every socket a Windows program asks for inside its prefix's wineserver and hands
+# the program a copy, so the socket's cgroup is the wineserver's: a rule that placed only the
+# program routed nothing it sent. Stand-ins for both, run through copies of the interpreter named
+# as Wine names them, make and hand over their sockets the way Wine does.
+FAKE_WINESERVER="$RUN/wineserver"
+cp /usr/bin/python3 "$FAKE_WINESERVER"; chmod 755 "$FAKE_WINESERVER"
+PFX_G="$RUN/prefix-gamma"; PFX_D="$RUN/prefix-delta"
+start_wine_server() {  # prefix label
+  as_user env WINEPREFIX="$1" "$FAKE_WINESERVER" "${LIB}/fake_wine.py" server --socket "$RUN/$2.sock" > "$RUN/$2.out" 2>&1 &
+  for _ in $(seq 1 40); do
+    if grep -q 'fake wineserver pid' "$RUN/$2.out" 2>/dev/null; then awk '{print $4; exit}' "$RUN/$2.out"; return 0; fi
+    sleep 0.25
+  done
+  return 1
+}
+start_wine_program() {  # prefix server label windows-exe
+  as_user env WINEPREFIX="$1" "$WINE_RUNTIME" "${LIB}/fake_wine.py" client --socket "$RUN/$2.sock" \
+    --tcp-target "${UNREACHABLE}:8080" --out "$RUN/client-$3.jsonl" --label "$3" --wine-target "$4" \
+    > "$RUN/client-$3.out" 2>&1 &
+  await_pid "$RUN/client-$3.jsonl"
+}
+# Proton writes its prefix with a trailing slash, and Wine strips it; one prefix spelled two ways
+# is still one wineserver.
+SERVER_G="$(start_wine_server "$PFX_G/" gamma-server)"; BG+=("$SERVER_G")
+SERVER_D="$(start_wine_server "$PFX_D" delta-server)"; BG+=("$SERVER_D")
+info "wineserver of $PFX_G is pid $SERVER_G; of $PFX_D, pid $SERVER_D"
+RULE_WINE="88880000-0000-4000-8000-00000000008b"
+WINE_RULE_JSON="$(exe_rule "$RULE_WINE" "gamma.exe via proxy A" "$WINE_RUNTIME" proxy "\"$PROXY_A_ID\"" 108 gameProfile ',"wineTargetExecutable":"C:\\games\\gamma\\gamma.exe"')"
+check "daemon applies a rule on one Windows program, before it starts" ctl apply-rule "$WINE_RULE_JSON"
+check "10c: with no program of the prefix running, its wineserver is left alone" \
+  bash -c "! grep -q '^0::/yura/' /proc/${SERVER_G}/cgroup && echo 'still outside'"
+GAMMA_PID="$(start_wine_program "$PFX_G" gamma-server gamma 'C:\games\gamma\gamma.exe')"; BG+=("$GAMMA_PID")
+DELTA_PID="$(start_wine_program "$PFX_D" delta-server delta 'C:\games\delta\delta.exe')"; BG+=("$DELTA_PID")
+sleep 4
+check "10c: every socket the program got from its wineserver is routed, from the first" lq assert "$RUN/client-gamma.jsonl" --event tcp --min-count 3 --expect-ok true --expect-contains "$MARK_A"
+check "10c: its wineserver joined the rule's group" grep -m1 '^0::/yura/' "/proc/${SERVER_G}/cgroup"
+check "10c: another prefix's wineserver did not" bash -c "! grep -q '^0::/yura/' /proc/${SERVER_D}/cgroup && echo 'still outside'"
+check "10c: a program in another prefix is unaffected" lq assert "$RUN/client-delta.jsonl" --event tcp --min-count 2 --expect-ok false
+# The cost, stated rather than hidden: a program sharing the prefix shares the route, because
+# its wineserver makes its sockets too. Neither the rule nor the group names it, so its flows are
+# found in the wineserver's hands, and decided by the group they were made in.
+EPSILON_PID="$(start_wine_program "$PFX_G" gamma-server epsilon 'C:\games\epsilon\epsilon.exe')"; BG+=("$EPSILON_PID")
+sleep 3
+check "10c: another program of the same prefix shares the route" lq assert "$RUN/client-epsilon.jsonl" --event tcp --min-count 3 --expect-ok true --expect-contains "$MARK_A"
+check "10c: and is not itself taken into the group" bash -c "! grep -q '^0::/yura/' /proc/${EPSILON_PID}/cgroup && echo 'outside, routed through its wineserver'"
+ctl remove-rule "{\"ruleId\":\"$RULE_WINE\"}" > /dev/null
+check "10c: with the rule removed, its wineserver goes back where it came from" \
+  bash -c "! grep -q '^0::/yura/' /proc/${SERVER_G}/cgroup && echo 'back outside'"
+# Applied to a program that is already running, as a boost of a running game is, the rule takes
+# its wineserver in at once.
+T_WR="$(date +%s.%N)"
+check "daemon applies the rule again, with the program running" ctl apply-rule "$WINE_RULE_JSON"
+sleep 5
+check "10c: applied while it runs, the program's new sockets are routed" lq assert "$RUN/client-gamma.jsonl" --event tcp --since "$T_WR" --window 3 --min-count 2 --expect-ok true --expect-contains "$MARK_A"
+ctl remove-rule "{\"ruleId\":\"$RULE_WINE\"}" > /dev/null
+kill -9 "$GAMMA_PID" "$DELTA_PID" "$EPSILON_PID" "$SERVER_G" "$SERVER_D" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+step "Acceptance 10d: a real Windows program under Wine"
+# The same, with Wine itself and a Windows program built for it: the proof that matters, since
+# where Wine makes its sockets is Wine's business. Skipped where Wine or MinGW is not installed.
+if command -v wine >/dev/null && command -v wineserver >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null; then
+  PROBE="$RUN/winsock_probe.exe"
+  WPFX="$RUN/wine-prefix"
+  WINE_USER="${SUDO_USER:-root}"
+  WINE_HOME="$(getent passwd "$WINE_USER" | cut -d: -f6)"
+  wine_as_user() {
+    as_user env HOME="$WINE_HOME" WINEPREFIX="$WPFX" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" \
+      DISPLAY= WAYLAND_DISPLAY= "$@"
+  }
+  x86_64-w64-mingw32-gcc -O2 -o "$PROBE" "${LIB}/winsock_probe.c" -lws2_32
+  [[ -n "${SUDO_USER:-}" ]] && chown "$SUDO_USER" "$PROBE"
+  rm -rf "$WPFX"; as_user mkdir -p "$WPFX"
+  wine_as_user wineboot -i > "$RUN/wineboot.out" 2>&1 || true
+  # Running before its rule, as a game a boost is started for is.
+  wine_as_user wine "$PROBE" "$UNREACHABLE" 8080 40 400 > "$RUN/probe-1.out" 2>&1 &
+  # Found once Wine has made it the Windows program: until then it is Wine's launcher, with
+  # Wine's own path where the program's will be.
+  PROBE_PID=""
+  for _ in $(seq 1 80); do
+    PROBE_PID="$(pgrep -u "$WINE_USER" -f "winsock_probe.exe $UNREACHABLE" | head -1)"
+    [[ -n "$PROBE_PID" && "$(tr '\0' '\n' < "/proc/$PROBE_PID/cmdline" 2>/dev/null | head -1)" == *.exe ]] && break
+    PROBE_PID=""; sleep 0.25
+  done
+  BG+=("${PROBE_PID:-}")
+  LOADER="$(readlink "/proc/${PROBE_PID}/exe" 2>/dev/null)"
+  TARGET="$(tr '\0' '\n' < "/proc/${PROBE_PID}/cmdline" 2>/dev/null | grep -m1 -i '\.exe$')"
+  WSERVER="$(for p in $(pgrep -u "$WINE_USER" -x wineserver); do
+    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "WINEPREFIX=$WPFX" && echo "$p"; done | head -1)"
+  info "probe pid ${PROBE_PID:-?} runs ${TARGET:-?} through ${LOADER:-?}; its wineserver is pid ${WSERVER:-?}"
+  RULE_REAL="88880000-0000-4000-8000-00000000008c"
+  check "daemon applies a rule on the running Windows program" ctl apply-rule \
+    "$(exe_rule "$RULE_REAL" "winsock_probe.exe via proxy A" "$LOADER" proxy "\"$PROXY_A_ID\"" 109 gameProfile ",\"wineTargetExecutable\":\"$TARGET\"")"
+  sleep 5
+  check "10d: its wineserver joined the rule's group" grep -m1 '^0::/yura/' "/proc/${WSERVER}/cgroup"
+  check "10d: what it connects once its rule is in goes through the route" \
+    bash -c "[[ \$(tail -n 3 '$RUN/probe-1.out' | grep -c 'ok $MARK_A') == 3 ]] && echo 'its last 3 attempts were proxied'"
+  # Started after its rule, as a game a boost was started before is.
+  wine_as_user wine "$PROBE" "$UNREACHABLE" 8080 4 300 > "$RUN/probe-2.out" 2>&1 || true
+  check "10d: started after its rule, a Windows program is routed from its first socket" \
+    bash -c "[[ \$(grep -c 'ok $MARK_A' '$RUN/probe-2.out') == 4 ]] && echo 'all 4 attempts proxied'"
+  ctl remove-rule "{\"ruleId\":\"$RULE_REAL\"}" > /dev/null
+  [[ -n "$PROBE_PID" ]] && kill -9 "$PROBE_PID" 2>/dev/null || true
+  wine_as_user wineserver -k > /dev/null 2>&1 || true
+else
+  info "skipped: needs wine, wineserver and x86_64-w64-mingw32-gcc"
+fi
+
+# ---------------------------------------------------------------------------
 step "Destination host names: matched from the traffic, not from the packet header"
 HOST_APP="$RUN/yura-hostapp"
 cp /usr/bin/python3 "$HOST_APP"; chmod 755 "$HOST_APP"

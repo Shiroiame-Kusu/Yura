@@ -441,6 +441,8 @@ public sealed class RuleStore
                 string.Equals(a.Process.WineTargetExecutable, b.Process.WineTargetExecutable, StringComparison.Ordinal),
             ProcessSelectorKind.ProcessName =>
                 string.Equals(a.Process.ProcessName, b.Process.ProcessName, StringComparison.Ordinal),
+            ProcessSelectorKind.SteamApp =>
+                string.Equals(a.Process.SteamAppId, b.Process.SteamAppId, StringComparison.Ordinal),
             _ => false,
         };
     }

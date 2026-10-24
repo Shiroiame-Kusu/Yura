@@ -78,6 +78,16 @@ public sealed record ProcessSnapshot
     /// </remarks>
     public string? SteamAppId { get; init; }
 
+    /// <summary>
+    /// The app id when this process is Steam's launch of a game, the process everything the game
+    /// runs descends from; see <see cref="SteamLaunch"/>.
+    /// </summary>
+    /// <remarks>
+    /// Read from the command line rather than the environment: every process of the game carries
+    /// <see cref="SteamAppId"/>, but only the launch names it in its arguments.
+    /// </remarks>
+    public string? SteamLaunchAppId => SteamLaunch.AppIdOf(CommandLine);
+
     /// <summary>True when the process is a kernel thread (no executable, no network).</summary>
     public bool IsKernelThread => ExecutablePathState == ExecutablePathState.None && ParentPid is 0 or 2;
 

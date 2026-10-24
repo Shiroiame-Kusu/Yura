@@ -13,7 +13,7 @@ using Yura.Core.Rules;
 namespace Yura.Core.Tests;
 
 /// <summary>
-/// A boost started before the game: the game found when it appears, routed, and remembered.
+/// A boost started before the game: the game routed from its launch, or found when it appears.
 /// </summary>
 public sealed class AutoBoostTests
 {
@@ -21,22 +21,26 @@ public sealed class AutoBoostTests
 
     private const string AppId = "999999990";
 
-    // Steam's launch wrapper: it carries the game's app id, and so does everything under it.
+    // Steam's launcher: every game Steam starts runs under it, and its command line names the app.
     private const string Wrapper = "/home/hakuu/.local/share/Steam/ubuntu12_32/reaper";
+
+    // A launcher of some other store, outside the game's folder, that carries the app id.
+    private const string Launcher = "/opt/launcher/bin/launcher";
 
     private static readonly ProxyEndpoint Tokyo = new()
     {
         Id = Guid.NewGuid(), Name = "Tokyo", Protocol = ProxyProtocol.Socks5, Host = "10.0.0.2", Port = 1080,
     };
 
-    /// <summary>A game Steam knows by its folder and app id, never attached: nothing to match yet.</summary>
+    /// <summary>A game Steam knows by its folder and app id, never attached.</summary>
     private static GameProfile SteamGame() => new()
     {
         Id = Guid.NewGuid(), Name = "Test Game", SteamAppId = AppId, InstallDirectory = Folder, Source = GameSource.Steam,
     };
 
     private static ProcessSnapshot Process(
-        int pid, string path, string? wineTarget = null, string? appId = AppId, int parent = 1) => new()
+        int pid, string path, string? wineTarget = null, string? appId = AppId, int parent = 1,
+        IReadOnlyList<string>? commandLine = null) => new()
     {
         Identity = new ProcessIdentity { Pid = pid, StartTicks = (ulong)pid * 10, Uid = 1000, BootId = "b" },
         Name = Path.GetFileName(path),
@@ -44,9 +48,17 @@ public sealed class AutoBoostTests
         ExecutablePathState = ExecutablePathState.Resolved,
         ParentPid = parent,
         UserName = "hakuu",
+        CommandLine = commandLine ?? [],
         Wine = wineTarget is null ? null : new WineContext { TargetExecutable = wineTarget },
         SteamAppId = appId,
     };
+
+    /// <summary>
+    /// Steam's launch of the game, as Steam runs it: its arguments name the app, and the game's
+    /// .exe, which is why it has a Wine target of its own.
+    /// </summary>
+    private static ProcessSnapshot Launch(int pid) => Process(pid, Wrapper, wineTarget: Folder + "/Game.exe",
+        commandLine: [Wrapper, "SteamLaunch", $"AppId={AppId}", "--", "/usr/bin/proton", "waitforexitandrun", Folder + "/Game.exe"]);
 
     private static (GamesPageViewModel Page, RecordingDaemonClient Daemon) New(GameProfile profile)
     {
@@ -71,117 +83,131 @@ public sealed class AutoBoostTests
         Assert.True(condition());
     }
 
-    [Fact]
-    public async Task A_game_that_is_not_running_can_be_boosted_and_nothing_is_installed_until_it_appears()
+    private static void AssertLaunchRule(RoutingRule rule)
     {
+        Assert.Equal(ProcessSelectorKind.SteamApp, rule.Process.Kind);
+        Assert.Equal(AppId, rule.Process.SteamAppId);
+        Assert.Equal(DescendantPolicy.IncludeExistingAndFuture, rule.Process.Descendants);
+    }
+
+    [Fact]
+    public async Task A_steam_game_that_is_not_running_has_its_rule_in_place_before_it_starts()
+    {
+        // Its app id is all a rule on Steam's launch of it needs, and the manifest has that: the
+        // first run is routed from its first connection, with nothing to learn first.
         var (page, daemon) = New(SteamGame());
         Assert.True(page.CanStart);
         Assert.Contains("Test Game", page.StartHint, StringComparison.Ordinal);
 
         await page.StartBoostCommand.ExecuteAsync(null);
 
+        AssertLaunchRule(Assert.Single(daemon.Applied).Rule);
         Assert.Equal(BoostState.WaitingForGame, page.State);
-        Assert.Empty(daemon.Applied);
-        Assert.Contains("Test Game", page.StatusMessage, StringComparison.Ordinal);
+        Assert.Equal(string.Format(Loc.Current["Games.ArmedWithRule"], "Test Game"), page.StatusMessage);
         Assert.Equal(Loc.Current["Games.Monitor.WaitingForGame"], page.MonitorStatus);
         page.Dispose();
     }
 
     [Fact]
-    public async Task A_game_that_appears_inside_its_folder_is_routed_and_remembered()
+    public async Task Steams_launch_of_the_game_is_routed_by_the_rule_already_in_place()
     {
         var (page, daemon) = New(SteamGame());
-        var saves = 0;
-        page.ProfilesChanged += (_, _) => saves++;
         await page.StartBoostCommand.ExecuteAsync(null);
 
-        page.ApplyRunning([Process(4242, Folder + "/bin/game")]);
+        page.ApplyRunning(ProtonTree());
+
+        Assert.Single(daemon.Applied);
+        Assert.Equal(BoostState.Routing, page.State);
+        Assert.Equal(4242, page.Games.Single().Running?.Identity.Pid);
+        Assert.Equal(string.Format(Loc.Current["Games.AttachedToSteamLaunch"], 4242), page.Games.Single().SubtitleText);
+        // Nothing about this run is worth remembering: the next is matched the same way.
+        Assert.Null(Assert.Single(page.Profiles).ExecutablePath);
+        Assert.Null(Assert.Single(page.Profiles).WineTargetExecutable);
+        page.Dispose();
+    }
+
+    [Fact]
+    public async Task A_steam_game_that_was_remembered_by_steams_launcher_gets_the_launch_rule_and_forgets_the_rest()
+    {
+        // What Helldivers 2's profile held: Steam's launcher, and the .exe it was told to start
+        // before Easy Anti-Cheat came between them. That rule matched nothing after the update.
+        var (page, daemon) = New(SteamGame() with
+        {
+            ExecutablePath = Wrapper,
+            WineTargetExecutable = Folder + "/bin/game.exe",
+        });
+        var saves = 0;
+        page.ProfilesChanged += (_, _) => saves++;
+        Assert.Equal(string.Format(Loc.Current["Games.SteamNotStarted"], AppId), page.Games.Single().SubtitleText);
+
+        await page.StartBoostCommand.ExecuteAsync(null);
+
+        AssertLaunchRule(Assert.Single(daemon.Applied).Rule);
+        var profile = Assert.Single(page.Profiles);
+        Assert.Null(profile.ExecutablePath);
+        Assert.Null(profile.WineTargetExecutable);
+        Assert.True(saves > 0);
+        page.Dispose();
+    }
+
+    [Fact]
+    public async Task Boosting_a_steam_game_running_through_steam_routes_its_launch_and_resets_what_it_has_open()
+    {
+        var (page, daemon) = New(SteamGame());
+        page.ApplyRunning(ProtonTree());
+
+        await page.StartBoostCommand.ExecuteAsync(null);
 
         var (rule, reset) = Assert.Single(daemon.Applied);
+        AssertLaunchRule(rule);
+        Assert.True(reset);
+        Assert.Equal(BoostState.Routing, page.State);
+        page.Dispose();
+    }
+
+    [Fact]
+    public async Task A_steam_game_started_outside_steam_is_routed_by_what_is_running_and_nothing_is_remembered()
+    {
+        var (page, daemon) = New(SteamGame());
+        await page.StartBoostCommand.ExecuteAsync(null);
+        var launchRule = daemon.Applied[0].Rule;
+
+        // The game's own binary, with no launch of Steam's around it: the launch rule covers none
+        // of this run.
+        page.ApplyRunning([Process(4242, Folder + "/bin/game")]);
+
+        Assert.Contains(launchRule.Id, daemon.Removed);
+        var (rule, reset) = daemon.Applied[1];
         Assert.Equal(ProcessSelectorKind.ExecutablePath, rule.Process.Kind);
         Assert.Equal(Folder + "/bin/game", rule.Process.ExecutablePath);
         Assert.Equal(DescendantPolicy.IncludeExistingAndFuture, rule.Process.Descendants);
         // It has been running for up to a couple of seconds: what it opened before the rule is
         // dropped, and reconnects through the route.
         Assert.True(reset);
+        Assert.Equal(rule.Id, Assert.Single(daemon.Installed).Id);
         Assert.Equal(BoostState.Routing, page.State);
-        Assert.Equal(Folder + "/bin/game", Assert.Single(page.Profiles).ExecutablePath);
-        Assert.True(saves > 0);
-        Assert.DoesNotContain(Loc.Current["Games.ArrivedThisRunOnly"], page.StatusMessage, StringComparison.Ordinal);
-        page.Dispose();
-    }
-
-    [Fact]
-    public async Task The_next_boost_has_its_rule_in_place_before_the_game_starts()
-    {
-        var (page, daemon) = New(SteamGame());
-        await page.StartBoostCommand.ExecuteAsync(null);
-        page.ApplyRunning([Process(4242, Folder + "/bin/game")]);
-        await page.StopBoostCommand.ExecuteAsync(null);
-        page.ApplyRunning([]);
-
-        await page.StartBoostCommand.ExecuteAsync(null);
-
-        Assert.Equal(BoostState.WaitingForGame, page.State);
-        Assert.Equal(2, daemon.Applied.Count);
-        Assert.Equal(Folder + "/bin/game", daemon.Applied[1].Rule.Process.ExecutablePath);
-
-        // The rule catches the game as it starts, so the session just routes: no second rule.
-        page.ApplyRunning([Process(4343, Folder + "/bin/game")]);
-
-        Assert.Equal(BoostState.Routing, page.State);
-        Assert.Equal(2, daemon.Applied.Count);
-        page.Dispose();
-    }
-
-    [Fact]
-    public async Task A_game_found_by_its_launcher_is_routed_by_process_and_learned_once_its_own_binary_runs()
-    {
-        var (page, daemon) = New(SteamGame());
-        await page.StartBoostCommand.ExecuteAsync(null);
-        var wrapper = Process(4242, Wrapper);
-
-        // The wrapper first: a rule for its binary would route every Steam game, so this run is
-        // routed by process — the wrapper and everything it starts, the game included.
-        page.ApplyRunning([wrapper]);
-
-        var (rule, _) = Assert.Single(daemon.Applied);
-        Assert.Equal(ProcessSelectorKind.Instance, rule.Process.Kind);
-        Assert.Equal(wrapper.Identity, rule.Process.Identity);
-        Assert.Equal(DescendantPolicy.IncludeExistingAndFuture, rule.Process.Descendants);
         Assert.Null(Assert.Single(page.Profiles).ExecutablePath);
+        page.Dispose();
+    }
+
+    [Fact]
+    public async Task Relaunched_through_steam_after_a_run_outside_it_the_game_gets_its_launch_rule_back()
+    {
+        var (page, daemon) = New(SteamGame());
+        await page.StartBoostCommand.ExecuteAsync(null);
+        page.ApplyRunning([Process(4242, Launcher)]);
+        var byProcess = daemon.Applied[1].Rule;
+        Assert.Equal(ProcessSelectorKind.Instance, byProcess.Process.Kind);
         Assert.Contains(Loc.Current["Games.ArrivedThisRunOnly"], page.StatusMessage, StringComparison.Ordinal);
 
-        // Then the game itself, under the wrapper: remembered, and this run's rule left alone.
-        page.ApplyRunning([wrapper, Process(4250, Folder + "/bin/game")]);
-
-        Assert.Equal(4250, page.Games.Single().Running?.Identity.Pid);
-        Assert.Equal(Folder + "/bin/game", Assert.Single(page.Profiles).ExecutablePath);
-        Assert.Single(daemon.Applied);
-        Assert.Contains("Test Game", page.StatusMessage, StringComparison.Ordinal);
-        Assert.Equal(BoostState.Routing, page.State);
-        page.Dispose();
-    }
-
-    [Fact]
-    public async Task Relaunched_after_it_was_learned_the_game_gets_its_learned_rule()
-    {
-        var (page, daemon) = New(SteamGame());
-        await page.StartBoostCommand.ExecuteAsync(null);
-        var wrapper = Process(4242, Wrapper);
-        page.ApplyRunning([wrapper]);
-        page.ApplyRunning([wrapper, Process(4250, Folder + "/bin/game")]);
-        var byProcess = daemon.Applied[0].Rule;
-
         page.ApplyRunning([]);
         Assert.Equal(BoostState.WaitingForGame, page.State);
-        page.ApplyRunning([Process(5353, Wrapper)]);
+        page.ApplyRunning(ProtonTree(root: 5000));
 
         Assert.Contains(byProcess.Id, daemon.Removed);
-        var learned = daemon.Applied[1].Rule;
-        Assert.Equal(ProcessSelectorKind.ExecutablePath, learned.Process.Kind);
-        Assert.Equal(Folder + "/bin/game", learned.Process.ExecutablePath);
-        Assert.Equal(learned.Id, Assert.Single(daemon.Installed).Id);
+        var relaunched = daemon.Applied[2].Rule;
+        AssertLaunchRule(relaunched);
+        Assert.Equal(relaunched.Id, Assert.Single(daemon.Installed).Id);
         Assert.Equal(BoostState.Routing, page.State);
         page.Dispose();
     }
@@ -191,14 +217,14 @@ public sealed class AutoBoostTests
     {
         var (page, daemon) = New(SteamGame());
         await page.StartBoostCommand.ExecuteAsync(null);
-        page.ApplyRunning([Process(4242, Wrapper)]);
-        var first = daemon.Applied[0].Rule;
+        page.ApplyRunning([Process(4242, Launcher)]);
+        var first = daemon.Applied[1].Rule;
 
         page.ApplyRunning([]);
-        page.ApplyRunning([Process(5353, Wrapper)]);
+        page.ApplyRunning([Process(5353, Launcher)]);
 
         Assert.Contains(first.Id, daemon.Removed);
-        var second = daemon.Applied[1].Rule;
+        var second = daemon.Applied[2].Rule;
         Assert.Equal(5353, second.Process.Identity?.Pid);
         Assert.Equal(second.Id, Assert.Single(daemon.Installed).Id);
         Assert.Equal(BoostState.Routing, page.State);
@@ -218,23 +244,9 @@ public sealed class AutoBoostTests
         daemon.HoldApply.SetResult();
 
         // Left in, it would route the game for a session that no longer exists.
-        await Eventually(() => daemon.Installed.Count == 0 && daemon.Applied.Count == 1);
-        Assert.Contains(daemon.Applied[0].Rule.Id, daemon.Removed);
+        await Eventually(() => daemon.Installed.Count == 0 && daemon.Applied.Count == 2);
+        Assert.Contains(daemon.Applied[1].Rule.Id, daemon.Removed);
         Assert.Equal(BoostState.Ready, page.State);
-        page.Dispose();
-    }
-
-    [Fact]
-    public async Task Boosting_a_game_that_is_already_running_learns_it_too()
-    {
-        var (page, daemon) = New(SteamGame());
-        page.ApplyRunning([Process(4242, Folder + "/bin/game")]);
-
-        await page.StartBoostCommand.ExecuteAsync(null);
-
-        Assert.Equal(ProcessSelectorKind.ExecutablePath, Assert.Single(daemon.Applied).Rule.Process.Kind);
-        Assert.Equal(Folder + "/bin/game", Assert.Single(page.Profiles).ExecutablePath);
-        Assert.Equal(BoostState.Routing, page.State);
         page.Dispose();
     }
 
@@ -254,15 +266,50 @@ public sealed class AutoBoostTests
     }
 
     [Fact]
+    public void Steams_launch_is_remembered_by_its_app_id_and_never_by_the_executable_it_names()
+    {
+        var profile = new GameProfile { Id = Guid.NewGuid(), Name = "Added by hand", Source = GameSource.Manual };
+
+        var (selector, learned) = GamesPageViewModel.LearnSelector(profile, Launch(4242));
+
+        Assert.Equal(ProcessSelectorKind.SteamApp, selector.Kind);
+        Assert.Equal(AppId, selector.SteamAppId);
+        Assert.Equal(AppId, learned?.SteamAppId);
+        Assert.Null(learned?.ExecutablePath);
+        Assert.Null(learned?.WineTargetExecutable);
+        Assert.Equal(AppId, learned?.SteamLaunchAppId);
+    }
+
+    [Fact]
+    public void A_game_added_from_steams_launch_is_matched_by_its_launch()
+    {
+        var (page, _) = New(SteamGame());
+
+        page.AddFromProcess(Launch(4242));
+
+        var added = page.Profiles.Single(p => p.Source == GameSource.Manual);
+        Assert.Null(added.ExecutablePath);
+        Assert.Null(added.WineTargetExecutable);
+        Assert.Equal(AppId, added.SteamLaunchAppId);
+        page.Dispose();
+    }
+
+    [Fact]
     public void Steams_wrapper_stands_in_for_the_game_only_until_the_game_runs()
     {
         var profile = SteamGame();
-        var wrapper = Process(4242, Wrapper);
+        var wrapper = Process(4242, Launcher);
         var game = Process(4250, Folder + "/bin/game");
 
         Assert.True(GamesPageViewModel.MatchRank(profile, game) > GamesPageViewModel.MatchRank(profile, wrapper));
         Assert.True(GamesPageViewModel.MatchRank(profile, wrapper) > 0);
         Assert.Equal(0, GamesPageViewModel.MatchRank(profile, Process(4300, "/usr/bin/bash", appId: null)));
+
+        // Steam's launch of it outranks everything under it: it is what the rule matches.
+        Assert.True(GamesPageViewModel.MatchRank(profile, Launch(4200)) > GamesPageViewModel.MatchRank(profile, game));
+        // Another game's launch is not this one's.
+        Assert.Equal(0, GamesPageViewModel.MatchRank(profile, Process(4400, Wrapper, appId: null,
+            commandLine: [Wrapper, "SteamLaunch", "AppId=1245620", "--", "/usr/bin/true"])));
     }
 
     [Fact]
@@ -575,14 +622,14 @@ public sealed class AutoBoostTests
 
     // -- the game as a tree of processes ------------------------------------------------
 
-    // What Steam and Proton actually run, as last night's daemon log showed it: the reaper, whose
-    // arguments name the game's .exe, then Proton's wrappers, then Wine, which runs the game from
-    // the library's own drive and holds every socket.
+    // What Steam and Proton actually run, as the daemon's log showed it: Steam's launch, whose
+    // arguments name the app and the game's .exe, then Proton's wrappers, then Wine, which runs the
+    // game from the library's own drive.
     private const string Preloader = "/home/hakuu/.local/share/Steam/steamapps/common/Proton 9.0/files/bin/wine64-preloader";
 
     private static ProcessSnapshot[] ProtonTree(int root = 4242) =>
     [
-        Process(root, Wrapper, wineTarget: Folder + "/Game.exe"),
+        Launch(root),
         Process(root + 8, "/usr/bin/python3", wineTarget: Folder + "/Game.exe", parent: root),
         Process(root + 58, Preloader, wineTarget: @"S:\steamapps\common\Test Game\Game.exe", parent: root + 8),
         Process(root + 60, Preloader, wineTarget: @"C:\windows\system32\services.exe", parent: root + 8),

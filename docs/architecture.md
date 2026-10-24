@@ -343,6 +343,31 @@ restart go straight to `systemctl`, which asks polkit itself.
   running `RuleEvaluator` over the rule list before and after the change, so reapplying a
   rule costs nothing. Unconnected UDP sockets are left alone: there is no connection to
   reset, and aborting one hands the application an error without making it rebind.
+- **Wine programs.** A Windows program's sockets are not its own. Wine opens every socket a
+  program asks for inside the wineserver of the program's prefix and hands the program a copy,
+  so the socket's cgroup is the wineserver's. Placed on its own, Helldivers 2's process sat in
+  its rule's group while every HTTPS and PlayFab connection it made was born in Steam's, and the
+  route carried only the relay pings Steam's native library made inside the game. A rule that
+  covers a Wine program therefore places that prefix's wineserver with it. The wineserver is
+  found by `WINEPREFIX` (or `~/.wine`) and uid, joins the moment the program execs, and is let go
+  once nothing in its prefix is covered. The wineserver keeps its own copy of every socket it
+  makes, so a captured flow is often found in its hands. Owners are looked for among a group's
+  programs first, so the flow is put down to the program that asked for it. One found only in
+  the wineserver's hands is decided by the group the socket was made in, since nothing about
+  the wineserver itself names a rule. Real Wine showed both; a stand-in that let go of its copies
+  did not. The cost is stated rather than hidden: the wineserver makes the sockets of every
+  program in its prefix, so they share the route. Proton gives each game a prefix of its own; a
+  prefix shared by several programs, as Lutris and Bottles allow, routes them all.
+- **Steam games.** Steam runs every game as `reaper SteamLaunch AppId=<id> -- <command>`, and
+  everything the game runs descends from that process: Proton, the wineserver, the game, its
+  anti-cheat. A rule on a Steam game matches that launch by its app id, so the whole tree is
+  born in the group, wineserver included, and the rule can be in place before the game has ever
+  run. The app id is the part of the launch an update cannot change. A rule keyed on the
+  executable Steam was told to start matched nothing once Helldivers 2 put Easy Anti-Cheat's
+  `start_protected_game.exe` in front of the game. The reaper forks the game within a
+  millisecond of starting, so it is placed on the netlink thread by reading its command line,
+  and a child forked before its parent was placed is moved when its fork is handled, not at the
+  next sweep.
 - **Process lifecycle.** The kernel's process connector (`NETLINK_CONNECTOR` / `CN_IDX_PROC`)
   reports fork, exec and exit. Exec is what lets a persistent executable rule catch a process
   before its first connection; exit is what expires an instance rule before its pid can be

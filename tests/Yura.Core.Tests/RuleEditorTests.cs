@@ -101,6 +101,43 @@ public sealed class RuleEditorTests
     }
 
     [Fact]
+    public void A_rule_on_steams_launch_of_a_game_is_edited_as_one()
+    {
+        // Turned into a path rule to fit the form, it would be a rule on Steam's launcher: every
+        // game Steam starts.
+        var store = Store();
+        var boost = new RoutingRule
+        {
+            Id = Guid.NewGuid(),
+            Order = 300,
+            Name = "HELLDIVERS 2 (game boost)",
+            Origin = RuleOrigin.GameProfile,
+            Lifetime = RuleLifetime.Session,
+            Process = new ProcessSelector
+            {
+                Kind = ProcessSelectorKind.SteamApp,
+                SteamAppId = "553850",
+                Descendants = DescendantPolicy.IncludeExistingAndFuture,
+            },
+            Destination = DestinationSelector.Any,
+            Action = new RuleAction.Proxy(Exit),
+            CreatedAtUtc = DateTimeOffset.UnixEpoch,
+        };
+        var editor = new RuleEditorViewModel(store);
+
+        editor.BeginEdit(boost);
+
+        Assert.Equal(ProcessSelectorKind.SteamApp, editor.ProcessKind);
+        Assert.False(editor.NeedsProcessValue);
+        Assert.True(editor.HasFixedSubject);
+        Assert.Contains("553850", editor.FixedSubjectDescription, StringComparison.Ordinal);
+
+        editor.Name = "Helldivers via Tokyo";
+        Assert.True(editor.TryBuild(out var saved, out var problem), problem);
+        Assert.Equal(boost.Process, saved.Process);
+    }
+
+    [Fact]
     public void Turning_an_instance_rule_into_a_path_rule_makes_it_a_saved_one()
     {
         // A rule no longer tied to one running process cannot expire with it.

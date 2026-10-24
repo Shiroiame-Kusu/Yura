@@ -25,6 +25,7 @@ internal static class RuleDescriber
             ProcessSelectorKind.ExecutablePath => Format("Describe.Path", selector.ExecutablePath ?? "?"),
             ProcessSelectorKind.ProcessName => Format("Describe.Name", selector.ProcessName ?? "?"),
             ProcessSelectorKind.User => Format("Describe.User", selector.Uid?.ToString(CultureInfo.CurrentCulture) ?? "?"),
+            ProcessSelectorKind.SteamApp => Format("Describe.SteamApp", selector.SteamAppId ?? "?"),
             _ => Loc.Current["Describe.AnyProcess"],
         };
 

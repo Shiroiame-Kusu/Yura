@@ -1,3 +1,5 @@
+using Yura.Core.Processes;
+
 namespace Yura.Core.Games;
 
 /// <summary>How Yura came to know about a game.</summary>
@@ -59,7 +61,33 @@ public sealed record GameProfile
     public ushort MeasurementPort { get; init; }
 
     /// <summary>True when enough is known to install a rule for this game.</summary>
-    public bool IsRoutable => ExecutablePath is { Length: > 0 } || WineTargetExecutable is { Length: > 0 };
+    public bool IsRoutable => SteamLaunchAppId is not null ||
+                              ExecutablePath is { Length: > 0 } || WineTargetExecutable is { Length: > 0 };
+
+    /// <summary>
+    /// The app id this game is matched by when Steam launches it, or null when it is matched by
+    /// its own executable.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A game from a Steam library is always matched this way: its app id is in the manifest, so
+    /// the rule can be in place before the game has ever run, and Steam's launch of it is the root
+    /// of everything it runs. A game added by hand is matched this way only when nothing else is
+    /// known about it, or when what it remembered was Steam's launcher.
+    /// </para>
+    /// <para>
+    /// Remembering the launcher is how a Steam game used to be matched: by
+    /// <c>reaper</c> and the executable named in its command line. When Helldivers 2 added Easy
+    /// Anti-Cheat, Steam started launching <c>start_protected_game.exe</c> instead of
+    /// <c>bin\helldivers2.exe</c>, and the remembered rule matched nothing from then on. What was
+    /// remembered is ignored now; the app id is the part of that command line an update cannot change.
+    /// </para>
+    /// </remarks>
+    public string? SteamLaunchAppId => SteamAppId is { Length: > 0 } appId &&
+                                       (Source == GameSource.Steam || SteamLaunch.IsLauncher(ExecutablePath) ||
+                                        (ExecutablePath is not { Length: > 0 } && WineTargetExecutable is not { Length: > 0 }))
+        ? appId
+        : null;
 
     /// <summary>
     /// Whether an executable path lies inside this game's install directory.

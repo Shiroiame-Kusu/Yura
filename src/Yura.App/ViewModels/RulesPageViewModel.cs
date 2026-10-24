@@ -546,10 +546,17 @@ public sealed partial class RuleEditorViewModel : ObservableObject
 
     /// <summary>
     /// True when the rule matches something the form has no field for — one running instance,
-    /// or everything a user runs — and the match is kept exactly as it was.
+    /// everything a user runs, or Steam's launch of one game — and the match is kept exactly as
+    /// it was.
     /// </summary>
-    public bool HasFixedSubject => ProcessKind is ProcessSelectorKind.Instance or ProcessSelectorKind.User &&
-                                   _original?.Process.Kind == ProcessKind;
+    public bool HasFixedSubject => IsFixedKind(ProcessKind) && _original?.Process.Kind == ProcessKind;
+
+    /// <summary>
+    /// Kinds of match the form has no text field for: one running instance, a user, or Steam's
+    /// launch of one app.
+    /// </summary>
+    private static bool IsFixedKind(ProcessSelectorKind kind) =>
+        kind is ProcessSelectorKind.Instance or ProcessSelectorKind.User or ProcessSelectorKind.SteamApp;
 
     /// <summary>What a fixed match matches, in words.</summary>
     public string? FixedSubjectDescription => HasFixedSubject && _original is { } original
@@ -567,8 +574,7 @@ public sealed partial class RuleEditorViewModel : ObservableObject
 
     public bool NeedsRoute => Action == RuleActionChoice.Proxy;
 
-    public bool NeedsProcessValue =>
-        ProcessKind is not (ProcessSelectorKind.Any or ProcessSelectorKind.Instance or ProcessSelectorKind.User);
+    public bool NeedsProcessValue => ProcessKind != ProcessSelectorKind.Any && !IsFixedKind(ProcessKind);
 
     public string ProcessValueLabel => ProcessKind switch
     {
@@ -600,8 +606,9 @@ public sealed partial class RuleEditorViewModel : ObservableObject
         _editingId = rule.Id;
         _original = isNew ? null : rule;
 
-        // A rule on one running instance, or on a user, is edited as what it is. Turning it
-        // into a path rule to fit the form would widen it to every run of the program.
+        // A rule on one running instance, on a user, or on Steam's launch of a game is edited as
+        // what it is. Turning it into a path rule to fit the form would widen it to every run of
+        // the program, or to every game Steam launches.
         ProcessKinds = EditableKinds.Contains(rule.Process.Kind) || isNew
             ? EditableKinds
             : [.. EditableKinds, rule.Process.Kind];
@@ -784,7 +791,7 @@ public sealed partial class RuleEditorViewModel : ObservableObject
             ? original.Descendants
             : IncludeChildren ? DescendantPolicy.IncludeFuture : DescendantPolicy.Exclude;
 
-        if (sameKind && ProcessKind is ProcessSelectorKind.Instance or ProcessSelectorKind.User)
+        if (sameKind && IsFixedKind(ProcessKind))
         {
             return original! with { Descendants = descendants };
         }

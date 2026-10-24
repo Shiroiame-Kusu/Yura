@@ -363,15 +363,20 @@ is unreferenced.
   each of the game's connections and says how many are going through the route, how many are
   going to a proxy on this machine, and how many predate the rule — because a rule being
   installed was never evidence that traffic obeys it
-- **A boost started before the game**: press Start, then launch the game. Yura spots it the
-  moment it appears — by its executable, its Windows executable under Wine or Proton, its
-  folder, or Steam's app id — routes it, drops the few connections it opened first so they
-  reconnect through the route, and remembers what it learned so the next boost is in place
-  before the game's first connection. A Proton game is caught at Steam's own launch of it, the
-  root of its process tree, so everything it starts is routed from birth; and what the page
-  reports is read from that whole tree, not from whichever process matched. A boost started
-  while the game is running says what it cannot move: sockets the game already has open, which
-  for gameplay is often all of it until the game restarts
+- **A boost started before the game**: press Start, then launch the game. A Steam game is
+  matched by Steam's own launch of it, which names its app id, so the rule is in place before
+  the game has ever run. Everything the game starts descends from that launch, Proton's
+  wineserver included, and is routed from birth. The app id is the part an update cannot
+  change: Helldivers 2's Easy Anti-Cheat update changed the executable Steam starts, and a rule
+  keyed on that executable matched nothing. A game added by hand is matched by its executable,
+  or by its Windows executable under Wine, and found the moment it appears. Its first few
+  connections are dropped so they reconnect through the route, and what it was matched by is
+  remembered for the next boost. Wine makes a Windows program's sockets inside its prefix's
+  wineserver, so a rule on the program takes that wineserver along; without it, the rule would
+  route nothing the game sends. What the page reports is read from the game's whole process
+  tree, not from whichever process matched. A boost started while the game is running says what
+  it cannot move: sockets the game already has open, which for gameplay is often all of it
+  until the game restarts
 - **A live chart of latency and packet loss** for the session, route against direct: the server
   the game talks to most is probed every three seconds when no target is typed, a refused probe
   counts as an answer (game servers mostly listen on UDP and refuse TCP), loss is counted only

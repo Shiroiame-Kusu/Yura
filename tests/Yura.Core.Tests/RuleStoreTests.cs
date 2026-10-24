@@ -179,6 +179,32 @@ public sealed class RuleStoreTests
     }
 
     [Fact]
+    public void A_boost_of_one_steam_game_replaces_that_games_last_one_and_no_other()
+    {
+        var store = Populated();
+        RoutingRule Launch(string appId, RuleAction action) => new()
+        {
+            Id = Guid.NewGuid(),
+            Order = store.NextOrder(RuleOrigin.GameProfile),
+            Name = $"app {appId}",
+            Origin = RuleOrigin.GameProfile,
+            Lifetime = RuleLifetime.Session,
+            Process = new ProcessSelector { Kind = ProcessSelectorKind.SteamApp, SteamAppId = appId },
+            Destination = DestinationSelector.Any,
+            Action = action,
+            CreatedAtUtc = DateTimeOffset.UnixEpoch,
+        };
+
+        var helldivers = Launch("553850", new RuleAction.Proxy(ProxyA));
+        var peak = Launch("3527290", new RuleAction.Proxy(ProxyA));
+        store.Add(helldivers);
+        store.Add(peak);
+
+        Assert.Equal(helldivers.Id, store.FindSupersededBy(Launch("553850", new RuleAction.Proxy(ProxyB)))?.Id);
+        Assert.Null(store.FindSupersededBy(Launch("1245620", new RuleAction.Proxy(ProxyB))));
+    }
+
+    [Fact]
     public void A_rule_put_in_place_of_the_one_it_replaces_needs_nothing_removed()
     {
         var store = Populated();

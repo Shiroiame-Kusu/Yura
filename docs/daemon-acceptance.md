@@ -8,8 +8,9 @@ dotnet build src/Yura.Daemon src/Yura.Agent
 sudo tests/acceptance/daemon-acceptance.sh
 ```
 
-**152 passed, 0 failed**, reproduced across consecutive runs on kernel 7.2 / nftables 1.1.7 /
-wireguard-tools 1.0: on the development builds, and on the NativeAOT daemon and agent that
+**172 passed, 0 failed** on kernel 7.3 / nftables 1.1.7 / wireguard-tools 1.0 / Wine 11.20, on the
+development builds. The 152 checks before the Steam and Wine ones below were reproduced across
+consecutive runs on kernel 7.2, on those builds and on the NativeAOT daemon and agent that
 `tools/publish.sh` and `tools/publish-agent.sh` produce.
 
 ```bash
@@ -55,6 +56,9 @@ address as the source, which is what an exit node's far end sees.
 | 8 | Child-process exclusion | **Verified, with a stated limit** | No child of an excluding rule reaches the proxy, and the daemon logs every child it moved out with zero failures. A child that creates a socket in its first instant can still win the race — see [The exclusion race](#the-exclusion-race) |
 | 9 | Precedence between manual rules and game profiles | **Verified** | One process covered by both rules sits in a single cgroup naming both; the higher rule's proxy is the one its traffic reaches, and reversing the order reverses the outcome |
 | 10 | Unrelated Wine/Proton applications unaffected | **Verified** | Two processes share one runtime binary; the rule narrowed to `alpha.exe` proxies that one and leaves `beta.exe` timing out |
+| 10b | A game Steam launches is routed from its launch, by its app id alone | **Verified** | A stand-in reaper, compiled so its command line reads as Steam's and forking the game at once, is placed on the exec event; the game's very first connection reaches `YURA-VIA-PROXY-A`, and another app id's launch is untouched |
+| 10c | A rule on a Windows program takes its prefix's wineserver along | **Verified** | Stand-ins that make and hand over sockets as Wine does: the program's sockets, made by its wineserver, are proxied from the first; the wineserver joins the group only while a program of its prefix is covered, and goes back when the rule goes; another prefix's server and program are untouched; a second program of the same prefix shares the route, found in the wineserver's hands |
+| 10d | The same with Wine itself | **Verified** | A Winsock probe built with MinGW runs under Wine 11.20 in a fresh prefix: running before its rule, it is proxied once the rule is in; started after it, all four attempts are proxied. Skipped where Wine or MinGW is not installed |
 | 11 | Existing connections distinguished from new ones | **Verified** | A's pre-rule connection stays open on its old route; the proxy never sees its destination, and the Connections view reports it as `preExistingPreviousRoute` alongside confirmed-proxied rows for the same process |
 
 ## Beyond the mandatory list

@@ -605,6 +605,8 @@ public sealed class RuleDto
 
     public string? WinePrefix { get; init; }
 
+    public string? SteamAppId { get; init; }
+
     // -- destination side
     public List<string> Hosts { get; set; } = [];
 
@@ -640,6 +642,7 @@ public sealed class RuleDto
         Descendants = rule.Process.Descendants,
         WineTargetExecutable = rule.Process.WineTargetExecutable,
         WinePrefix = rule.Process.WinePrefix,
+        SteamAppId = rule.Process.SteamAppId,
         Hosts = rule.Destination.Hosts.Select(h => h.ToString()).ToList(),
         Networks = rule.Destination.Networks.Select(n => n.ToString()).ToList(),
         Ports = rule.Destination.Ports.Select(p => p.ToString()).ToList(),
@@ -678,6 +681,11 @@ public sealed class RuleDto
             };
         }
 
+        if (ProcessKind == ProcessSelectorKind.SteamApp && SteamAppId is not { Length: > 0 })
+        {
+            throw new InvalidDataException("a steamApp rule needs steamAppId");
+        }
+
         var hosts = Hosts.Select(ParseHost).ToList();
         var networks = Networks.Select(ParseNetwork).ToList();
         var ports = Ports.Select(text =>
@@ -713,6 +721,7 @@ public sealed class RuleDto
                 Descendants = Descendants,
                 WineTargetExecutable = WineTargetExecutable,
                 WinePrefix = WinePrefix,
+                SteamAppId = ProcessKind == ProcessSelectorKind.SteamApp ? SteamAppId : null,
             },
             Destination = new DestinationSelector
             {

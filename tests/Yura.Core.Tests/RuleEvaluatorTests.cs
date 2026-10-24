@@ -247,6 +247,36 @@ public sealed class RuleEvaluatorTests
         Assert.True(RuleEvaluator.Evaluate(rules, Request(unrelated)).IsDefault);
     }
 
+    [Fact]
+    public void A_socket_owned_by_a_wineserver_is_decided_by_the_group_it_was_made_in()
+    {
+        // Wine makes a Windows program's sockets in the prefix's wineserver, which keeps a copy
+        // of each, so a captured flow is often put down to the wineserver. Matched by its own
+        // path it covers no rule, and the game's connection, captured into the rule's group, was
+        // dialled directly. Real Wine showed it; a stand-in that let go of its copy did not.
+        var rule = Rule(0, new RuleAction.Proxy(ProxyA), new ProcessSelector
+        {
+            Kind = ProcessSelectorKind.ExecutablePath,
+            ExecutablePath = "/usr/lib/wine/x86_64-unix/wine-preloader",
+            WineTargetExecutable = @"S:\steamapps\common\Helldivers 2\bin/helldivers2.exe",
+            Descendants = DescendantPolicy.Exclude,
+        });
+        var wineserver = Process(pid: 95840, name: "wineserver", exe: "/usr/bin/wineserver");
+
+        Assert.True(RuleEvaluator.Evaluate([rule], Request(wineserver)).IsDefault);
+        Assert.Equal(new RuleAction.Proxy(ProxyA), RuleEvaluator.Evaluate([rule], Request(wineserver) with
+        {
+            ClassifierMatchedRuleIds = new HashSet<Guid> { rule.Id },
+        }).Action);
+
+        // Any other owner of a path rule's socket is still matched by what it is.
+        var stranger = Process(pid: 95841, name: "curl", exe: "/usr/bin/curl");
+        Assert.True(RuleEvaluator.Evaluate([rule], Request(stranger) with
+        {
+            ClassifierMatchedRuleIds = new HashSet<Guid> { rule.Id },
+        }).IsDefault);
+    }
+
     // -- destination matching ---------------------------------------------------
 
     [Fact]
